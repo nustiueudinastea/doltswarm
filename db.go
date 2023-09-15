@@ -1,4 +1,4 @@
-package db
+package doltswarm
 
 import (
 	"context"
@@ -22,12 +22,11 @@ import (
 	"github.com/dolthub/dolt/go/store/datas"
 	dd "github.com/dolthub/driver"
 	doltSQL "github.com/dolthub/go-mysql-server/sql"
-	"github.com/nustiueudinastea/doltswarm/client"
 	"github.com/nustiueudinastea/doltswarm/proto"
-	"github.com/nustiueudinastea/doltswarm/server"
 	"github.com/segmentio/ksuid"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -59,11 +58,11 @@ type DB struct {
 	workingDir      string
 	peerRegistrator PeerHandlerRegistrator
 	grpcRetriever   GRPCServerRetriever
-	clientRetriever client.ClientRetriever
+	clientRetriever ClientRetriever
 	log             *logrus.Logger
 }
 
-func New(dir string, name string, commitListChan chan []Commit, peerRegistrator PeerHandlerRegistrator, grpcRetriever GRPCServerRetriever, clientRetriever client.ClientRetriever, logger *logrus.Logger) (*DB, error) {
+func New(dir string, name string, commitListChan chan []Commit, peerRegistrator PeerHandlerRegistrator, grpcRetriever GRPCServerRetriever, clientRetriever ClientRetriever, logger *logrus.Logger) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
@@ -157,7 +156,7 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 	db.log.Info("Doing p2p setup")
 	db.peerRegistrator.RegisterPeerHandler(db)
 	// register new factory
-	dbfactory.RegisterFactory(FactorySwarm, client.NewCustomFactory(db.name, db.clientRetriever, logrus.NewEntry(db.log)))
+	dbfactory.RegisterFactory(FactorySwarm, NewCustomFactory(db.name, db.clientRetriever, logrus.NewEntry(db.log)))
 
 	if withGRPCservers {
 		// prepare dolt chunk store server
@@ -165,10 +164,10 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 		if err != nil {
 			return fmt.Errorf("error getting chunk store: %s", err.Error())
 		}
-		chunkStoreCache := server.NewCSCache(cs.(remotesrv.RemoteSrvStore))
-		chunkStoreServer := server.NewServerChunkStore(logrus.NewEntry(db.log), chunkStoreCache, db.GetFilePath())
-		eventQueue := make(chan server.Event, 100)
-		syncerServer := server.NewServerSyncer(logrus.NewEntry(db.log), eventQueue)
+		chunkStoreCache := NewCSCache(cs.(remotesrv.RemoteSrvStore))
+		chunkStoreServer := NewServerChunkStore(logrus.NewEntry(db.log), chunkStoreCache, db.GetFilePath())
+		eventQueue := make(chan Event, 100)
+		syncerServer := NewServerSyncer(logrus.NewEntry(db.log), eventQueue)
 
 		// register grpc servers
 		grpcServer := db.grpcRetriever.GetGRPCServer()
@@ -255,7 +254,7 @@ func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 	return datas.ChunkStoreFromDatabase(dbd), nil
 }
 
-func (db *DB) AddPeer(peerID string) error {
+func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 
 	dbEnv := db.mrEnv.GetEnv(db.name)
 	if dbEnv == nil {

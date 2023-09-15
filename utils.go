@@ -1,10 +1,23 @@
-package db
+package doltswarm
 
 import (
 	"errors"
 	"os"
 
+	"io"
+
 	"github.com/bokwoon95/sq"
+
+	"github.com/nustiueudinastea/doltswarm/proto"
+
+	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
+	"github.com/dolthub/dolt/go/store/chunks"
+)
+
+const (
+	grpcRetries            = 5
+	MaxFetchSize           = 128 * 1024 * 1024
+	HedgeDownloadSizeLimit = 4 * 1024 * 1024
 )
 
 func commitMapper(row *sq.Row) (Commit, error) {
@@ -37,4 +50,54 @@ func ensureDir(dirName string) error {
 		return nil
 	}
 	return err
+}
+
+func batchItr(elemCount, batchSize int, cb func(start, end int) (stop bool)) {
+	for st, end := 0, batchSize; st < elemCount; st, end = end, end+batchSize {
+		if end > elemCount {
+			end = elemCount
+		}
+
+		stop := cb(st, end)
+
+		if stop {
+			break
+		}
+	}
+}
+
+func copyFileChunksFromResponse(w *io.PipeWriter, res proto.Downloader_DownloadFileClient) {
+	message := new(proto.DownloadFileResponse)
+	var err error
+	for {
+		err = res.RecvMsg(message)
+		if err == io.EOF {
+			_ = w.Close()
+			break
+		}
+		if err != nil {
+			_ = w.CloseWithError(err)
+			break
+		}
+		if len(message.GetChunk()) > 0 {
+			_, err = w.Write(message.Chunk)
+			if err != nil {
+				_ = res.CloseSend()
+				break
+			}
+		}
+		message.Chunk = message.Chunk[:0]
+	}
+}
+
+func buildTableFileInfo(tableList []chunks.TableFile) []*remotesapi.TableFileInfo {
+	tableFileInfo := make([]*remotesapi.TableFileInfo, 0)
+	for _, t := range tableList {
+		tableFileInfo = append(tableFileInfo, &remotesapi.TableFileInfo{
+			FileId:    t.FileID(),
+			NumChunks: uint32(t.NumChunks()),
+			Url:       t.FileID(),
+		})
+	}
+	return tableFileInfo
 }

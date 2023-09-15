@@ -1,16 +1,24 @@
-package db
+package doltswarm
 
 import (
 	"context"
 	"fmt"
 
+	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/nustiueudinastea/doltswarm/proto"
-	"github.com/nustiueudinastea/doltswarm/server"
 	"google.golang.org/grpc"
 )
 
+type DBClient struct {
+	proto.DBSyncerClient
+	remotesapi.ChunkStoreServiceClient
+	proto.DownloaderClient
+
+	id string
+}
+
 type PeerHandler interface {
-	AddPeer(peerID string) error
+	AddPeer(peerID string, conn *grpc.ClientConn) error
 	RemovePeer(peerID string) error
 }
 
@@ -26,7 +34,7 @@ type GRPCServerRetriever interface {
 // handlers
 //
 
-func (db *DB) remoteEventProcessor(broadcastEvents chan server.Event) func() error {
+func (db *DB) remoteEventProcessor(broadcastEvents chan Event) func() error {
 	db.log.Info("Starting db remote event processor")
 	stopSignal := make(chan struct{})
 	go func() {
@@ -50,9 +58,9 @@ func (db *DB) remoteEventProcessor(broadcastEvents chan server.Event) func() err
 	return stopper
 }
 
-func (db *DB) eventHandler(event server.Event) error {
+func (db *DB) eventHandler(event Event) error {
 	switch event.Type {
-	case server.ExternalNewHeadEvent:
+	case ExternalNewHeadEvent:
 		db.log.Infof("new event '%s' from peer '%s': head -> %s", event.Type, event.Peer, event.Data.(string))
 		err := db.Pull(event.Peer)
 		if err != nil {

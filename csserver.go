@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package server
+package doltswarm
 
 import (
 	"context"
@@ -54,16 +54,6 @@ func NewServerChunkStore(logger *logrus.Entry, csCache DBCache, filePath string)
 type repoRequest interface {
 	GetRepoId() *remotesapi.RepoId
 	GetRepoPath() string
-}
-
-func getRepoPath(req repoRequest) string {
-	if req.GetRepoPath() != "" {
-		return req.GetRepoPath()
-	}
-	if repoId := req.GetRepoId(); repoId != nil {
-		return repoId.Org + "/" + repoId.RepoName
-	}
-	panic("unexpected empty repo_path and nil repo_id")
 }
 
 type ServerChunkStore struct {
