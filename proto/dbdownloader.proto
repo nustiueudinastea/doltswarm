@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+option go_package = "./proto";
+
+package proto;
+
+service Downloader {
+  rpc DownloadFile(DownloadFileRequest) returns(stream DownloadFileResponse);
+  rpc DownloadChunks(DownloadChunksRequest) returns(stream DownloadChunksResponse);
+}
+
+message DownloadFileRequest{
+  string id = 1;
+}
+
+message DownloadFileResponse{
+  bytes chunk = 1;
+}
+
+message DownloadChunksRequest{
+  repeated string hashes = 1;
+}
+
+message DownloadChunksResponse{
+  string hash = 1;
+  bytes chunk = 2;
+}

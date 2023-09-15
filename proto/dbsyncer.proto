@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+option go_package = "./proto";
+
+package proto;
+
+service DBSyncer {
+  rpc AdvertiseHead (AdvertiseHeadRequest) returns (AdvertiseHeadResponse) {}
+}
+
+message AdvertiseHeadRequest {
+  string head = 1;
+}
+
+message AdvertiseHeadResponse {}
