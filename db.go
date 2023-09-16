@@ -150,7 +150,7 @@ func (db *DB) Open() error {
 }
 
 func (db *DB) p2pSetup(withGRPCservers bool) error {
-	db.log.Info("Doing p2p setup")
+	db.log.Infof("Doing p2p setup (grpc: %v)", withGRPCservers)
 	// register new factory
 	dbfactory.RegisterFactory(FactorySwarm, NewCustomFactory(db.name, db, logrus.NewEntry(db.log)))
 
@@ -257,10 +257,11 @@ func (db *DB) AddGRPCServer(server *grpc.Server) {
 }
 
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
+	db.log.Infof("Adding peer %s", peerID)
 
 	dbEnv := db.mrEnv.GetEnv(db.name)
 	if dbEnv == nil {
-		return nil
+		return fmt.Errorf("failed to add peer '%s'. db env '%s' not found", peerID, db.name)
 	}
 
 	remotes, err := dbEnv.GetRemotes()
