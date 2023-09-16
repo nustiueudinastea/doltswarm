@@ -335,7 +335,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 		err := db.Query(query, true)
 		if err != nil {
 			if strings.Contains(err.Error(), "could not get client") {
-				db.log.Warnf("Peer %s not available yet. Retrying...", peerID)
+				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
 				tries++
 				time.Sleep(2 * time.Second)
 				continue
