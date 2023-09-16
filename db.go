@@ -259,16 +259,6 @@ func (db *DB) AddGRPCServer(server *grpc.Server) {
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 	db.log.Infof("Adding peer %s", peerID)
 
-	dbEnv := db.mrEnv.GetEnv(db.name)
-	if dbEnv == nil {
-		return fmt.Errorf("failed to add peer '%s'. db env '%s' not found", peerID, db.name)
-	}
-
-	remotes, err := dbEnv.GetRemotes()
-	if err != nil {
-		return fmt.Errorf("failed to get remotes: %v", err)
-	}
-
 	if _, ok := db.dbClients[peerID]; !ok {
 		db.dbClients[peerID] = &DBClient{
 			id:                      peerID,
@@ -278,6 +268,18 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 		}
 	} else {
 		db.log.Infof("Client for peer %s already exists", peerID)
+	}
+
+	// this part only continues if the db is already initialized (non nil env)
+	// so that the client is still available when doing initialization from another peer
+	dbEnv := db.mrEnv.GetEnv(db.name)
+	if dbEnv == nil {
+		return nil
+	}
+
+	remotes, err := dbEnv.GetRemotes()
+	if err != nil {
+		return fmt.Errorf("failed to get remotes: %v", err)
 	}
 
 	if _, ok := remotes[peerID]; !ok {
