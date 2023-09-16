@@ -24,7 +24,7 @@ const (
 	maxHasManyBatchSize = 16 * 1024
 )
 
-func NewRemoteChunkStore(client Client, peerID string, dbName string, nbfVersion string, logger *logrus.Entry) (*RemoteChunkStore, error) {
+func NewRemoteChunkStore(client *DBClient, peerID string, dbName string, nbfVersion string, logger *logrus.Entry) (*RemoteChunkStore, error) {
 	rcs := &RemoteChunkStore{
 		dbName:      dbName,
 		client:      client,
@@ -74,7 +74,7 @@ type ConcurrencyParams struct {
 
 type RemoteChunkStore struct {
 	dbName      string
-	client      Client
+	client      *DBClient
 	peerID      string
 	cache       remotestorage.ChunkCache
 	httpFetcher HTTPFetcher
@@ -358,7 +358,7 @@ func (rcs *RemoteChunkStore) Sources(ctx context.Context) (hash.Hash, []chunks.T
 	return hash.New(resp.RootHash), sourceFiles, appendixFiles, nil
 }
 
-func getTableFiles(client Client, infoList []*remotesapi.TableFileInfo) []chunks.TableFile {
+func getTableFiles(client *DBClient, infoList []*remotesapi.TableFileInfo) []chunks.TableFile {
 	tableFiles := make([]chunks.TableFile, 0)
 	for _, nfo := range infoList {
 		tableFiles = append(tableFiles, RemoteTableFile{client, nfo})

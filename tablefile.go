@@ -13,7 +13,7 @@ import (
 
 // RemoteTableFile is an implementation of a TableFile that lives in a DoltChunkStore
 type RemoteTableFile struct {
-	client Client
+	client *DBClient
 	info   *remotesapi.TableFileInfo
 }
 

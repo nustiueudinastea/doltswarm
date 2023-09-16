@@ -5,35 +5,20 @@ import (
 	"fmt"
 	"net/url"
 
-	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/types"
-	"github.com/nustiueudinastea/doltswarm/proto"
 	"github.com/sirupsen/logrus"
 )
 
-type Client interface {
-	proto.DBSyncerClient
-	remotesapi.ChunkStoreServiceClient
-	proto.DownloaderClient
-
-	GetID() string
-}
-
-type ClientRetriever interface {
-	GetClient(peerID string) (Client, error)
-	GetClients() []Client
-}
-
-func NewCustomFactory(dbName string, cr ClientRetriever, logger *logrus.Entry) CustomFactory {
-	return CustomFactory{dbName, cr, logger}
+func NewCustomFactory(dbName string, db *DB, logger *logrus.Entry) CustomFactory {
+	return CustomFactory{dbName, db, logger}
 }
 
 type CustomFactory struct {
 	dbName string
-	cr     ClientRetriever
+	db     *DB
 	logger *logrus.Entry
 }
 
@@ -58,7 +43,7 @@ func (fact CustomFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFormat
 
 func (fact CustomFactory) newChunkStore(peerID string, nbfVersion string) (chunks.ChunkStore, error) {
 
-	client, err := fact.cr.GetClient(peerID)
+	client, err := fact.db.GetClient(peerID)
 	if err != nil {
 		return nil, fmt.Errorf("could not get client for '%s': %w", peerID, err)
 	}

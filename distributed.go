@@ -17,17 +17,8 @@ type DBClient struct {
 	id string
 }
 
-type PeerHandler interface {
-	AddPeer(peerID string, conn *grpc.ClientConn) error
-	RemovePeer(peerID string) error
-}
-
-type PeerHandlerRegistrator interface {
-	RegisterPeerHandler(handler PeerHandler)
-}
-
-type GRPCServerRetriever interface {
-	GetGRPCServer() *grpc.Server
+func (c DBClient) GetID() string {
+	return c.id
 }
 
 //
@@ -85,7 +76,7 @@ func (db *DB) eventHandler(event Event) error {
 
 func (db *DB) AdvertiseHead() {
 
-	clients := db.clientRetriever.GetClients()
+	clients := db.GetClients()
 
 	if len(clients) == 0 {
 		return

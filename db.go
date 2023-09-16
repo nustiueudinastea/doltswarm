@@ -47,35 +47,32 @@ type Commit struct {
 var tableName = "testtable"
 
 type DB struct {
-	name            string
-	stoppers        []func() error
-	commitListChan  chan []Commit
-	dbEnvInit       *env.DoltEnv
-	mrEnv           *env.MultiRepoEnv
-	sqle            *engine.SqlEngine
-	sqld            *sql.DB
-	sqlCtx          *doltSQL.Context
-	workingDir      string
-	peerRegistrator PeerHandlerRegistrator
-	grpcRetriever   GRPCServerRetriever
-	clientRetriever ClientRetriever
-	log             *logrus.Logger
+	name           string
+	stoppers       []func() error
+	commitListChan chan []Commit
+	dbEnvInit      *env.DoltEnv
+	mrEnv          *env.MultiRepoEnv
+	sqle           *engine.SqlEngine
+	sqld           *sql.DB
+	sqlCtx         *doltSQL.Context
+	workingDir     string
+	grpcServer     *grpc.Server
+	log            *logrus.Logger
+	dbClients      map[string]*DBClient
 }
 
-func New(dir string, name string, commitListChan chan []Commit, peerRegistrator PeerHandlerRegistrator, grpcRetriever GRPCServerRetriever, clientRetriever ClientRetriever, logger *logrus.Logger) (*DB, error) {
+func New(dir string, name string, commitListChan chan []Commit, logger *logrus.Logger) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
 	}
 
 	db := &DB{
-		name:            name,
-		workingDir:      workingDir,
-		peerRegistrator: peerRegistrator,
-		grpcRetriever:   grpcRetriever,
-		clientRetriever: clientRetriever,
-		log:             logger,
-		commitListChan:  commitListChan,
+		name:           name,
+		workingDir:     workingDir,
+		log:            logger,
+		commitListChan: commitListChan,
+		dbClients:      map[string]*DBClient{},
 	}
 
 	return db, nil
@@ -154,9 +151,8 @@ func (db *DB) Open() error {
 
 func (db *DB) p2pSetup(withGRPCservers bool) error {
 	db.log.Info("Doing p2p setup")
-	db.peerRegistrator.RegisterPeerHandler(db)
 	// register new factory
-	dbfactory.RegisterFactory(FactorySwarm, NewCustomFactory(db.name, db.clientRetriever, logrus.NewEntry(db.log)))
+	dbfactory.RegisterFactory(FactorySwarm, NewCustomFactory(db.name, db, logrus.NewEntry(db.log)))
 
 	if withGRPCservers {
 		// prepare dolt chunk store server
@@ -170,10 +166,12 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 		syncerServer := NewServerSyncer(logrus.NewEntry(db.log), eventQueue)
 
 		// register grpc servers
-		grpcServer := db.grpcRetriever.GetGRPCServer()
-		proto.RegisterDownloaderServer(grpcServer, chunkStoreServer)
-		remotesapi.RegisterChunkStoreServiceServer(grpcServer, chunkStoreServer)
-		proto.RegisterDBSyncerServer(grpcServer, syncerServer)
+		if db.grpcServer == nil {
+			return fmt.Errorf("grpc server not initialized")
+		}
+		proto.RegisterDownloaderServer(db.grpcServer, chunkStoreServer)
+		remotesapi.RegisterChunkStoreServiceServer(db.grpcServer, chunkStoreServer)
+		proto.RegisterDBSyncerServer(db.grpcServer, syncerServer)
 
 		// start event processor
 		db.stoppers = append(db.stoppers, db.remoteEventProcessor(eventQueue))
@@ -254,6 +252,10 @@ func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 	return datas.ChunkStoreFromDatabase(dbd), nil
 }
 
+func (db *DB) AddGRPCServer(server *grpc.Server) {
+	db.grpcServer = server
+}
+
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 
 	dbEnv := db.mrEnv.GetEnv(db.name)
@@ -265,6 +267,18 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 	if err != nil {
 		return fmt.Errorf("failed to get remotes: %v", err)
 	}
+
+	if _, ok := db.dbClients[peerID]; !ok {
+		db.dbClients[peerID] = &DBClient{
+			id:                      peerID,
+			DBSyncerClient:          proto.NewDBSyncerClient(conn),
+			ChunkStoreServiceClient: remotesapi.NewChunkStoreServiceClient(conn),
+			DownloaderClient:        proto.NewDownloaderClient(conn),
+		}
+	} else {
+		db.log.Infof("Client for peer %s already exists", peerID)
+	}
+
 	if _, ok := remotes[peerID]; !ok {
 		r := env.NewRemote(peerID, fmt.Sprintf("%s://%s", FactorySwarm, peerID), map[string]string{})
 		err := dbEnv.AddRemote(r)
@@ -287,6 +301,8 @@ func (db *DB) RemovePeer(peerID string) error {
 		return nil
 	}
 
+	delete(db.dbClients, peerID)
+
 	err := dbEnv.RemoveRemote(context.Background(), peerID)
 	if err != nil {
 		if strings.Contains(err.Error(), "remote not found") {
@@ -297,6 +313,17 @@ func (db *DB) RemovePeer(peerID string) error {
 	db.log.Infof("Removed remote for peer %s", peerID)
 
 	return nil
+}
+
+func (db *DB) GetClient(peerID string) (*DBClient, error) {
+	if client, ok := db.dbClients[peerID]; ok {
+		return client, nil
+	}
+	return nil, fmt.Errorf("client for peer %s not found", peerID)
+}
+
+func (db *DB) GetClients() map[string]*DBClient {
+	return db.dbClients
 }
 
 func (db *DB) InitFromPeer(peerID string) error {
