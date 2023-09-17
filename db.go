@@ -47,32 +47,30 @@ type Commit struct {
 var tableName = "testtable"
 
 type DB struct {
-	name           string
-	stoppers       []func() error
-	commitListChan chan []Commit
-	dbEnvInit      *env.DoltEnv
-	mrEnv          *env.MultiRepoEnv
-	sqle           *engine.SqlEngine
-	sqld           *sql.DB
-	sqlCtx         *doltSQL.Context
-	workingDir     string
-	grpcServer     *grpc.Server
-	log            *logrus.Logger
-	dbClients      map[string]*DBClient
+	name       string
+	stoppers   []func() error
+	dbEnvInit  *env.DoltEnv
+	mrEnv      *env.MultiRepoEnv
+	sqle       *engine.SqlEngine
+	sqld       *sql.DB
+	sqlCtx     *doltSQL.Context
+	workingDir string
+	grpcServer *grpc.Server
+	log        *logrus.Logger
+	dbClients  map[string]*DBClient
 }
 
-func New(dir string, name string, commitListChan chan []Commit, logger *logrus.Logger) (*DB, error) {
+func New(dir string, name string, logger *logrus.Logger) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
 	}
 
 	db := &DB{
-		name:           name,
-		workingDir:     workingDir,
-		log:            logger,
-		commitListChan: commitListChan,
-		dbClients:      map[string]*DBClient{},
+		name:       name,
+		workingDir: workingDir,
+		log:        logger,
+		dbClients:  map[string]*DBClient{},
 	}
 
 	return db, nil
@@ -232,10 +230,6 @@ func (db *DB) InitLocal() error {
 	}
 
 	return nil
-}
-
-func (db *DB) StartUpdater() {
-	db.stoppers = append(db.stoppers, db.commitUpdater())
 }
 
 func (db *DB) GetFilePath() string {
@@ -515,39 +509,4 @@ func (db *DB) PrintBranches() error {
 	}
 	fmt.Println(headRefs)
 	return nil
-}
-
-func (db *DB) commitUpdater() func() error {
-	db.log.Info("Starting commit updater")
-	updateTimer := time.NewTicker(1 * time.Second)
-	commitTimmer := time.NewTicker(15 * time.Second)
-	stopSignal := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-updateTimer.C:
-				commits, err := db.GetAllCommits()
-				if err != nil {
-					db.log.Errorf("failed to retrieve all commits: %s", err.Error())
-					continue
-				}
-				db.commitListChan <- commits
-			case timer := <-commitTimmer.C:
-				err := db.Insert(timer.String())
-				if err != nil {
-					db.log.Errorf("Failed to insert time: %s", err.Error())
-					continue
-				}
-				db.log.Infof("Inserted time '%s' into db", timer.String())
-			case <-stopSignal:
-				db.log.Info("Stopping commit updater")
-				return
-			}
-		}
-	}()
-	stopper := func() error {
-		stopSignal <- struct{}{}
-		return nil
-	}
-	return stopper
 }
