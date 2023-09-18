@@ -14,7 +14,6 @@ require (
 	github.com/dolthub/dolt/go v0.40.5-0.20230503211923-08f2ebf472f2
 	github.com/dolthub/driver v0.0.0-20230503220024-0df7c47dcc69
 	github.com/dolthub/go-mysql-server v0.16.1-0.20230801211701-7b82507a9c4f
-	github.com/segmentio/ksuid v1.0.4
 	github.com/sirupsen/logrus v1.9.0
 	go.uber.org/multierr v1.8.0
 	google.golang.org/grpc v1.55.0

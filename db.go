@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"log"
 	"strings"
 	"time"
@@ -23,7 +22,6 @@ import (
 	dd "github.com/dolthub/driver"
 	doltSQL "github.com/dolthub/go-mysql-server/sql"
 	"github.com/nustiueudinastea/doltswarm/proto"
-	"github.com/segmentio/ksuid"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
 	"google.golang.org/grpc"
@@ -137,6 +135,11 @@ func (db *DB) Open() error {
 		if err != nil {
 			return fmt.Errorf("failed to do p2p setup: %w", err)
 		}
+
+		_, err = db.sqld.Exec(fmt.Sprintf("USE %s;", db.name))
+		if err != nil {
+			return fmt.Errorf("failed to use db: %w", err)
+		}
 	} else {
 		err = db.p2pSetup(false)
 		if err != nil {
@@ -210,21 +213,28 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) InitLocal() error {
-	err := db.Query(fmt.Sprintf("CREATE DATABASE %s;", db.name), true)
+
+	_, err := db.sqld.Exec(fmt.Sprintf("CREATE DATABASE %s;", db.name))
 	if err != nil {
 		return fmt.Errorf("failed to create db: %w", err)
 	}
 
-	err = db.Query(fmt.Sprintf("USE %s;", db.name), false)
+	_, err = db.sqld.Exec(fmt.Sprintf("USE %s;", db.name))
 	if err != nil {
 		return fmt.Errorf("failed to use db: %w", err)
 	}
 
+	tx, err := db.sqld.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Commit()
+
 	// create table
-	err = db.Query(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s(
+	_, err = tx.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s(
 		  id varchar(256) PRIMARY KEY,
 		  name varchar(512)
-	    );`, tableName), true)
+	    );`, tableName))
 	if err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
@@ -329,7 +339,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 	tries := 0
 	for tries < 10 {
 		query := fmt.Sprintf("CALL DOLT_CLONE('%s://%s/%s');", FactorySwarm, peerID, db.name)
-		err := db.Query(query, true)
+		err := db.Query(query)
 		if err != nil {
 			if strings.Contains(err.Error(), "could not get client") {
 				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
@@ -347,16 +357,11 @@ func (db *DB) InitFromPeer(peerID string) error {
 }
 
 func (db *DB) Pull(peerID string) error {
-	err := db.Query(fmt.Sprintf("USE %s;", db.name), false)
-	if err != nil {
-		return fmt.Errorf("failed to use db: %w", err)
-	}
-
-	err = db.Query(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID), false)
+	err := db.Query(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID))
 	if err != nil {
 		if strings.Contains(err.Error(), fmt.Sprintf("could not find %s", peerID)) {
 			// peer branch not found, we create it
-			err = db.Query(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s');", peerID), false)
+			err = db.Query(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s');", peerID))
 			if err != nil {
 				return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
 			}
@@ -365,7 +370,7 @@ func (db *DB) Pull(peerID string) error {
 		}
 	}
 
-	err = db.Query(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID), false)
+	err = db.Query(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID))
 	if err != nil {
 		return fmt.Errorf("failed to pull db from peer %s: %w", peerID, err)
 	}
@@ -398,48 +403,11 @@ func (db *DB) Merge(peerID string) error {
 	return nil
 }
 
-func (db *DB) Query(query string, printResult bool) (err error) {
-	schema, rows, err := db.sqle.Query(db.sqlCtx, query)
+func (db *DB) Query(query string) error {
+	_, err := db.sqld.Exec(query)
 	if err != nil {
 		return err
 	}
-
-	if printResult {
-		engine.PrettyPrintResults(db.sqlCtx, engine.FormatTabular, schema, rows)
-	} else {
-		for {
-			_, err := rows.Next(db.sqlCtx)
-			if err == io.EOF {
-				break
-			} else if err != nil {
-				return err
-			}
-		}
-		rows.Close(db.sqlCtx)
-	}
-
-	return nil
-}
-
-func (db *DB) Insert(data string) error {
-	uid, err := ksuid.NewRandom()
-	if err != nil {
-		return fmt.Errorf("failed to create uid: %w", err)
-	}
-
-	err = db.Query(fmt.Sprintf("USE %s;", db.name), false)
-	if err != nil {
-		return fmt.Errorf("failed to use db: %w", err)
-	}
-
-	queryString := fmt.Sprintf("INSERT INTO %s (id, name) VALUES ('%s', '%s');", tableName, uid.String(), data)
-	err = db.Query(queryString, false)
-	if err != nil {
-		return fmt.Errorf("failed to save record: %w", err)
-	}
-
-	// async advertise new head
-	go db.AdvertiseHead()
 
 	return nil
 }
@@ -470,6 +438,7 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
 	)
+
 	if err != nil {
 		return commits, fmt.Errorf("failed to retrieve last commit hash: %w", err)
 	}
@@ -479,7 +448,7 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 
 func (db *DB) PrintAllCommits() error {
 	query := fmt.Sprintf("SELECT * FROM `%s/main`.dolt_diff ORDER BY date;", db.name)
-	err := db.Query(query, true)
+	err := db.Query(query)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve commits: %w", err)
 	}
@@ -488,7 +457,7 @@ func (db *DB) PrintAllCommits() error {
 }
 
 func (db *DB) PrintAllData() error {
-	err := db.Query(fmt.Sprintf("SELECT * FROM `%s/main`.%s;", db.name, tableName), true)
+	err := db.Query(fmt.Sprintf("SELECT * FROM `%s/main`.%s;", db.name, tableName))
 	if err != nil {
 		return fmt.Errorf("failed to retrieve commits: %w", err)
 	}
