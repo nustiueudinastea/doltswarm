@@ -224,21 +224,6 @@ func (db *DB) InitLocal() error {
 		return fmt.Errorf("failed to use db: %w", err)
 	}
 
-	tx, err := db.sqld.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to start transaction: %w", err)
-	}
-	defer tx.Commit()
-
-	// create table
-	_, err = tx.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s(
-		  id varchar(256) PRIMARY KEY,
-		  name varchar(512)
-	    );`, tableName))
-	if err != nil {
-		return fmt.Errorf("failed to create table: %w", err)
-	}
-
 	return nil
 }
 
