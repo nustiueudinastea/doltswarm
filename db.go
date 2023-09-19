@@ -339,7 +339,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 	tries := 0
 	for tries < 10 {
 		query := fmt.Sprintf("CALL DOLT_CLONE('%s://%s/%s');", FactorySwarm, peerID, db.name)
-		err := db.Query(query)
+		_, err := db.Exec(query)
 		if err != nil {
 			if strings.Contains(err.Error(), "could not get client") {
 				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
@@ -357,11 +357,11 @@ func (db *DB) InitFromPeer(peerID string) error {
 }
 
 func (db *DB) Pull(peerID string) error {
-	err := db.Query(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID))
+	_, err := db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID))
 	if err != nil {
 		if strings.Contains(err.Error(), fmt.Sprintf("could not find %s", peerID)) {
 			// peer branch not found, we create it
-			err = db.Query(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s');", peerID))
+			_, err = db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s');", peerID))
 			if err != nil {
 				return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
 			}
@@ -370,7 +370,7 @@ func (db *DB) Pull(peerID string) error {
 		}
 	}
 
-	err = db.Query(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID))
+	_, err = db.Exec(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID))
 	if err != nil {
 		return fmt.Errorf("failed to pull db from peer %s: %w", peerID, err)
 	}
@@ -403,13 +403,16 @@ func (db *DB) Merge(peerID string) error {
 	return nil
 }
 
-func (db *DB) Query(query string) error {
-	_, err := db.sqld.Exec(query)
-	if err != nil {
-		return err
-	}
+func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
+	return db.sqld.Exec(query)
+}
 
-	return nil
+func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	return db.sqld.Query(query)
+}
+
+func (db *DB) Begin() (*sql.Tx, error) {
+	return db.sqld.Begin()
 }
 
 func (db *DB) GetLastCommit() (Commit, error) {
@@ -448,7 +451,7 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 
 func (db *DB) PrintAllCommits() error {
 	query := fmt.Sprintf("SELECT * FROM `%s/main`.dolt_diff ORDER BY date;", db.name)
-	err := db.Query(query)
+	_, err := db.Exec(query)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve commits: %w", err)
 	}
@@ -457,7 +460,7 @@ func (db *DB) PrintAllCommits() error {
 }
 
 func (db *DB) PrintAllData() error {
-	err := db.Query(fmt.Sprintf("SELECT * FROM `%s/main`.%s;", db.name, tableName))
+	_, err := db.Exec(fmt.Sprintf("SELECT * FROM `%s/main`.%s;", db.name, tableName))
 	if err != nil {
 		return fmt.Errorf("failed to retrieve commits: %w", err)
 	}
