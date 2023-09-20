@@ -144,7 +144,7 @@ func (db *DB) RequestHeadFromPeer(peerID string) error {
 
 	resp, err := client.RequestHead(context.TODO(), &proto.RequestHeadRequest{}, grpc.WaitForReady(true))
 	if err != nil {
-		db.log.Errorf("Error receiving head from peer '%s': %v", client.GetID(), err)
+		return fmt.Errorf("error receiving head from peer '%s': %v", client.GetID(), err)
 	}
 
 	db.eventQueue <- Event{Peer: peerID, Type: ExternalHeadEvent, Data: resp.Head}
