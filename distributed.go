@@ -25,13 +25,13 @@ func (c DBClient) GetID() string {
 // handlers
 //
 
-func (db *DB) remoteEventProcessor(broadcastEvents chan Event) func() error {
+func (db *DB) remoteEventProcessor() func() error {
 	db.log.Info("Starting db remote event processor")
 	stopSignal := make(chan struct{})
 	go func() {
 		for {
 			select {
-			case event := <-broadcastEvents:
+			case event := <-db.eventQueue:
 				err := db.eventHandler(event)
 				if err != nil {
 					db.log.Errorf("Error handling event '%s' from peer '%s': %v", event.Type, event.Peer, err)
@@ -51,9 +51,19 @@ func (db *DB) remoteEventProcessor(broadcastEvents chan Event) func() error {
 
 func (db *DB) eventHandler(event Event) error {
 	switch event.Type {
-	case ExternalNewHeadEvent:
-		db.log.Infof("new event '%s' from peer '%s': head -> %s", event.Type, event.Peer, event.Data.(string))
-		err := db.Pull(event.Peer)
+	case ExternalHeadEvent:
+		commitHash := event.Data.(string)
+		db.log.Debugf("new event '%s' from peer '%s': head -> %s", event.Type, event.Peer, commitHash)
+		found, err := db.CheckIfCommitPresent(commitHash)
+		if err != nil {
+			return fmt.Errorf("error checking if commit '%s' is present: %v", commitHash, err)
+		}
+		if found {
+			db.log.Debugf("commit '%s' already present", commitHash)
+			return nil
+		}
+
+		err = db.Pull(event.Peer)
 		if err != nil {
 			return fmt.Errorf("error pulling from peer '%s': %v", event.Peer, err)
 		}
@@ -100,4 +110,43 @@ func (db *DB) AdvertiseHead() {
 	}
 
 	db.log.Infof("Advertised head %s to all peers", commit.Hash)
+}
+
+func (db *DB) RequestHeadFromAllPeers() {
+
+	clients := db.GetClients()
+
+	if len(clients) == 0 {
+		return
+	}
+
+	heads := map[string]string{}
+
+	for id, client := range clients {
+		resp, err := client.RequestHead(context.TODO(), &proto.RequestHeadRequest{}, grpc.WaitForReady(true))
+		if err != nil {
+			db.log.Errorf("Error receiving head from peer '%s': %v", client.GetID(), err)
+			continue
+		}
+		heads[id] = resp.Head
+		db.eventQueue <- Event{Peer: id, Type: ExternalHeadEvent, Data: resp.Head}
+	}
+
+	db.log.Infof("Received heads from %d peers", len(heads))
+}
+
+func (db *DB) RequestHeadFromPeer(peerID string) error {
+
+	client, err := db.GetClient(peerID)
+	if err != nil {
+		return fmt.Errorf("error getting client for peer '%s': %v", peerID, err)
+	}
+
+	resp, err := client.RequestHead(context.TODO(), &proto.RequestHeadRequest{}, grpc.WaitForReady(true))
+	if err != nil {
+		db.log.Errorf("Error receiving head from peer '%s': %v", client.GetID(), err)
+	}
+
+	db.eventQueue <- Event{Peer: peerID, Type: ExternalHeadEvent, Data: resp.Head}
+	return nil
 }

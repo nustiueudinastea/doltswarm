@@ -10,12 +10,12 @@ import (
 )
 
 const (
-	ExternalNewHeadEvent = "new_head"
+	ExternalHeadEvent = "new_head"
 )
 
-func NewServerSyncer(logger *logrus.Entry, broadcastEvents chan Event) *ServerSyncer {
+func NewServerSyncer(logger *logrus.Entry, db *DB) *ServerSyncer {
 	return &ServerSyncer{
-		events: broadcastEvents,
+		db: db,
 	}
 }
 
@@ -26,7 +26,9 @@ type Event struct {
 }
 
 type ServerSyncer struct {
-	events chan Event
+	db *DB
+
+	proto.UnimplementedDBSyncerServer
 }
 
 func (s *ServerSyncer) AdvertiseHead(ctx context.Context, req *proto.AdvertiseHeadRequest) (*proto.AdvertiseHeadResponse, error) {
@@ -35,6 +37,15 @@ func (s *ServerSyncer) AdvertiseHead(ctx context.Context, req *proto.AdvertiseHe
 		return nil, errors.New("no AuthInfo in context")
 	}
 
-	s.events <- Event{Peer: peer.String(), Type: ExternalNewHeadEvent, Data: req.Head}
+	s.db.eventQueue <- Event{Peer: peer.String(), Type: ExternalHeadEvent, Data: req.Head}
 	return &proto.AdvertiseHeadResponse{}, nil
+}
+
+func (s *ServerSyncer) RequestHead(ctx context.Context, req *proto.RequestHeadRequest) (*proto.RequestHeadResponse, error) {
+	commit, err := s.db.GetLastCommit()
+	if err != nil {
+		return nil, err
+	}
+
+	return &proto.RequestHeadResponse{Head: commit.Hash}, nil
 }

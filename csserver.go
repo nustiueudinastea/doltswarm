@@ -72,7 +72,7 @@ func (rs *ServerChunkStore) HasChunks(ctx context.Context, req *remotesapi.HasCh
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	defer func() { rs.log.Info("finished") }()
+	defer func() { rs.log.Trace("finished") }()
 
 	cs, err := rs.getStore()
 	if err != nil {
@@ -124,7 +124,7 @@ func (rs *ServerChunkStore) Root(ctx context.Context, req *remotesapi.RootReques
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	defer func() { rs.log.Info("finished Root") }()
+	defer func() { rs.log.Trace("finished Root") }()
 
 	cs, err := rs.getStore()
 	if err != nil {
@@ -149,7 +149,7 @@ func (rs *ServerChunkStore) GetRepoMetadata(ctx context.Context, req *remotesapi
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	defer func() { rs.log.Info("finished") }()
+	defer func() { rs.log.Trace("finished") }()
 
 	cs, err := rs.getOrCreateStore()
 	if err != nil {
@@ -173,7 +173,7 @@ func (rs *ServerChunkStore) ListTableFiles(ctx context.Context, req *remotesapi.
 	if err := ValidateListTableFilesRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	defer func() { rs.log.Info("finished ListTableFiles") }()
+	defer func() { rs.log.Trace("finished ListTableFiles") }()
 
 	cs, err := rs.getStore()
 	if err != nil {

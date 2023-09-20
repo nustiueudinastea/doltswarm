@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion7
 
 const (
 	DBSyncer_AdvertiseHead_FullMethodName = "/proto.DBSyncer/AdvertiseHead"
+	DBSyncer_RequestHead_FullMethodName   = "/proto.DBSyncer/RequestHead"
 )
 
 // DBSyncerClient is the client API for DBSyncer service.
@@ -27,6 +28,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type DBSyncerClient interface {
 	AdvertiseHead(ctx context.Context, in *AdvertiseHeadRequest, opts ...grpc.CallOption) (*AdvertiseHeadResponse, error)
+	RequestHead(ctx context.Context, in *RequestHeadRequest, opts ...grpc.CallOption) (*RequestHeadResponse, error)
 }
 
 type dBSyncerClient struct {
@@ -46,11 +48,21 @@ func (c *dBSyncerClient) AdvertiseHead(ctx context.Context, in *AdvertiseHeadReq
 	return out, nil
 }
 
+func (c *dBSyncerClient) RequestHead(ctx context.Context, in *RequestHeadRequest, opts ...grpc.CallOption) (*RequestHeadResponse, error) {
+	out := new(RequestHeadResponse)
+	err := c.cc.Invoke(ctx, DBSyncer_RequestHead_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DBSyncerServer is the server API for DBSyncer service.
 // All implementations should embed UnimplementedDBSyncerServer
 // for forward compatibility
 type DBSyncerServer interface {
 	AdvertiseHead(context.Context, *AdvertiseHeadRequest) (*AdvertiseHeadResponse, error)
+	RequestHead(context.Context, *RequestHeadRequest) (*RequestHeadResponse, error)
 }
 
 // UnimplementedDBSyncerServer should be embedded to have forward compatible implementations.
@@ -59,6 +71,9 @@ type UnimplementedDBSyncerServer struct {
 
 func (UnimplementedDBSyncerServer) AdvertiseHead(context.Context, *AdvertiseHeadRequest) (*AdvertiseHeadResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AdvertiseHead not implemented")
+}
+func (UnimplementedDBSyncerServer) RequestHead(context.Context, *RequestHeadRequest) (*RequestHeadResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RequestHead not implemented")
 }
 
 // UnsafeDBSyncerServer may be embedded to opt out of forward compatibility for this service.
@@ -90,6 +105,24 @@ func _DBSyncer_AdvertiseHead_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DBSyncer_RequestHead_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RequestHeadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DBSyncerServer).RequestHead(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DBSyncer_RequestHead_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DBSyncerServer).RequestHead(ctx, req.(*RequestHeadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DBSyncer_ServiceDesc is the grpc.ServiceDesc for DBSyncer service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -100,6 +133,10 @@ var DBSyncer_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AdvertiseHead",
 			Handler:    _DBSyncer_AdvertiseHead_Handler,
+		},
+		{
+			MethodName: "RequestHead",
+			Handler:    _DBSyncer_RequestHead_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

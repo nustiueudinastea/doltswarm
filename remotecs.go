@@ -86,7 +86,7 @@ type RemoteChunkStore struct {
 }
 
 func (rcs *RemoteChunkStore) Get(ctx context.Context, h hash.Hash) (chunks.Chunk, error) {
-	rcs.log.Info("calling Get")
+	rcs.log.Trace("calling Get")
 
 	hashes := hash.HashSet{h: struct{}{}}
 	var found *chunks.Chunk
@@ -102,7 +102,7 @@ func (rcs *RemoteChunkStore) Get(ctx context.Context, h hash.Hash) (chunks.Chunk
 }
 
 func (rcs *RemoteChunkStore) GetMany(ctx context.Context, hashes hash.HashSet, found func(context.Context, *chunks.Chunk)) error {
-	rcs.log.Info("calling GetMany")
+	rcs.log.Trace("calling GetMany")
 	ae := atomicerr.New()
 	decompressedSize := uint64(0)
 	err := rcs.GetManyCompressed(ctx, hashes, func(ctx context.Context, cc nbs.CompressedChunk) {
@@ -126,7 +126,7 @@ func (rcs *RemoteChunkStore) GetMany(ctx context.Context, hashes hash.HashSet, f
 }
 
 func (rcs *RemoteChunkStore) GetManyCompressed(ctx context.Context, hashes hash.HashSet, found func(context.Context, nbs.CompressedChunk)) error {
-	rcs.log.Info("calling GetManyCompressed")
+	rcs.log.Trace("calling GetManyCompressed")
 	hashToChunk := rcs.cache.Get(hashes)
 
 	notCached := make([]hash.Hash, 0, len(hashes))
@@ -198,7 +198,7 @@ func (rcs *RemoteChunkStore) downloadChunksAndCache(ctx context.Context, hashes 
 }
 
 func (rcs *RemoteChunkStore) Has(ctx context.Context, h hash.Hash) (bool, error) {
-	rcs.log.Info("calling Has")
+	rcs.log.Trace("calling Has")
 	hashes := hash.HashSet{h: struct{}{}}
 	absent, err := rcs.HasMany(ctx, hashes)
 
@@ -210,7 +210,7 @@ func (rcs *RemoteChunkStore) Has(ctx context.Context, h hash.Hash) (bool, error)
 }
 
 func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (hash.HashSet, error) {
-	rcs.log.Info("calling HasMany")
+	rcs.log.Trace("calling HasMany")
 
 	notCached := rcs.cache.Has(hashes)
 
@@ -284,17 +284,17 @@ func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (
 }
 
 func (rcs *RemoteChunkStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCb) error {
-	rcs.log.Info("calling Put")
+	rcs.log.Trace("calling Put")
 	return fmt.Errorf("not supported")
 }
 
 func (rcs *RemoteChunkStore) Version() string {
-	rcs.log.Info("calling Version: ", rcs.nbfVersion)
+	rcs.log.Trace("calling Version: ", rcs.nbfVersion)
 	return rcs.nbfVersion
 }
 
 func (rcs *RemoteChunkStore) Rebase(ctx context.Context) error {
-	rcs.log.Info("calling Rebase")
+	rcs.log.Trace("calling Rebase")
 	return fmt.Errorf("not supported")
 }
 
@@ -309,27 +309,27 @@ func (rcs *RemoteChunkStore) loadRoot(ctx context.Context) error {
 }
 
 func (rcs *RemoteChunkStore) Root(ctx context.Context) (hash.Hash, error) {
-	rcs.log.Info("calling Root")
+	rcs.log.Trace("calling Root")
 	return rcs.root, nil
 }
 
 func (rcs *RemoteChunkStore) Commit(ctx context.Context, current, last hash.Hash) (bool, error) {
-	rcs.log.Info("calling Commit")
+	rcs.log.Trace("calling Commit")
 	return false, fmt.Errorf("not supported")
 }
 
 func (rcs *RemoteChunkStore) Stats() interface{} {
-	rcs.log.Info("calling Stats")
+	rcs.log.Trace("calling Stats")
 	return nil
 }
 
 func (rcs *RemoteChunkStore) StatsSummary() string {
-	rcs.log.Info("calling StatsSummary")
+	rcs.log.Trace("calling StatsSummary")
 	return "Unsupported"
 }
 
 func (rcs *RemoteChunkStore) Close() error {
-	rcs.log.Info("calling Close")
+	rcs.log.Trace("calling Close")
 	return nil
 }
 
@@ -342,7 +342,7 @@ func (rcs *RemoteChunkStore) getRepoId() *remotesapi.RepoId {
 //
 
 func (rcs *RemoteChunkStore) Sources(ctx context.Context) (hash.Hash, []chunks.TableFile, []chunks.TableFile, error) {
-	rcs.log.Info("calling Sources")
+	rcs.log.Trace("calling Sources")
 	id := rcs.getRepoId()
 	req := &remotesapi.ListTableFilesRequest{RepoId: id, RepoPath: "", RepoToken: ""}
 	resp, err := rcs.client.ListTableFiles(ctx, req)
@@ -367,7 +367,7 @@ func getTableFiles(client *DBClient, infoList []*remotesapi.TableFileInfo) []chu
 }
 
 func (rcs *RemoteChunkStore) Size(ctx context.Context) (uint64, error) {
-	rcs.log.Info("calling Size")
+	rcs.log.Trace("calling Size")
 	return rcs.repoSize, nil
 }
 

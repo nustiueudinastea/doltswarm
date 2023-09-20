@@ -6,10 +6,15 @@ package proto;
 
 service DBSyncer {
   rpc AdvertiseHead (AdvertiseHeadRequest) returns (AdvertiseHeadResponse) {}
+  rpc RequestHead (RequestHeadRequest) returns (RequestHeadResponse) {}
 }
 
 message AdvertiseHeadRequest {
   string head = 1;
 }
-
 message AdvertiseHeadResponse {}
+
+message RequestHeadRequest {}
+message RequestHeadResponse {
+  string head = 1;
+}

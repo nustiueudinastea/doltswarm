@@ -52,6 +52,7 @@ type DB struct {
 	sqle       *engine.SqlEngine
 	sqld       *sql.DB
 	sqlCtx     *doltSQL.Context
+	eventQueue chan Event
 	workingDir string
 	grpcServer *grpc.Server
 	log        *logrus.Logger
@@ -68,6 +69,7 @@ func New(dir string, name string, logger *logrus.Logger) (*DB, error) {
 		name:       name,
 		workingDir: workingDir,
 		log:        logger,
+		eventQueue: make(chan Event, 300),
 		dbClients:  map[string]*DBClient{},
 	}
 
@@ -163,8 +165,7 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 		}
 		chunkStoreCache := NewCSCache(cs.(remotesrv.RemoteSrvStore))
 		chunkStoreServer := NewServerChunkStore(logrus.NewEntry(db.log), chunkStoreCache, db.GetFilePath())
-		eventQueue := make(chan Event, 100)
-		syncerServer := NewServerSyncer(logrus.NewEntry(db.log), eventQueue)
+		syncerServer := NewServerSyncer(logrus.NewEntry(db.log), db)
 
 		// register grpc servers
 		if db.grpcServer == nil {
@@ -175,7 +176,7 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 		proto.RegisterDBSyncerServer(db.grpcServer, syncerServer)
 
 		// start event processor
-		db.stoppers = append(db.stoppers, db.remoteEventProcessor(eventQueue))
+		db.stoppers = append(db.stoppers, db.remoteEventProcessor())
 	}
 
 	return nil
@@ -282,6 +283,11 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 	}
 
 	db.log.Infof("Added remote for peer %s", peerID)
+
+	err = db.RequestHeadFromPeer(peerID)
+	if err != nil {
+		db.log.Errorf("failed to request head from peer %s: %v", peerID, err)
+	}
 
 	return nil
 }
@@ -417,6 +423,27 @@ func (db *DB) GetLastCommit() (Commit, error) {
 	}
 
 	return commits[0], nil
+}
+
+func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
+	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_diff WHERE commit_hash = '%s' LIMIT 1;", db.name, commitHash)
+	commit, err := sq.FetchOne(db.sqld, sq.
+		Queryf(query).
+		SetDialect(sq.DialectMySQL),
+		commitMapper,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "no rows in result set") {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to look up commit hash: %w", err)
+	}
+
+	if commit.Hash == commitHash {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func (db *DB) GetAllCommits() ([]Commit, error) {
