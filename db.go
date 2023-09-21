@@ -32,14 +32,11 @@ const (
 )
 
 type Commit struct {
-	Hash         string
-	Table        string
-	Committer    string
-	Email        string
-	Date         time.Time
-	Message      string
-	DataChange   bool
-	SchemaChange bool
+	Hash      string
+	Committer string
+	Email     string
+	Date      time.Time
+	Message   string
 }
 
 var tableName = "testtable"
@@ -408,7 +405,7 @@ func (db *DB) Begin() (*sql.Tx, error) {
 
 func (db *DB) GetLastCommit() (Commit, error) {
 
-	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_diff ORDER BY date DESC;", db.name)
+	query := `SELECT {*} FROM dolt_commits ORDER BY date DESC LIMIT 1;`
 	commits, err := sq.FetchAll(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
@@ -426,7 +423,7 @@ func (db *DB) GetLastCommit() (Commit, error) {
 }
 
 func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
-	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_diff WHERE commit_hash = '%s' LIMIT 1;", db.name, commitHash)
+	query := fmt.Sprintf("SELECT {*} FROM dolt_commits WHERE commit_hash = '%s' LIMIT 1;", commitHash)
 	commit, err := sq.FetchOne(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
@@ -447,7 +444,7 @@ func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 }
 
 func (db *DB) GetAllCommits() ([]Commit, error) {
-	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_diff ORDER BY date DESC;", db.name)
+	query := `SELECT {*} FROM dolt_commits;`
 	commits, err := sq.FetchAll(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
