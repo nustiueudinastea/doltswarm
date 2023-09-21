@@ -444,7 +444,7 @@ func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 }
 
 func (db *DB) GetAllCommits() ([]Commit, error) {
-	query := `SELECT {*} FROM dolt_commits;`
+	query := `SELECT {*} FROM dolt_commits ORDER BY date;`
 	commits, err := sq.FetchAll(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
