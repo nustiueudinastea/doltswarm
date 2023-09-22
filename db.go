@@ -126,7 +126,7 @@ func (db *DB) Open() error {
 		return err
 	}
 
-	db.sqld = sql.OpenDB(&Connector{driver: &doltDriver{conn: &dd.DoltConn{DataSource: &dd.DoltDataSource{}, SE: db.sqle, GmsCtx: db.sqlCtx}}})
+	db.sqld = sql.OpenDB(&Connector{driver: &doltDriver{conn: dd.CreateCustomConnection(&dd.DoltDataSource{}, db.sqle, db.sqlCtx)}})
 
 	env := db.mrEnv.GetEnv(db.name)
 	if env != nil {
