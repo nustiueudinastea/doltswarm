@@ -85,31 +85,35 @@ func (db *DB) eventHandler(event Event) error {
 //
 
 func (db *DB) AdvertiseHead() {
+	go func() {
+		clients := db.GetClients()
+		db.log.Infof("Advertising head to all peers (%d)", len(clients))
 
-	clients := db.GetClients()
-
-	if len(clients) == 0 {
-		return
-	}
-
-	commit, err := db.GetLastCommit()
-	if err != nil {
-		db.log.Errorf("Error getting last commit: %v", err)
-		return
-	}
-
-	req := &proto.AdvertiseHeadRequest{Head: commit.Hash}
-
-	for _, client := range clients {
-		_, err := client.AdvertiseHead(context.TODO(), req, grpc.WaitForReady(true))
-		if err != nil {
-			db.log.Errorf("Error advertising head to peer '%s': %v", client.GetID(), err)
-			continue
+		if len(clients) == 0 {
+			return
 		}
 
-	}
+		commit, err := db.GetLastCommit()
+		if err != nil {
+			db.log.Errorf("Error getting last commit: %v", err)
+			return
+		}
 
-	db.log.Infof("Advertised head %s to all peers", commit.Hash)
+		db.log.Infof("Advertising head %s to all peers (%d)", commit.Hash, len(clients))
+
+		req := &proto.AdvertiseHeadRequest{Head: commit.Hash}
+
+		for _, client := range clients {
+			_, err := client.AdvertiseHead(context.TODO(), req, grpc.WaitForReady(true))
+			if err != nil {
+				db.log.Errorf("Error advertising head to peer '%s': %v", client.GetID(), err)
+				continue
+			}
+
+		}
+
+		db.log.Infof("Advertised head %s to all peers", commit.Hash)
+	}()
 }
 
 func (db *DB) RequestHeadFromAllPeers() {

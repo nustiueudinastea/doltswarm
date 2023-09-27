@@ -39,8 +39,6 @@ type Commit struct {
 	Message   string
 }
 
-var tableName = "testtable"
-
 type DB struct {
 	name       string
 	stoppers   []func() error
@@ -180,18 +178,10 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 }
 
 func (db *DB) Close() error {
-	if db.mrEnv != nil {
-		dbEnv := db.mrEnv.GetEnv(db.name)
-		if dbEnv != nil {
-			remotes, err := dbEnv.GetRemotes()
-			if err == nil {
-				for r := range remotes {
-					err = dbEnv.RemoveRemote(context.TODO(), r)
-					if err != nil {
-						return err
-					}
-				}
-			}
+	for _, client := range db.dbClients {
+		err := db.RemovePeer(client.GetID())
+		if err != nil {
+			db.log.Warnf("failed to remove peer %s: %v", client.GetID(), err)
 		}
 	}
 
@@ -208,21 +198,6 @@ func (db *DB) Close() error {
 		}
 	}
 	return finalerr
-}
-
-func (db *DB) InitLocal() error {
-
-	_, err := db.sqld.Exec(fmt.Sprintf("CREATE DATABASE %s;", db.name))
-	if err != nil {
-		return fmt.Errorf("failed to create db: %w", err)
-	}
-
-	_, err = db.sqld.Exec(fmt.Sprintf("USE %s;", db.name))
-	if err != nil {
-		return fmt.Errorf("failed to use db: %w", err)
-	}
-
-	return nil
 }
 
 func (db *DB) GetFilePath() string {
@@ -257,12 +232,13 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 		db.log.Infof("Client for peer %s already exists", peerID)
 	}
 
-	// this part only continues if the db is already initialized (non nil env)
-	// so that the client is still available when doing initialization from another peer
 	dbEnv := db.mrEnv.GetEnv(db.name)
 	if dbEnv == nil {
 		return nil
 	}
+
+	// this part only continues if the db is already initialized (non nil env)
+	// so that the client is still available when doing initialization from another peer
 
 	remotes, err := dbEnv.GetRemotes()
 	if err != nil {
@@ -277,6 +253,18 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 		}
 	} else {
 		db.log.Infof("Remote for peer %s already exists", peerID)
+	}
+
+	commit, err := db.GetFirstCommit()
+	if err != nil {
+		return fmt.Errorf("failed to get first commit while adding peer: %w", err)
+	}
+
+	_, err = db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s', '%s');", peerID, commit.Hash))
+	if err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
+		}
 	}
 
 	db.log.Infof("Added remote for peer %s", peerID)
@@ -321,12 +309,27 @@ func (db *DB) GetClients() map[string]*DBClient {
 	return db.dbClients
 }
 
+func (db *DB) InitLocal() error {
+
+	_, err := db.sqld.Exec(fmt.Sprintf("CREATE DATABASE %s;", db.name))
+	if err != nil {
+		return fmt.Errorf("failed to create db: %w", err)
+	}
+
+	_, err = db.sqld.Exec(fmt.Sprintf("USE %s;", db.name))
+	if err != nil {
+		return fmt.Errorf("failed to use db: %w", err)
+	}
+
+	return nil
+}
+
 func (db *DB) InitFromPeer(peerID string) error {
 	db.log.Infof("Initializing from peer %s", peerID)
 
 	tries := 0
 	for tries < 10 {
-		query := fmt.Sprintf("CALL DOLT_CLONE('%s://%s/%s');", FactorySwarm, peerID, db.name)
+		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main','%s://%s/%s');", FactorySwarm, peerID, db.name)
 		_, err := db.Exec(query)
 		if err != nil {
 			if strings.Contains(err.Error(), "could not get client") {
@@ -345,27 +348,34 @@ func (db *DB) InitFromPeer(peerID string) error {
 }
 
 func (db *DB) Pull(peerID string) error {
-	_, err := db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID))
+	db.log.Infof("Pulling from peer %s", peerID)
+	txn, err := db.Begin()
 	if err != nil {
-		if strings.Contains(err.Error(), fmt.Sprintf("could not find %s", peerID)) {
-			// peer branch not found, we create it
-			_, err = db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s');", peerID))
-			if err != nil {
-				return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
-			}
-		} else {
-			return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
-		}
+		return fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer txn.Rollback()
+
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID))
+	if err != nil {
+		return fmt.Errorf("failed to checkout branch during pull from peer %s: %w", peerID, err)
+
 	}
 
-	_, err = db.Exec(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID))
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID))
 	if err != nil {
 		return fmt.Errorf("failed to pull db from peer %s: %w", peerID, err)
 	}
+
+	err = txn.Commit()
+	if err != nil {
+		return fmt.Errorf("failed to commit merge transaction: %w", err)
+	}
+
 	return nil
 }
 
 func (db *DB) Merge(peerID string) error {
+	db.log.Infof("Merging from peer %s", peerID)
 
 	txn, err := db.sqld.Begin()
 	if err != nil {
@@ -373,20 +383,127 @@ func (db *DB) Merge(peerID string) error {
 	}
 	defer txn.Rollback()
 
+	var hashMain sql.NullString
+	err = txn.QueryRow(fmt.Sprintf("select commit_hash from `%s/main`.dolt_log LIMIT 1", db.name)).Scan(&hashMain)
+	if err != nil || !hashMain.Valid {
+		return fmt.Errorf("failed to retrieve main hash: %w", err)
+	}
+
+	var hashPeer sql.NullString
+	err = txn.QueryRow(fmt.Sprintf("select commit_hash from `%s/%s`.dolt_log LIMIT 1", db.name, peerID)).Scan(&hashPeer)
+	if err != nil || !hashPeer.Valid {
+		return fmt.Errorf("failed to retrieve peer hash: %w", err)
+	}
+
+	var sourceBranch string
+	var targetBranch string
+	if hashMain.String > hashPeer.String {
+		sourceBranch = "main"
+		targetBranch = peerID
+	} else {
+		sourceBranch = peerID
+		targetBranch = "main"
+	}
+
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '%s', 'source');", sourceBranch))
+	if err != nil {
+		return fmt.Errorf("failed to copy source branch: %w", err)
+	}
+
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '%s', 'target');", targetBranch))
+	if err != nil {
+		return fmt.Errorf("failed to copy target branch: %w", err)
+	}
+
+	_, err = txn.Exec("CALL DOLT_CHECKOUT('target');")
+	if err != nil {
+		return fmt.Errorf("failed to checkout main branch: %w", err)
+	}
+
+	rows, err := txn.Query("CALL DOLT_MERGE('--no-commit', 'source');")
+	if err != nil {
+		return fmt.Errorf("failed to merge branch for peer '%s': %w", peerID, err)
+	}
+
+	defer rows.Close()
+	for rows.Next() {
+		hash := ""
+		fastForwards := 0
+		conflicts := 0
+		err := rows.Scan(&hash, &fastForwards, &conflicts)
+		if err != nil {
+			return fmt.Errorf("failed scan rows while merging branch for peer '%s': %w", peerID, err)
+		}
+
+		if conflicts > 0 {
+			return fmt.Errorf("conflicts found while merging branch for peer '%s'", peerID)
+		}
+
+		// if no conflict and a ff happend, we commit the transaction and we return because we don't need a dolt commit
+		if fastForwards > 0 {
+			err = txn.Commit()
+			if err != nil {
+				return fmt.Errorf("failed to commit merge transaction: %w", err)
+			}
+
+			commit, err := db.GetLastCommit()
+			if err != nil {
+				return fmt.Errorf("failed to GET commit merge transaction: %w", err)
+			}
+			fmt.Println(commit.Hash, " - ", commit.Message)
+
+			_, err = txn.Exec("CALL DOLT_CHECKOUT('main');")
+			if err != nil {
+				return fmt.Errorf("failed to checkout main branch: %w", err)
+			}
+
+			_, err = txn.Exec("CALL DOLT_MERGE('target');")
+			if err != nil {
+				return fmt.Errorf("failed to merge target to main branch: %w", err)
+			}
+
+			// advertise new head
+			db.AdvertiseHead()
+
+			return nil
+		}
+	}
+	err = rows.Err()
+	if err != nil {
+		return fmt.Errorf("failed close rows while merging branch for peer '%s': %w", peerID, err)
+	}
+
+	// commit
+	mergeTime, err := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
+	if err != nil {
+		return fmt.Errorf("failed to parse merge time: %w", err)
+	}
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_COMMIT('-A', '--author', 'merge <merge@merge.com>', '--date', '%s', '-m', 'auto merge');", mergeTime.Format(time.RFC3339Nano)))
+	if err != nil {
+		fmt.Println(err)
+		if strings.Contains(err.Error(), "nothing to commit") {
+			return nil
+		}
+		return fmt.Errorf("failed to commit merge: %w", err)
+	}
+
 	_, err = txn.Exec("CALL DOLT_CHECKOUT('main');")
 	if err != nil {
 		return fmt.Errorf("failed to checkout main branch: %w", err)
 	}
 
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_MERGE('%s');", peerID))
+	_, err = txn.Exec("CALL DOLT_MERGE('target');")
 	if err != nil {
-		return fmt.Errorf("failed to merge branch for peer '%s': %w", peerID, err)
+		return fmt.Errorf("failed to merge target to main branch: %w", err)
 	}
 
 	err = txn.Commit()
 	if err != nil {
 		return fmt.Errorf("failed to commit merge transaction: %w", err)
 	}
+
+	// advertise new head
+	db.AdvertiseHead()
 
 	return nil
 }
@@ -405,7 +522,26 @@ func (db *DB) Begin() (*sql.Tx, error) {
 
 func (db *DB) GetLastCommit() (Commit, error) {
 
-	query := `SELECT {*} FROM dolt_commits ORDER BY date DESC LIMIT 1;`
+	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log LIMIT 1;", db.name)
+	commits, err := sq.FetchAll(db.sqld, sq.
+		Queryf(query).
+		SetDialect(sq.DialectMySQL),
+		commitMapper,
+	)
+	if err != nil {
+		return Commit{}, fmt.Errorf("failed to retrieve last commit hash: %w", err)
+	}
+
+	if len(commits) == 0 {
+		return Commit{}, fmt.Errorf("no commits found")
+	}
+
+	return commits[0], nil
+}
+
+func (db *DB) GetFirstCommit() (Commit, error) {
+
+	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log ORDER BY date LIMIT 1;", db.name)
 	commits, err := sq.FetchAll(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
@@ -423,7 +559,7 @@ func (db *DB) GetLastCommit() (Commit, error) {
 }
 
 func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
-	query := fmt.Sprintf("SELECT {*} FROM dolt_commits WHERE commit_hash = '%s' LIMIT 1;", commitHash)
+	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log WHERE commit_hash = '%s' LIMIT 1;", db.name, commitHash)
 	commit, err := sq.FetchOne(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
@@ -444,7 +580,7 @@ func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 }
 
 func (db *DB) GetAllCommits() ([]Commit, error) {
-	query := `SELECT {*} FROM dolt_commits ORDER BY date;`
+	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log;", db.name)
 	commits, err := sq.FetchAll(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
@@ -458,24 +594,24 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 	return commits, nil
 }
 
-func (db *DB) PrintAllCommits() error {
-	query := fmt.Sprintf("SELECT * FROM `%s/main`.dolt_diff ORDER BY date;", db.name)
-	_, err := db.Exec(query)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve commits: %w", err)
-	}
+// func (db *DB) PrintAllCommits() error {
+// 	query := fmt.Sprintf("SELECT * FROM `%s/main`.dolt_diff ORDER BY date;", db.name)
+// 	_, err := db.Exec(query)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to retrieve commits: %w", err)
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
-func (db *DB) PrintAllData() error {
-	_, err := db.Exec(fmt.Sprintf("SELECT * FROM `%s/main`.%s;", db.name, tableName))
-	if err != nil {
-		return fmt.Errorf("failed to retrieve commits: %w", err)
-	}
+// func (db *DB) PrintAllData() error {
+// 	_, err := db.Exec(fmt.Sprintf("SELECT * FROM `%s/main`.%s;", db.name, tableName))
+// 	if err != nil {
+// 		return fmt.Errorf("failed to retrieve commits: %w", err)
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
 func (db *DB) PrintBranches() error {
 	dbEnv := db.mrEnv.GetEnv(db.name)
