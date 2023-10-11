@@ -13,7 +13,7 @@ require (
 	github.com/bokwoon95/sq v0.1.1
 	github.com/dolthub/dolt/go v0.40.5-0.20230824221934-83da423c3547
 	github.com/dolthub/driver v0.0.0-20230503220024-0df7c47dcc69
-	github.com/dolthub/go-mysql-server v0.17.1-0.20230920214618-75692cb811e7
+	github.com/dolthub/go-mysql-server v0.17.1-0.20230929002604-4c09261c634e
 	github.com/sirupsen/logrus v1.9.0
 	go.uber.org/multierr v1.8.0
 	google.golang.org/grpc v1.57.0
@@ -42,7 +42,7 @@ require (
 	github.com/dolthub/jsonpath v0.0.2-0.20230525180605-8dc13778fd72 // indirect
 	github.com/dolthub/maphash v0.0.0-20221220182448-74e1e1ea1577 // indirect
 	github.com/dolthub/swiss v0.1.0 // indirect
-	github.com/dolthub/vitess v0.0.0-20230920212116-eb645ef178c2 // indirect
+	github.com/dolthub/vitess v0.0.0-20230929000236-6c60b48b32da // indirect
 	github.com/dustin/go-humanize v1.0.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/go-kit/kit v0.12.0 // indirect

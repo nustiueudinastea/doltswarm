@@ -358,7 +358,6 @@ func (db *DB) Pull(peerID string) error {
 	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID))
 	if err != nil {
 		return fmt.Errorf("failed to checkout branch during pull from peer %s: %w", peerID, err)
-
 	}
 
 	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID))
@@ -405,12 +404,12 @@ func (db *DB) Merge(peerID string) error {
 		targetBranch = "main"
 	}
 
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '%s', 'source');", sourceBranch))
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '-f', '%s', 'source');", sourceBranch))
 	if err != nil {
 		return fmt.Errorf("failed to copy source branch: %w", err)
 	}
 
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '%s', 'target');", targetBranch))
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '-f', '%s', 'target');", targetBranch))
 	if err != nil {
 		return fmt.Errorf("failed to copy target branch: %w", err)
 	}
