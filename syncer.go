@@ -42,7 +42,7 @@ func (s *ServerSyncer) AdvertiseHead(ctx context.Context, req *proto.AdvertiseHe
 }
 
 func (s *ServerSyncer) RequestHead(ctx context.Context, req *proto.RequestHeadRequest) (*proto.RequestHeadResponse, error) {
-	commit, err := s.db.GetLastCommit()
+	commit, err := s.db.GetLastCommit("main")
 	if err != nil {
 		return nil, err
 	}

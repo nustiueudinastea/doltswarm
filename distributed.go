@@ -58,21 +58,21 @@ func (db *DB) eventHandler(event Event) error {
 		if err != nil {
 			return fmt.Errorf("error checking if commit '%s' is present: %v", commitHash, err)
 		}
-		if found {
-			db.log.Debugf("commit '%s' already present", commitHash)
-			return nil
-		}
 
 		err = db.Pull(event.Peer)
 		if err != nil {
 			return fmt.Errorf("error pulling from peer '%s': %v", event.Peer, err)
 		}
 
+		if found {
+			db.log.Debugf("commit '%s' already present", commitHash)
+			return nil
+		}
+
 		err = db.Merge(event.Peer)
 		if err != nil {
 			return fmt.Errorf("error merging from peer '%s': %v", event.Peer, err)
 		}
-
 	default:
 		return fmt.Errorf("unknown event type '%s'", event.Type)
 	}
@@ -93,7 +93,7 @@ func (db *DB) AdvertiseHead() {
 			return
 		}
 
-		commit, err := db.GetLastCommit()
+		commit, err := db.GetLastCommit("main")
 		if err != nil {
 			db.log.Errorf("Error getting last commit: %v", err)
 			return

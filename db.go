@@ -137,6 +137,12 @@ func (db *DB) Open() error {
 		if err != nil {
 			return fmt.Errorf("failed to use db: %w", err)
 		}
+
+		_, err = db.sqld.Exec("CALL DOLT_REMOTE('remove','origin');")
+		if err != nil && !strings.Contains(err.Error(), "unknown remote") {
+			return fmt.Errorf("failed to remove origin remote during init: %w", err)
+		}
+
 	} else {
 		err = db.p2pSetup(false)
 		if err != nil {
@@ -255,18 +261,6 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 		db.log.Infof("Remote for peer %s already exists", peerID)
 	}
 
-	commit, err := db.GetFirstCommit()
-	if err != nil {
-		return fmt.Errorf("failed to get first commit while adding peer: %w", err)
-	}
-
-	_, err = db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s', '%s');", peerID, commit.Hash))
-	if err != nil {
-		if !strings.Contains(err.Error(), "already exists") {
-			return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
-		}
-	}
-
 	db.log.Infof("Added remote for peer %s", peerID)
 
 	err = db.RequestHeadFromPeer(peerID)
@@ -355,12 +349,7 @@ func (db *DB) Pull(peerID string) error {
 	}
 	defer txn.Rollback()
 
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", peerID))
-	if err != nil {
-		return fmt.Errorf("failed to checkout branch during pull from peer %s: %w", peerID, err)
-	}
-
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_PULL('%s', 'main');", peerID))
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_FETCH('%s', 'main');", peerID))
 	if err != nil {
 		return fmt.Errorf("failed to pull db from peer %s: %w", peerID, err)
 	}
@@ -376,124 +365,149 @@ func (db *DB) Pull(peerID string) error {
 func (db *DB) Merge(peerID string) error {
 	db.log.Infof("Merging from peer %s", peerID)
 
+	commit, err := db.GetFirstCommit()
+	if err != nil {
+		return fmt.Errorf("failed to get first commit while adding peer: %w", err)
+	}
+
 	txn, err := db.sqld.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
 	}
 	defer txn.Rollback()
 
+	tempPeerBranch := randSeq(6)
+	tempMainBranch := randSeq(6)
+
+	_, err = db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s', '%s');", tempPeerBranch, commit.Hash))
+	if err != nil {
+		return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
+	}
+	defer func() {
+		// delete temp branch
+		_, err = db.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempPeerBranch))
+		if err != nil {
+			db.log.Errorf("failed to delete temp branch: %v", err)
+		}
+	}()
+
+	_, err = db.Exec(fmt.Sprintf("CALL DOLT_MERGE('%s/main');", peerID))
+	if err != nil {
+		return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
+	}
+
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', 'main', '%s');", tempMainBranch))
+	if err != nil {
+		return fmt.Errorf("failed to copy source branch: %w", err)
+	}
+	defer func() {
+		// delete temp branch
+		_, err = db.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempMainBranch))
+		if err != nil {
+			db.log.Errorf("failed to delete temp branch: %v", err)
+		}
+	}()
+
 	var hashMain sql.NullString
-	err = txn.QueryRow(fmt.Sprintf("select commit_hash from `%s/main`.dolt_log LIMIT 1", db.name)).Scan(&hashMain)
+	err = txn.QueryRow(fmt.Sprintf("select commit_hash from `%s/%s`.dolt_log LIMIT 1", db.name, tempMainBranch)).Scan(&hashMain)
 	if err != nil || !hashMain.Valid {
 		return fmt.Errorf("failed to retrieve main hash: %w", err)
 	}
 
 	var hashPeer sql.NullString
-	err = txn.QueryRow(fmt.Sprintf("select commit_hash from `%s/%s`.dolt_log LIMIT 1", db.name, peerID)).Scan(&hashPeer)
+	err = txn.QueryRow(fmt.Sprintf("select commit_hash from `%s/%s`.dolt_log LIMIT 1", db.name, tempPeerBranch)).Scan(&hashPeer)
 	if err != nil || !hashPeer.Valid {
 		return fmt.Errorf("failed to retrieve peer hash: %w", err)
 	}
 
-	var sourceBranch string
-	var targetBranch string
+	// establish deterministic merge direction based on simple string comparison
+	sourceBranch := tempPeerBranch
+	targetBranch := tempMainBranch
 	if hashMain.String > hashPeer.String {
-		sourceBranch = "main"
-		targetBranch = peerID
-	} else {
-		sourceBranch = peerID
-		targetBranch = "main"
+		sourceBranch = tempMainBranch
+		targetBranch = tempPeerBranch
 	}
 
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '-f', '%s', 'source');", sourceBranch))
-	if err != nil {
-		return fmt.Errorf("failed to copy source branch: %w", err)
-	}
-
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', '-f', '%s', 'target');", targetBranch))
-	if err != nil {
-		return fmt.Errorf("failed to copy target branch: %w", err)
-	}
-
-	_, err = txn.Exec("CALL DOLT_CHECKOUT('target');")
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('%s');", targetBranch))
 	if err != nil {
 		return fmt.Errorf("failed to checkout main branch: %w", err)
 	}
 
-	rows, err := txn.Query("CALL DOLT_MERGE('--no-commit', 'source');")
+	rows, err := txn.Query(fmt.Sprintf("CALL DOLT_MERGE('--no-commit', '%s');", sourceBranch))
 	if err != nil {
 		return fmt.Errorf("failed to merge branch for peer '%s': %w", peerID, err)
 	}
 
 	defer rows.Close()
-	for rows.Next() {
-		hash := ""
-		fastForwards := 0
-		conflicts := 0
-		err := rows.Scan(&hash, &fastForwards, &conflicts)
+	if !rows.Next() {
+		err = rows.Err()
 		if err != nil {
-			return fmt.Errorf("failed scan rows while merging branch for peer '%s': %w", peerID, err)
-		}
-
-		if conflicts > 0 {
-			return fmt.Errorf("conflicts found while merging branch for peer '%s'", peerID)
-		}
-
-		// if no conflict and a ff happend, we commit the transaction and we return because we don't need a dolt commit
-		if fastForwards > 0 {
-			err = txn.Commit()
-			if err != nil {
-				return fmt.Errorf("failed to commit merge transaction: %w", err)
-			}
-
-			commit, err := db.GetLastCommit()
-			if err != nil {
-				return fmt.Errorf("failed to GET commit merge transaction: %w", err)
-			}
-			fmt.Println(commit.Hash, " - ", commit.Message)
-
-			_, err = txn.Exec("CALL DOLT_CHECKOUT('main');")
-			if err != nil {
-				return fmt.Errorf("failed to checkout main branch: %w", err)
-			}
-
-			_, err = txn.Exec("CALL DOLT_MERGE('target');")
-			if err != nil {
-				return fmt.Errorf("failed to merge target to main branch: %w", err)
-			}
-
-			// advertise new head
-			db.AdvertiseHead()
-
-			return nil
+			return fmt.Errorf("no query result after performing merge for '%s': %w", peerID, err)
 		}
 	}
-	err = rows.Err()
+
+	var hash string
+	var fastForwards int
+	var conflicts int
+	err = rows.Scan(&hash, &fastForwards, &conflicts)
 	if err != nil {
-		return fmt.Errorf("failed close rows while merging branch for peer '%s': %w", peerID, err)
+		return fmt.Errorf("failed to scan rows while merging branch for peer '%s': %w", peerID, err)
 	}
 
-	// commit
-	mergeTime, err := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
-	if err != nil {
-		return fmt.Errorf("failed to parse merge time: %w", err)
+	if conflicts > 0 {
+		return fmt.Errorf("conflicts found while merging branch for peer '%s'", peerID)
 	}
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_COMMIT('-A', '--author', 'merge <merge@merge.com>', '--date', '%s', '-m', 'auto merge');", mergeTime.Format(time.RFC3339Nano)))
-	if err != nil {
-		fmt.Println(err)
-		if strings.Contains(err.Error(), "nothing to commit") {
-			return nil
+
+	// if no conflict and a ff happend, we commit the transaction and we return because we don't need a dolt commit
+	if fastForwards > 0 {
+		//
+		// fast forward merge (no commit needed)
+		//
+
+		_, err = txn.Exec("CALL DOLT_CHECKOUT('main');")
+		if err != nil {
+			return fmt.Errorf("failed to checkout main branch: %w", err)
 		}
-		return fmt.Errorf("failed to commit merge: %w", err)
-	}
 
-	_, err = txn.Exec("CALL DOLT_CHECKOUT('main');")
-	if err != nil {
-		return fmt.Errorf("failed to checkout main branch: %w", err)
-	}
+		_, err = txn.Exec(fmt.Sprintf("CALL DOLT_MERGE('%s');", targetBranch))
+		if err != nil {
+			return fmt.Errorf("failed to merge target to main branch: %w", err)
+		}
 
-	_, err = txn.Exec("CALL DOLT_MERGE('target');")
-	if err != nil {
-		return fmt.Errorf("failed to merge target to main branch: %w", err)
+	} else {
+		//
+		// commit merge
+		//
+
+		// get last commit date and use it for our auto merge commit
+		query := fmt.Sprintf("SELECT {*} FROM `%s/%s`.dolt_log LIMIT 1;", db.name, targetBranch)
+		commits, err := sq.FetchAll(db.sqld, sq.
+			Queryf(query).
+			SetDialect(sq.DialectMySQL),
+			commitMapper,
+		)
+		if err != nil && len(commits) == 0 {
+			return fmt.Errorf("failed to retrieve last commit hash: %w", err)
+		}
+
+		_, err = txn.Exec(fmt.Sprintf("CALL DOLT_COMMIT('-A', '--author', 'merge <merge@merge.com>', '--date', '%s', '-m', 'auto merge');", commits[0].Date.Format(time.RFC3339Nano)))
+		if err != nil {
+			fmt.Println(err)
+			if strings.Contains(err.Error(), "nothing to commit") {
+				return nil
+			}
+			return fmt.Errorf("failed to commit merge: %w", err)
+		}
+
+		_, err = txn.Exec("CALL DOLT_CHECKOUT('main');")
+		if err != nil {
+			return fmt.Errorf("failed to checkout main branch: %w", err)
+		}
+
+		_, err = txn.Exec(fmt.Sprintf("CALL DOLT_MERGE('%s');", targetBranch))
+		if err != nil {
+			return fmt.Errorf("failed to merge target to main branch: %w", err)
+		}
 	}
 
 	err = txn.Commit()
@@ -504,6 +518,7 @@ func (db *DB) Merge(peerID string) error {
 	// advertise new head
 	db.AdvertiseHead()
 
+	db.log.Infof("Finished merging from peer %s", peerID)
 	return nil
 }
 
@@ -519,9 +534,9 @@ func (db *DB) Begin() (*sql.Tx, error) {
 	return db.sqld.Begin()
 }
 
-func (db *DB) GetLastCommit() (Commit, error) {
+func (db *DB) GetLastCommit(branch string) (Commit, error) {
 
-	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log LIMIT 1;", db.name)
+	query := fmt.Sprintf("SELECT {*} FROM `%s/%s`.dolt_log LIMIT 1;", db.name, branch)
 	commits, err := sq.FetchAll(db.sqld, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
