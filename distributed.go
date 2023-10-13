@@ -53,20 +53,21 @@ func (db *DB) eventHandler(event Event) error {
 	switch event.Type {
 	case ExternalHeadEvent:
 		commitHash := event.Data.(string)
-		db.log.Debugf("new event '%s' from peer '%s': head -> %s", event.Type, event.Peer, commitHash)
 		found, err := db.CheckIfCommitPresent(commitHash)
 		if err != nil {
 			return fmt.Errorf("error checking if commit '%s' is present: %v", commitHash, err)
 		}
 
+		if found {
+			db.log.Tracef("commit '%s' already present", commitHash)
+			return nil
+		}
+
+		db.log.Debugf("new event '%s' from peer '%s': head -> %s", event.Type, event.Peer, commitHash)
+
 		err = db.Pull(event.Peer)
 		if err != nil {
 			return fmt.Errorf("error pulling from peer '%s': %v", event.Peer, err)
-		}
-
-		if found {
-			db.log.Debugf("commit '%s' already present", commitHash)
-			return nil
 		}
 
 		err = db.Merge(event.Peer)
