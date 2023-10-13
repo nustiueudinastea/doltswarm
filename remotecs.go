@@ -24,12 +24,14 @@ const (
 	maxHasManyBatchSize = 16 * 1024
 )
 
+var chunkCache = newMapChunkCache()
+
 func NewRemoteChunkStore(client *DBClient, peerID string, dbName string, nbfVersion string, logger *logrus.Entry) (*RemoteChunkStore, error) {
 	rcs := &RemoteChunkStore{
 		dbName:      dbName,
 		client:      client,
 		peerID:      peerID,
-		cache:       newMapChunkCache(),
+		cache:       chunkCache,
 		httpFetcher: &http.Client{},
 		concurrency: ConcurrencyParams{
 			ConcurrentSmallFetches: 64,
