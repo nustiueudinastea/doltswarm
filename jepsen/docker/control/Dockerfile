@@ -1,4 +1,4 @@
-FROM jgoerzen/debian-base-standard:bullseye
+FROM jepsen-debian-base:dev1
 
 ENV container=docker
 STOPSIGNAL SIGRTMIN+3
@@ -16,12 +16,6 @@ RUN wget https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
     mv lein /usr/bin && \
     chmod +x /usr/bin/lein && \
     lein self-install
-
-# without --dev flag up.sh copies jepsen to these subfolders
-# with --dev flag they are empty until mounted
-COPY jepsen/jepsen /jepsen/jepsen/
-RUN if [ -f /jepsen/jepsen/project.clj ]; then cd /jepsen/jepsen && lein install; fi
-COPY jepsen /jepsen/
 
 ADD ./bashrc /root/.bashrc
 ADD ./init.sh /init.sh
