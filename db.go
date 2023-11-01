@@ -154,7 +154,7 @@ func (db *DB) Open() error {
 }
 
 func (db *DB) p2pSetup(withGRPCservers bool) error {
-	db.log.Infof("Doing p2p setup (grpc: %v)", withGRPCservers)
+	db.log.Infof("doing p2p setup (grpc: %v)", withGRPCservers)
 	// register new factory
 	dbfactory.RegisterFactory(FactorySwarm, NewCustomFactory(db.name, db, logrus.NewEntry(db.log)))
 
@@ -179,6 +179,8 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 		// start event processor
 		db.stoppers = append(db.stoppers, db.remoteEventProcessor())
 	}
+
+	db.log.Info("p2p setup done")
 
 	return nil
 }
@@ -265,7 +267,9 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 
 	err = db.RequestHeadFromPeer(peerID)
 	if err != nil {
-		db.log.Errorf("failed to request head from peer %s: %v", peerID, err)
+		if !strings.Contains(err.Error(), "unknown service proto.DBSyncer") {
+			db.log.Errorf("failed to request head from peer %s: %v", peerID, err)
+		}
 	}
 
 	return nil
