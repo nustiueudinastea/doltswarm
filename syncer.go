@@ -27,8 +27,6 @@ type Event struct {
 
 type ServerSyncer struct {
 	db *DB
-
-	proto.UnimplementedDBSyncerServer
 }
 
 func (s *ServerSyncer) AdvertiseHead(ctx context.Context, req *proto.AdvertiseHeadRequest) (*proto.AdvertiseHeadResponse, error) {
