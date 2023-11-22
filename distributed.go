@@ -3,6 +3,7 @@ package doltswarm
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/nustiueudinastea/doltswarm/proto"
@@ -88,7 +89,6 @@ func (db *DB) eventHandler(event Event) error {
 func (db *DB) AdvertiseHead() {
 	go func() {
 		clients := db.GetClients()
-		db.log.Infof("Advertising head to all peers (%d)", len(clients))
 
 		if len(clients) == 0 {
 			return
@@ -100,7 +100,7 @@ func (db *DB) AdvertiseHead() {
 			return
 		}
 
-		db.log.Infof("Advertising head %s to all peers (%d)", commit.Hash, len(clients))
+		db.log.Infof("Advertising head '%s' to all peers (%d)", commit.Hash, len(clients))
 
 		req := &proto.AdvertiseHeadRequest{Head: commit.Hash}
 
@@ -113,7 +113,7 @@ func (db *DB) AdvertiseHead() {
 
 		}
 
-		db.log.Infof("Advertised head %s to all peers", commit.Hash)
+		db.log.Infof("Advertised head '%s' to all peers", commit.Hash)
 	}()
 }
 
@@ -130,7 +130,9 @@ func (db *DB) RequestHeadFromAllPeers() {
 	for id, client := range clients {
 		resp, err := client.RequestHead(context.TODO(), &proto.RequestHeadRequest{}, grpc.WaitForReady(true))
 		if err != nil {
-			db.log.Errorf("Error receiving head from peer '%s': %v", client.GetID(), err)
+			if !strings.Contains(err.Error(), "not implemented") {
+				db.log.Errorf("Error receiving head from peer '%s': %v", client.GetID(), err)
+			}
 			continue
 		}
 		heads[id] = resp.Head
@@ -149,6 +151,9 @@ func (db *DB) RequestHeadFromPeer(peerID string) error {
 
 	resp, err := client.RequestHead(context.TODO(), &proto.RequestHeadRequest{}, grpc.WaitForReady(true))
 	if err != nil {
+		if strings.Contains(err.Error(), "not implemented") {
+			return nil
+		}
 		return fmt.Errorf("error receiving head from peer '%s': %v", client.GetID(), err)
 	}
 

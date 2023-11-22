@@ -1,6 +1,8 @@
 module github.com/nustiueudinastea/doltswarm
 
-go 1.20
+go 1.21
+
+toolchain go1.21.3
 
 replace (
 	github.com/dolthub/dolt/go => /Users/al3x/code/protos/code/dolt/go
@@ -13,10 +15,10 @@ require (
 	github.com/bokwoon95/sq v0.1.1
 	github.com/dolthub/dolt/go v0.40.5-0.20230824221934-83da423c3547
 	github.com/dolthub/driver v0.0.0-20230503220024-0df7c47dcc69
-	github.com/dolthub/go-mysql-server v0.17.1-0.20230929002604-4c09261c634e
+	github.com/dolthub/go-mysql-server v0.17.1-0.20231121231446-0a2b90169f58
 	github.com/sirupsen/logrus v1.9.0
 	go.uber.org/multierr v1.8.0
-	google.golang.org/grpc v1.57.0
+	google.golang.org/grpc v1.57.1
 	google.golang.org/protobuf v1.31.0
 )
 
@@ -42,7 +44,7 @@ require (
 	github.com/dolthub/jsonpath v0.0.2-0.20230525180605-8dc13778fd72 // indirect
 	github.com/dolthub/maphash v0.0.0-20221220182448-74e1e1ea1577 // indirect
 	github.com/dolthub/swiss v0.1.0 // indirect
-	github.com/dolthub/vitess v0.0.0-20230929000236-6c60b48b32da // indirect
+	github.com/dolthub/vitess v0.0.0-20231109003730-c0fa018b5ef6 // indirect
 	github.com/dustin/go-humanize v1.0.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/go-kit/kit v0.12.0 // indirect
@@ -105,17 +107,17 @@ require (
 	go.opentelemetry.io/otel/trace v1.11.1 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/zap v1.24.0 // indirect
-	golang.org/x/crypto v0.11.0 // indirect
+	golang.org/x/crypto v0.14.0 // indirect
 	golang.org/x/exp v0.0.0-20230522175609-2e198f4a06a1 // indirect
-	golang.org/x/mod v0.8.0 // indirect
-	golang.org/x/net v0.12.0 // indirect
+	golang.org/x/mod v0.12.0 // indirect
+	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/oauth2 v0.8.0 // indirect
-	golang.org/x/sync v0.2.0 // indirect
-	golang.org/x/sys v0.10.0 // indirect
-	golang.org/x/term v0.10.0 // indirect
-	golang.org/x/text v0.11.0 // indirect
+	golang.org/x/sync v0.3.0 // indirect
+	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/term v0.13.0 // indirect
+	golang.org/x/text v0.13.0 // indirect
 	golang.org/x/time v0.1.0 // indirect
-	golang.org/x/tools v0.6.0 // indirect
+	golang.org/x/tools v0.13.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 	gonum.org/v1/gonum v0.12.0 // indirect
 	gonum.org/v1/plot v0.12.0 // indirect

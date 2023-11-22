@@ -16,6 +16,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/remotesrv"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/binlogreplication"
+	"github.com/dolthub/dolt/go/libraries/utils/concurrentmap"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/datas"
@@ -51,7 +52,7 @@ type DB struct {
 	workingDir string
 	grpcServer *grpc.Server
 	log        *logrus.Logger
-	dbClients  map[string]*DBClient
+	dbClients  *concurrentmap.Map[string, *DBClient]
 }
 
 func New(dir string, name string, logger *logrus.Logger) (*DB, error) {
@@ -65,7 +66,7 @@ func New(dir string, name string, logger *logrus.Logger) (*DB, error) {
 		workingDir: workingDir,
 		log:        logger,
 		eventQueue: make(chan Event, 300),
-		dbClients:  map[string]*DBClient{},
+		dbClients:  concurrentmap.New[string, *DBClient](),
 	}
 
 	return db, nil
@@ -186,12 +187,13 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 }
 
 func (db *DB) Close() error {
-	for _, client := range db.dbClients {
+	db.dbClients.Iter(func(key string, client *DBClient) bool {
 		err := db.RemovePeer(client.GetID())
 		if err != nil {
 			db.log.Warnf("failed to remove peer %s: %v", client.GetID(), err)
 		}
-	}
+		return true
+	})
 
 	err := db.sqle.Close()
 	if err != context.Canceled {
@@ -229,13 +231,13 @@ func (db *DB) AddGRPCServer(server *grpc.Server) {
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 	db.log.Infof("Adding peer %s", peerID)
 
-	if _, ok := db.dbClients[peerID]; !ok {
-		db.dbClients[peerID] = &DBClient{
+	if _, ok := db.dbClients.Get(peerID); !ok {
+		db.dbClients.Set(peerID, &DBClient{
 			id:                      peerID,
 			DBSyncerClient:          proto.NewDBSyncerClient(conn),
 			ChunkStoreServiceClient: remotesapi.NewChunkStoreServiceClient(conn),
 			DownloaderClient:        proto.NewDownloaderClient(conn),
-		}
+		})
 	} else {
 		db.log.Infof("Client for peer %s already exists", peerID)
 	}
@@ -253,7 +255,7 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 		return fmt.Errorf("failed to get remotes: %v", err)
 	}
 
-	if _, ok := remotes[peerID]; !ok {
+	if _, ok := remotes.Get(peerID); !ok {
 		r := env.NewRemote(peerID, fmt.Sprintf("%s://%s", FactorySwarm, peerID), map[string]string{})
 		err := dbEnv.AddRemote(r)
 		if err != nil {
@@ -282,7 +284,7 @@ func (db *DB) RemovePeer(peerID string) error {
 		return nil
 	}
 
-	delete(db.dbClients, peerID)
+	db.dbClients.Delete(peerID)
 
 	err := dbEnv.RemoveRemote(context.Background(), peerID)
 	if err != nil {
@@ -297,14 +299,14 @@ func (db *DB) RemovePeer(peerID string) error {
 }
 
 func (db *DB) GetClient(peerID string) (*DBClient, error) {
-	if client, ok := db.dbClients[peerID]; ok {
+	if client, ok := db.dbClients.Get(peerID); ok {
 		return client, nil
 	}
 	return nil, fmt.Errorf("client for peer %s not found", peerID)
 }
 
 func (db *DB) GetClients() map[string]*DBClient {
-	return db.dbClients
+	return db.dbClients.Snapshot()
 }
 
 func (db *DB) InitLocal() error {
