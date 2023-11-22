@@ -195,14 +195,16 @@ func (db *DB) Close() error {
 		return true
 	})
 
-	err := db.sqle.Close()
-	if err != context.Canceled {
-		return err
+	if db.sqle != nil {
+		err := db.sqle.Close()
+		if err != context.Canceled {
+			return err
+		}
 	}
 
 	var finalerr error
 	for _, stopper := range db.stoppers {
-		err = stopper()
+		err := stopper()
 		if err != nil {
 			finalerr = multierr.Append(finalerr, err)
 		}
