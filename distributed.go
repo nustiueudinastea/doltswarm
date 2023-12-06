@@ -26,7 +26,7 @@ func (c DBClient) GetID() string {
 // handlers
 //
 
-func (db *DB) remoteEventProcessor() func() error {
+func (db *DB) startRemoteEventProcessor() func() error {
 	db.log.Info("Starting db remote event processor")
 	stopSignal := make(chan struct{})
 	go func() {

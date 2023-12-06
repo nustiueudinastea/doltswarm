@@ -12,23 +12,25 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func NewCustomFactory(dbName string, db *DB, logger *logrus.Entry) CustomFactory {
-	return CustomFactory{dbName, db, logger}
+type ClientRetriever interface {
+	GetClient(peerID string) (*DBClient, error)
 }
 
-type CustomFactory struct {
-	dbName string
-	db     *DB
-	logger *logrus.Entry
+func NewDoltSwarmFactory(dbName string, clientRetriever ClientRetriever, logger *logrus.Entry) DoltSwarmFactory {
+	return DoltSwarmFactory{dbName, clientRetriever, logger}
 }
 
-func (fact CustomFactory) PrepareDB(ctx context.Context, nbf *types.NomsBinFormat, urlObj *url.URL, params map[string]interface{}) error {
+type DoltSwarmFactory struct {
+	dbName          string
+	clientRetriever ClientRetriever
+	logger          *logrus.Entry
+}
+
+func (fact DoltSwarmFactory) PrepareDB(ctx context.Context, nbf *types.NomsBinFormat, urlObj *url.URL, params map[string]interface{}) error {
 	return nil
 }
 
-func (fact CustomFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFormat, urlObj *url.URL, params map[string]interface{}) (datas.Database, types.ValueReadWriter, tree.NodeStore, error) {
-	var db datas.Database
-
+func (fact DoltSwarmFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFormat, urlObj *url.URL, params map[string]interface{}) (datas.Database, types.ValueReadWriter, tree.NodeStore, error) {
 	cs, err := fact.newChunkStore(urlObj.Host, nbf.VersionString())
 	if err != nil {
 		return nil, nil, nil, err
@@ -36,14 +38,14 @@ func (fact CustomFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFormat
 
 	vrw := types.NewValueStore(cs)
 	ns := tree.NewNodeStore(cs)
-	db = datas.NewTypesDatabase(vrw, ns)
+	typesDB := datas.NewTypesDatabase(vrw, ns)
 
-	return db, vrw, ns, nil
+	return typesDB, vrw, ns, nil
 }
 
-func (fact CustomFactory) newChunkStore(peerID string, nbfVersion string) (chunks.ChunkStore, error) {
+func (fact DoltSwarmFactory) newChunkStore(peerID string, nbfVersion string) (chunks.ChunkStore, error) {
 
-	client, err := fact.db.GetClient(peerID)
+	client, err := fact.clientRetriever.GetClient(peerID)
 	if err != nil {
 		return nil, fmt.Errorf("could not get client for '%s': %w", peerID, err)
 	}

@@ -4,28 +4,25 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/bokwoon95/sq"
-	"github.com/dolthub/dolt/go/cmd/dolt/commands/engine"
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/remotesrv"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/binlogreplication"
 	"github.com/dolthub/dolt/go/libraries/utils/concurrentmap"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/datas"
-	dd "github.com/dolthub/driver"
-	doltSQL "github.com/dolthub/go-mysql-server/sql"
 	"github.com/nustiueudinastea/doltswarm/proto"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
 	"google.golang.org/grpc"
+
+	_ "github.com/dolthub/driver"
 )
 
 const (
@@ -40,14 +37,38 @@ type Commit struct {
 	Message   string
 }
 
+type Remote struct {
+	Name       string
+	URL        string
+	FetchSpecs string
+	Params     string
+}
+
+type Database struct {
+	Name string
+}
+
+type DoltMREnvRetriever interface {
+	GetMultiRepoEnv() *env.MultiRepoEnv
+}
+
+func commitMapper(row *sq.Row) Commit {
+	commit := Commit{
+		Hash:      row.String("commit_hash"),
+		Committer: row.String("committer"),
+		Email:     row.String("email"),
+		Date:      row.Time("date"),
+		Message:   row.String("message"),
+	}
+	return commit
+}
+
 type DB struct {
-	name       string
-	stoppers   []func() error
-	dbEnvInit  *env.DoltEnv
-	mrEnv      *env.MultiRepoEnv
-	sqle       *engine.SqlEngine
-	sqld       *sql.DB
-	sqlCtx     *doltSQL.Context
+	init     bool
+	name     string
+	stoppers *concurrentmap.Map[string, func() error]
+	// mrEnv      *env.MultiRepoEnv
+	conn       *sql.Conn
 	eventQueue chan Event
 	workingDir string
 	grpcServer *grpc.Server
@@ -55,18 +76,20 @@ type DB struct {
 	dbClients  *concurrentmap.Map[string, *DBClient]
 }
 
-func New(dir string, name string, logger *logrus.Logger) (*DB, error) {
+func New(dir string, name string, logger *logrus.Logger, init bool) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
 	}
 
 	db := &DB{
+		init:       init,
 		name:       name,
 		workingDir: workingDir,
 		log:        logger,
 		eventQueue: make(chan Event, 300),
 		dbClients:  concurrentmap.New[string, *DBClient](),
+		stoppers:   concurrentmap.New[string, func() error](),
 	}
 
 	return db, nil
@@ -74,72 +97,40 @@ func New(dir string, name string, logger *logrus.Logger) (*DB, error) {
 
 func (db *DB) Open() error {
 
-	workingDirFS, err := filesys.LocalFS.WithWorkingDir(db.workingDir)
+	err := ensureDir(db.workingDir)
 	if err != nil {
 		return fmt.Errorf("failed to open db: %w", err)
 	}
 
-	err = ensureDir(db.workingDir)
+	var dbConn string
+	if db.init {
+		dbConn = "file://" + db.workingDir + "?commitname=Alex&commitemail=alex@giurgiu.io&multistatements=true"
+	} else {
+		dbConn = "file://" + db.workingDir + "?commitname=Alex&commitemail=alex@giurgiu.io&database=" + db.name + "&multistatements=true"
+	}
+
+	sqld, err := sql.Open("dolt", dbConn)
 	if err != nil {
 		return fmt.Errorf("failed to open db: %w", err)
 	}
 
-	ctx := context.Background()
-	dbEnv := env.Load(ctx, env.GetCurrentUserHomeDir, workingDirFS, "file://"+db.workingDir+"/"+db.name, "1.6.1")
-	db.dbEnvInit = dbEnv
-	err = dbEnv.Config.WriteableConfig().SetStrings(map[string]string{
-		env.UserEmailKey: "alex@giurgiu.io",
-		env.UserNameKey:  "Alex Giurgiu",
-	})
+	db.conn, err = sqld.Conn(context.Background())
 	if err != nil {
-		return fmt.Errorf("failed to set config : %w", err)
+		return fmt.Errorf("failed to open db connection: %w", err)
 	}
 
-	db.mrEnv, err = env.MultiEnvForDirectory(ctx, dbEnv.Config.WriteableConfig(), workingDirFS, dbEnv.Version, dbEnv.IgnoreLockFile, dbEnv)
-	if err != nil {
-		return fmt.Errorf("failed to load database names: %v", err)
+	if db.conn.PingContext(context.Background()) != nil {
+		return fmt.Errorf("failed to ping db: %w", err)
 	}
 
-	sqleConfig := &engine.SqlEngineConfig{
-		IsReadOnly:              false,
-		PrivFilePath:            ".doltcfg/privileges.db",
-		BranchCtrlFilePath:      ".doltcfg/branch_control.db",
-		DoltCfgDirPath:          ".doltcfg",
-		ServerUser:              "root",
-		ServerPass:              "",
-		ServerHost:              "localhost",
-		Autocommit:              false,
-		DoltTransactionCommit:   false,
-		JwksConfig:              []engine.JwksConfig{},
-		ClusterController:       nil,
-		BinlogReplicaController: binlogreplication.DoltBinlogReplicaController,
-	}
-
-	db.sqle, err = engine.NewSqlEngine(ctx, db.mrEnv, sqleConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create sql engine: %w", err)
-	}
-
-	db.sqlCtx, err = db.sqle.NewLocalContext(ctx)
-	if err != nil {
-		return err
-	}
-
-	db.sqld = sql.OpenDB(&Connector{driver: &doltDriver{conn: dd.CreateCustomConnection(&dd.DoltDataSource{}, db.sqle, db.sqlCtx)}})
-
-	env := db.mrEnv.GetEnv(db.name)
-	if env != nil {
+	dbs, err := db.GetDatabase(db.name)
+	if err == nil && dbs == db.name {
 		err = db.p2pSetup(true)
 		if err != nil {
 			return fmt.Errorf("failed to do p2p setup: %w", err)
 		}
 
-		_, err = db.sqld.Exec(fmt.Sprintf("USE %s;", db.name))
-		if err != nil {
-			return fmt.Errorf("failed to use db: %w", err)
-		}
-
-		_, err = db.sqld.Exec("CALL DOLT_REMOTE('remove','origin');")
+		_, err = db.conn.ExecContext(context.Background(), "CALL DOLT_REMOTE('remove','origin');")
 		if err != nil && !strings.Contains(err.Error(), "unknown remote") {
 			return fmt.Errorf("failed to remove origin remote during init: %w", err)
 		}
@@ -157,7 +148,8 @@ func (db *DB) Open() error {
 func (db *DB) p2pSetup(withGRPCservers bool) error {
 	db.log.Infof("doing p2p setup (grpc: %v)", withGRPCservers)
 	// register new factory
-	dbfactory.RegisterFactory(FactorySwarm, NewCustomFactory(db.name, db, logrus.NewEntry(db.log)))
+	dbfactory.DBFactories[FactorySwarm] = NewDoltSwarmFactory(db.name, db, logrus.NewEntry(db.log))
+	dbfactory.RegisterFactory(FactorySwarm, NewDoltSwarmFactory(db.name, db, logrus.NewEntry(db.log)))
 
 	if withGRPCservers {
 		// prepare dolt chunk store server
@@ -178,7 +170,7 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 		proto.RegisterDBSyncerServer(db.grpcServer, syncerServer)
 
 		// start event processor
-		db.stoppers = append(db.stoppers, db.remoteEventProcessor())
+		db.stoppers.Set("dbEventProcessor", db.startRemoteEventProcessor())
 	}
 
 	db.log.Info("p2p setup done")
@@ -187,6 +179,7 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 }
 
 func (db *DB) Close() error {
+	defer db.conn.Close()
 	db.dbClients.Iter(func(key string, client *DBClient) bool {
 		err := db.RemovePeer(client.GetID())
 		if err != nil {
@@ -195,20 +188,15 @@ func (db *DB) Close() error {
 		return true
 	})
 
-	if db.sqle != nil {
-		err := db.sqle.Close()
-		if err != context.Canceled {
-			return err
-		}
-	}
-
 	var finalerr error
-	for _, stopper := range db.stoppers {
+	db.stoppers.Iter(func(key string, stopper func() error) bool {
 		err := stopper()
 		if err != nil {
 			finalerr = multierr.Append(finalerr, err)
 		}
-	}
+		db.log.Infof("Stopped %s", key)
+		return true
+	})
 	return finalerr
 }
 
@@ -217,7 +205,24 @@ func (db *DB) GetFilePath() string {
 }
 
 func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
-	env := db.mrEnv.GetEnv(db.name)
+
+	var mrEnv *env.MultiRepoEnv
+	err := db.conn.Raw(func(driverConn any) error {
+		r, ok := driverConn.(DoltMREnvRetriever)
+		if !ok {
+			return fmt.Errorf("connection is not of dolt type")
+		}
+		mrEnv = r.GetMultiRepoEnv()
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve multi repo env: %w", err)
+	}
+	if mrEnv == nil {
+		return nil, fmt.Errorf("multi repo env not found")
+	}
+
+	env := mrEnv.GetEnv(db.name)
 	if env == nil {
 		return nil, fmt.Errorf("failed to retrieve db env")
 	}
@@ -231,8 +236,6 @@ func (db *DB) AddGRPCServer(server *grpc.Server) {
 }
 
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
-	db.log.Infof("Adding peer %s", peerID)
-
 	if _, ok := db.dbClients.Get(peerID); !ok {
 		db.dbClients.Set(peerID, &DBClient{
 			id:                      peerID,
@@ -240,39 +243,26 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 			ChunkStoreServiceClient: remotesapi.NewChunkStoreServiceClient(conn),
 			DownloaderClient:        proto.NewDownloaderClient(conn),
 		})
+		db.log.Infof("Added client for peer %s", peerID)
 	} else {
 		db.log.Infof("Client for peer %s already exists", peerID)
 	}
 
-	dbEnv := db.mrEnv.GetEnv(db.name)
-	if dbEnv == nil {
-		return nil
-	}
-
-	// this part only continues if the db is already initialized (non nil env)
-	// so that the client is still available when doing initialization from another peer
-
-	remotes, err := dbEnv.GetRemotes()
-	if err != nil {
-		return fmt.Errorf("failed to get remotes: %v", err)
-	}
-
-	if _, ok := remotes.Get(peerID); !ok {
-		r := env.NewRemote(peerID, fmt.Sprintf("%s://%s", FactorySwarm, peerID), map[string]string{})
-		err := dbEnv.AddRemote(r)
+	if !db.init {
+		// this part is executed if the db is already initialized
+		// so that the client is still available when doing initialization from another peer
+		_, err := db.Exec(fmt.Sprintf("CALL DOLT_REMOTE('add','%s','%s://%s');", peerID, FactorySwarm, peerID))
 		if err != nil {
-			return fmt.Errorf("failed to add remote: %w", err)
+			return fmt.Errorf("failed to add remote for peer %s: %w", peerID, err)
 		}
-	} else {
-		db.log.Infof("Remote for peer %s already exists", peerID)
-	}
 
-	db.log.Infof("Added remote for peer %s", peerID)
+		db.log.Infof("Added remote for peer %s", peerID)
 
-	err = db.RequestHeadFromPeer(peerID)
-	if err != nil {
-		if !strings.Contains(err.Error(), "unknown service proto.DBSyncer") {
-			db.log.Errorf("failed to request head from peer %s: %v", peerID, err)
+		err = db.RequestHeadFromPeer(peerID)
+		if err != nil {
+			if !strings.Contains(err.Error(), "unknown service proto.DBSyncer") {
+				db.log.Errorf("failed to request head from peer %s: %v", peerID, err)
+			}
 		}
 	}
 
@@ -280,21 +270,17 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 }
 
 func (db *DB) RemovePeer(peerID string) error {
-
-	dbEnv := db.mrEnv.GetEnv(db.name)
-	if dbEnv == nil {
-		return nil
-	}
-
 	db.dbClients.Delete(peerID)
 
-	err := dbEnv.RemoveRemote(context.Background(), peerID)
-	if err != nil {
-		if strings.Contains(err.Error(), "remote not found") {
-			return nil
+	if !db.init {
+		_, err := db.Exec(fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
+		if err != nil {
+			if !strings.Contains(err.Error(), "remote not found") && !strings.Contains(err.Error(), "unknown remote") {
+				return fmt.Errorf("failed to remove remote for peer %s: %w", peerID, err)
+			}
 		}
-		return fmt.Errorf("failed to remove remote: %w", err)
 	}
+
 	db.log.Infof("Removed remote for peer %s", peerID)
 
 	return nil
@@ -312,15 +298,18 @@ func (db *DB) GetClients() map[string]*DBClient {
 }
 
 func (db *DB) InitLocal() error {
+	db.log.Infof("Initializing local db %s", db.name)
 
-	_, err := db.sqld.Exec(fmt.Sprintf("CREATE DATABASE %s;", db.name))
+	ctx := context.Background()
+
+	_, err := db.conn.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE %s;", db.name))
 	if err != nil {
 		return fmt.Errorf("failed to create db: %w", err)
 	}
 
-	_, err = db.sqld.Exec(fmt.Sprintf("USE %s;", db.name))
+	_, err = db.conn.ExecContext(ctx, "commit;")
 	if err != nil {
-		return fmt.Errorf("failed to use db: %w", err)
+		return fmt.Errorf("failed to commit db creation: %w", err)
 	}
 
 	return nil
@@ -329,9 +318,11 @@ func (db *DB) InitLocal() error {
 func (db *DB) InitFromPeer(peerID string) error {
 	db.log.Infof("Initializing from peer %s", peerID)
 
+	// time.Sleep(3 * time.Second)
+
 	tries := 0
 	for tries < 10 {
-		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main','%s://%s/%s');", FactorySwarm, peerID, db.name)
+		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main', '%s://%s/%s', '%s');", FactorySwarm, peerID, db.name, db.name)
 		_, err := db.Exec(query)
 		if err != nil {
 			if strings.Contains(err.Error(), "could not get client") {
@@ -342,6 +333,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 			}
 			return fmt.Errorf("failed to clone db: %w", err)
 		}
+
 		db.log.Infof("Successfully cloned db from peer %s", peerID)
 		return nil
 	}
@@ -378,7 +370,7 @@ func (db *DB) Merge(peerID string) error {
 		return fmt.Errorf("failed to get first commit while adding peer: %w", err)
 	}
 
-	txn, err := db.sqld.Begin()
+	txn, err := db.conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
 	}
@@ -387,7 +379,12 @@ func (db *DB) Merge(peerID string) error {
 	tempPeerBranch := randSeq(6)
 	tempMainBranch := randSeq(6)
 
-	_, err = db.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s', '%s');", tempPeerBranch, commit.Hash))
+	_, err = txn.Exec(fmt.Sprintf("USE %s;", db.name))
+	if err != nil {
+		return fmt.Errorf("failed to use db: %w", err)
+	}
+
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s', '%s');", tempPeerBranch, commit.Hash))
 	if err != nil {
 		return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
 	}
@@ -399,9 +396,9 @@ func (db *DB) Merge(peerID string) error {
 		}
 	}()
 
-	_, err = db.Exec(fmt.Sprintf("CALL DOLT_MERGE('%s/main');", peerID))
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_MERGE('%s/main');", peerID))
 	if err != nil {
-		return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
+		return fmt.Errorf("failed to merge peer branch %s: %w", peerID, err)
 	}
 
 	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', 'main', '%s');", tempMainBranch))
@@ -489,7 +486,7 @@ func (db *DB) Merge(peerID string) error {
 
 		// get last commit date and use it for our auto merge commit
 		query := fmt.Sprintf("SELECT {*} FROM `%s/%s`.dolt_log LIMIT 1;", db.name, targetBranch)
-		commits, err := sq.FetchAll(db.sqld, sq.
+		commits, err := sq.FetchAll(db.conn, sq.
 			Queryf(query).
 			SetDialect(sq.DialectMySQL),
 			commitMapper,
@@ -500,7 +497,6 @@ func (db *DB) Merge(peerID string) error {
 
 		_, err = txn.Exec(fmt.Sprintf("CALL DOLT_COMMIT('-A', '--author', 'merge <merge@merge.com>', '--date', '%s', '-m', 'auto merge');", commits[0].Date.Format(time.RFC3339Nano)))
 		if err != nil {
-			fmt.Println(err)
 			if strings.Contains(err.Error(), "nothing to commit") {
 				return nil
 			}
@@ -531,15 +527,15 @@ func (db *DB) Merge(peerID string) error {
 }
 
 func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
-	return db.sqld.Exec(query)
+	return db.conn.ExecContext(context.Background(), query)
 }
 
 func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
-	return db.sqld.Query(query)
+	return db.conn.QueryContext(context.Background(), query)
 }
 
 func (db *DB) Begin() (*sql.Tx, error) {
-	return db.sqld.Begin()
+	return db.conn.BeginTx(context.Background(), nil)
 }
 
 func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
@@ -581,7 +577,7 @@ func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 func (db *DB) GetLastCommit(branch string) (Commit, error) {
 
 	query := fmt.Sprintf("SELECT {*} FROM `%s/%s`.dolt_log LIMIT 1;", db.name, branch)
-	commits, err := sq.FetchAll(db.sqld, sq.
+	commits, err := sq.FetchAll(db.conn, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -597,10 +593,31 @@ func (db *DB) GetLastCommit(branch string) (Commit, error) {
 	return commits[0], nil
 }
 
+func (db *DB) GetRemote(name string) (Remote, error) {
+	return sq.FetchOne(db.conn, sq.
+		Queryf("SELECT {*} FROM remotes WHERE name = {}", name).
+		SetDialect(sq.DialectMySQL),
+		func(row *sq.Row) Remote {
+			return Remote{
+				Name:       row.String("name"),
+				URL:        row.String("url"),
+				FetchSpecs: row.String("fetch_specs"),
+				Params:     row.String("params"),
+			}
+		},
+	)
+}
+
+func (db *DB) GetDatabase(name string) (string, error) {
+	dbName := ""
+	err := db.conn.QueryRowContext(context.Background(), fmt.Sprintf("SHOW DATABASES LIKE '%s'", db.name)).Scan(&dbName)
+	return dbName, err
+}
+
 func (db *DB) GetFirstCommit() (Commit, error) {
 
 	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log ORDER BY date LIMIT 1;", db.name)
-	commits, err := sq.FetchAll(db.sqld, sq.
+	commits, err := sq.FetchAll(db.conn, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -618,7 +635,7 @@ func (db *DB) GetFirstCommit() (Commit, error) {
 
 func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log WHERE commit_hash = '%s' LIMIT 1;", db.name, commitHash)
-	commit, err := sq.FetchOne(db.sqld, sq.
+	commit, err := sq.FetchOne(db.conn, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -639,7 +656,7 @@ func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 
 func (db *DB) GetAllCommits() ([]Commit, error) {
 	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log;", db.name)
-	commits, err := sq.FetchAll(db.sqld, sq.
+	commits, err := sq.FetchAll(db.conn, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -671,17 +688,17 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 // 	return nil
 // }
 
-func (db *DB) PrintBranches() error {
-	dbEnv := db.mrEnv.GetEnv(db.name)
-	if dbEnv == nil {
-		return fmt.Errorf("db '%s' not found", db.name)
-	}
+// func (db *DB) PrintBranches() error {
+// 	dbEnv := db.mrEnv.GetEnv(db.name)
+// 	if dbEnv == nil {
+// 		return fmt.Errorf("db '%s' not found", db.name)
+// 	}
 
-	ctx := context.Background()
-	headRefs, err := dbEnv.DoltDB.GetHeadRefs(ctx)
-	if err != nil {
-		log.Fatalf("failed to retrieve head refs: %s", err.Error())
-	}
-	fmt.Println(headRefs)
-	return nil
-}
+// 	ctx := context.Background()
+// 	headRefs, err := dbEnv.DoltDB.GetHeadRefs(ctx)
+// 	if err != nil {
+// 		log.Fatalf("failed to retrieve head refs: %s", err.Error())
+// 	}
+// 	fmt.Println(headRefs)
+// 	return nil
+// }

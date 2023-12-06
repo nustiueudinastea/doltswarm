@@ -7,8 +7,6 @@ import (
 
 	"io"
 
-	"github.com/bokwoon95/sq"
-
 	"github.com/nustiueudinastea/doltswarm/proto"
 
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
@@ -20,17 +18,6 @@ const (
 	MaxFetchSize           = 128 * 1024 * 1024
 	HedgeDownloadSizeLimit = 4 * 1024 * 1024
 )
-
-func commitMapper(row *sq.Row) (Commit, error) {
-	commit := Commit{
-		Hash:      row.String("commit_hash"),
-		Committer: row.String("committer"),
-		Email:     row.String("email"),
-		Date:      row.Time("date"),
-		Message:   row.String("message"),
-	}
-	return commit, nil
-}
 
 func ensureDir(dirName string) error {
 	err := os.Mkdir(dirName, os.ModePerm)
