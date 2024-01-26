@@ -335,6 +335,11 @@ func (rcs *RemoteChunkStore) Close() error {
 	return nil
 }
 
+func (rcs *RemoteChunkStore) AccessMode() chunks.ExclusiveAccessMode {
+	rcs.log.Trace("calling AccessMode")
+	return chunks.ExclusiveAccessMode_ReadOnly
+}
+
 func (rcs *RemoteChunkStore) getRepoId() *remotesapi.RepoId {
 	return &remotesapi.RepoId{Org: rcs.peerID, RepoName: rcs.dbName}
 }
