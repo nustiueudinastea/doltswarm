@@ -454,7 +454,8 @@ func (db *DB) Merge(peerID string) error {
 	var hash string
 	var fastForwards int
 	var conflicts int
-	err = rows.Scan(&hash, &fastForwards, &conflicts)
+	var message string
+	err = rows.Scan(&hash, &fastForwards, &conflicts, &message)
 	if err != nil {
 		return fmt.Errorf("failed to scan rows while merging branch for peer '%s': %w", peerID, err)
 	}
