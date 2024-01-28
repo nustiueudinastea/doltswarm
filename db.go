@@ -669,37 +669,3 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 
 	return commits, nil
 }
-
-// func (db *DB) PrintAllCommits() error {
-// 	query := fmt.Sprintf("SELECT * FROM `%s/main`.dolt_diff ORDER BY date;", db.name)
-// 	_, err := db.Exec(query)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to retrieve commits: %w", err)
-// 	}
-
-// 	return nil
-// }
-
-// func (db *DB) PrintAllData() error {
-// 	_, err := db.Exec(fmt.Sprintf("SELECT * FROM `%s/main`.%s;", db.name, tableName))
-// 	if err != nil {
-// 		return fmt.Errorf("failed to retrieve commits: %w", err)
-// 	}
-
-// 	return nil
-// }
-
-// func (db *DB) PrintBranches() error {
-// 	dbEnv := db.mrEnv.GetEnv(db.name)
-// 	if dbEnv == nil {
-// 		return fmt.Errorf("db '%s' not found", db.name)
-// 	}
-
-// 	ctx := context.Background()
-// 	headRefs, err := dbEnv.DoltDB.GetHeadRefs(ctx)
-// 	if err != nil {
-// 		log.Fatalf("failed to retrieve head refs: %s", err.Error())
-// 	}
-// 	fmt.Println(headRefs)
-// 	return nil
-// }
