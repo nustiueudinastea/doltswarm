@@ -32,9 +32,24 @@ func (db *DB) Insert(table string, data string) error {
 	}
 
 	// commit
-	_, err = tx.Exec(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', 'Alex Giurgiu <alex@giurgiu.io>', '--date', '%s');", data, time.Now().Format(time.RFC3339Nano)))
+	var commitHash string
+	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s>', '--date', '%s');", data, db.commitName, db.commitEmail, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
-		return fmt.Errorf("failed to commit table: %w", err)
+		return fmt.Errorf("failed to commit: %w", err)
+	}
+
+	if db.signer == nil {
+		return fmt.Errorf("no signer available")
+	}
+	// create commit signature and add it to a tag
+	signature, err := db.signer.Sign(commitHash)
+	if err != nil {
+		return fmt.Errorf("failed to sign commit '%s': %w", commitHash, err)
+	}
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s>', '%s-%s', '%s');", signature, db.commitName, db.commitEmail, db.signer.PublicKey(), commitHash, commitHash)
+	_, err = tx.Exec(tagcmd)
+	if err != nil {
+		return fmt.Errorf("failed to create tag for signature: %w", err)
 	}
 
 	err = tx.Commit()

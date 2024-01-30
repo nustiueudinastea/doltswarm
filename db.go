@@ -52,6 +52,12 @@ type DoltMREnvRetriever interface {
 	GetMultiRepoEnv() *env.MultiRepoEnv
 }
 
+type Signer interface {
+	Sign(commit string) (string, error)
+	Verify(data []byte, signature string) error
+	PublicKey() string
+}
+
 func commitMapper(row *sq.Row) Commit {
 	commit := Commit{
 		Hash:      row.String("commit_hash"),
@@ -64,32 +70,36 @@ func commitMapper(row *sq.Row) Commit {
 }
 
 type DB struct {
-	init     bool
-	name     string
-	stoppers *concurrentmap.Map[string, func() error]
-	// mrEnv      *env.MultiRepoEnv
-	conn       *sql.Conn
-	eventQueue chan Event
-	workingDir string
-	grpcServer *grpc.Server
-	log        *logrus.Logger
-	dbClients  *concurrentmap.Map[string, *DBClient]
+	init        bool
+	name        string
+	commitName  string
+	commitEmail string
+	stoppers    *concurrentmap.Map[string, func() error]
+	conn        *sql.Conn
+	eventQueue  chan Event
+	workingDir  string
+	grpcServer  *grpc.Server
+	log         *logrus.Logger
+	dbClients   *concurrentmap.Map[string, *DBClient]
+	signer      Signer
 }
 
-func New(dir string, name string, logger *logrus.Logger, init bool) (*DB, error) {
+func New(dir string, name string, logger *logrus.Logger, init bool, commiterName string, commiterEmail string) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
 	}
 
 	db := &DB{
-		init:       init,
-		name:       name,
-		workingDir: workingDir,
-		log:        logger,
-		eventQueue: make(chan Event, 300),
-		dbClients:  concurrentmap.New[string, *DBClient](),
-		stoppers:   concurrentmap.New[string, func() error](),
+		init:        init,
+		name:        name,
+		commitName:  commiterName,
+		commitEmail: commiterEmail,
+		workingDir:  workingDir,
+		log:         logger,
+		eventQueue:  make(chan Event, 300),
+		dbClients:   concurrentmap.New[string, *DBClient](),
+		stoppers:    concurrentmap.New[string, func() error](),
 	}
 
 	return db, nil
@@ -104,9 +114,9 @@ func (db *DB) Open() error {
 
 	var dbConn string
 	if db.init {
-		dbConn = "file://" + db.workingDir + "?commitname=Alex&commitemail=alex@giurgiu.io&multistatements=true"
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s&multistatements=true", db.workingDir, db.commitName, db.commitEmail)
 	} else {
-		dbConn = "file://" + db.workingDir + "?commitname=Alex&commitemail=alex@giurgiu.io&database=" + db.name + "&multistatements=true"
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s&database=%s&multistatements=true", db.workingDir, db.commitName, db.commitEmail, db.name)
 	}
 
 	sqld, err := sql.Open("dolt", dbConn)
@@ -233,6 +243,10 @@ func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 
 func (db *DB) AddGRPCServer(server *grpc.Server) {
 	db.grpcServer = server
+}
+
+func (db *DB) AddSigner(signer Signer) {
+	db.signer = signer
 }
 
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
@@ -559,7 +573,7 @@ func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 
 	// commit
 	var commitHash string
-	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', 'Alex Giurgiu <alex@giurgiu.io>', '--date', '%s');", commitMsg, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
+	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s>', '--date', '%s');", commitMsg, db.commitName, db.commitEmail, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
 		return "", fmt.Errorf("failed to commit table: %w", err)
 	}
