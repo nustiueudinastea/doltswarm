@@ -553,42 +553,6 @@ func (db *DB) Begin() (*sql.Tx, error) {
 	return db.conn.BeginTx(context.Background(), nil)
 }
 
-func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return "", fmt.Errorf("failed to start transaction: %w", err)
-	}
-
-	defer tx.Rollback()
-
-	_, err = tx.Exec("CALL DOLT_CHECKOUT('main');")
-	if err != nil {
-		return "", fmt.Errorf("failed to checkout main branch: %w", err)
-	}
-
-	_, err = tx.Exec(query)
-	if err != nil {
-		return "", fmt.Errorf("failed to save record: %w", err)
-	}
-
-	// commit
-	var commitHash string
-	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s>', '--date', '%s');", commitMsg, db.commitName, db.commitEmail, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
-	if err != nil {
-		return "", fmt.Errorf("failed to commit table: %w", err)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		return "", fmt.Errorf("failed to commit insert transaction: %w", err)
-	}
-
-	// advertise new head
-	db.AdvertiseHead()
-
-	return commitHash, nil
-}
-
 func (db *DB) GetLastCommit(branch string) (Commit, error) {
 
 	query := fmt.Sprintf("SELECT {*} FROM `%s/%s`.dolt_log LIMIT 1;", db.name, branch)
