@@ -27,7 +27,7 @@ func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 
 	// commit
 	var commitHash string
-	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s>', '--date', '%s');", commitMsg, db.commitName, db.commitEmail, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
+	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s@%s>', '--date', '%s');", commitMsg, db.signer.PublicKey(), db.signer.PublicKey(), db.domain, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
 		return "", fmt.Errorf("failed to commit table: %w", err)
 	}
@@ -40,7 +40,7 @@ func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to sign commit '%s': %w", commitHash, err)
 	}
-	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s>', '%s', '%s');", db.signer.PublicKey(), db.commitName, db.commitEmail, signature, commitHash)
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.PublicKey(), db.signer.PublicKey(), db.domain, signature, commitHash)
 	_, err = tx.Exec(tagcmd)
 	if err != nil {
 		return "", fmt.Errorf("failed to create tag for signature: %w", err)
@@ -83,7 +83,7 @@ func (db *DB) Insert(table string, data string) error {
 
 	// commit
 	var commitHash string
-	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s>', '--date', '%s');", data, db.commitName, db.commitEmail, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
+	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s@%s>', '--date', '%s');", data, db.signer.PublicKey(), db.signer.PublicKey(), db.domain, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
 		return fmt.Errorf("failed to commit: %w", err)
 	}
@@ -96,7 +96,7 @@ func (db *DB) Insert(table string, data string) error {
 	if err != nil {
 		return fmt.Errorf("failed to sign commit '%s': %w", commitHash, err)
 	}
-	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s>', '%s', '%s');", db.signer.PublicKey(), db.commitName, db.commitEmail, signature, commitHash)
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.PublicKey(), db.signer.PublicKey(), db.domain, signature, commitHash)
 	_, err = tx.Exec(tagcmd)
 	if err != nil {
 		return fmt.Errorf("failed to create tag for signature: %w", err)

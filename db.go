@@ -70,36 +70,34 @@ func commitMapper(row *sq.Row) Commit {
 }
 
 type DB struct {
-	init        bool
-	name        string
-	commitName  string
-	commitEmail string
-	stoppers    *concurrentmap.Map[string, func() error]
-	conn        *sql.Conn
-	eventQueue  chan Event
-	workingDir  string
-	grpcServer  *grpc.Server
-	log         *logrus.Logger
-	dbClients   *concurrentmap.Map[string, *DBClient]
-	signer      Signer
+	init       bool
+	name       string
+	domain     string
+	stoppers   *concurrentmap.Map[string, func() error]
+	conn       *sql.Conn
+	eventQueue chan Event
+	workingDir string
+	grpcServer *grpc.Server
+	log        *logrus.Logger
+	dbClients  *concurrentmap.Map[string, *DBClient]
+	signer     Signer
 }
 
-func New(dir string, name string, logger *logrus.Logger, init bool, commiterName string, commiterEmail string) (*DB, error) {
+func New(dir string, name string, logger *logrus.Logger, init bool, domain string) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
 	}
 
 	db := &DB{
-		init:        init,
-		name:        name,
-		commitName:  commiterName,
-		commitEmail: commiterEmail,
-		workingDir:  workingDir,
-		log:         logger,
-		eventQueue:  make(chan Event, 300),
-		dbClients:   concurrentmap.New[string, *DBClient](),
-		stoppers:    concurrentmap.New[string, func() error](),
+		init:       init,
+		name:       name,
+		domain:     domain,
+		workingDir: workingDir,
+		log:        logger,
+		eventQueue: make(chan Event, 300),
+		dbClients:  concurrentmap.New[string, *DBClient](),
+		stoppers:   concurrentmap.New[string, func() error](),
 	}
 
 	return db, nil
@@ -114,9 +112,9 @@ func (db *DB) Open() error {
 
 	var dbConn string
 	if db.init {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s&multistatements=true", db.workingDir, db.commitName, db.commitEmail)
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&multistatements=true", db.workingDir, db.signer.PublicKey(), db.signer.PublicKey(), db.domain)
 	} else {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s&database=%s&multistatements=true", db.workingDir, db.commitName, db.commitEmail, db.name)
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&database=%s&multistatements=true", db.workingDir, db.signer.PublicKey(), db.signer.PublicKey(), db.domain, db.name)
 	}
 
 	sqld, err := sql.Open("dolt", dbConn)
@@ -370,7 +368,25 @@ func (db *DB) Pull(peerID string) error {
 
 	err = txn.Commit()
 	if err != nil {
-		return fmt.Errorf("failed to commit merge transaction: %w", err)
+		return fmt.Errorf("failed to commit sql pull transaction: %w", err)
+	}
+
+	return nil
+}
+
+func (db *DB) VerifySignatures(peerID string) error {
+	query := fmt.Sprintf("SELECT {*} FROM dolt_log('main..%s/main');", peerID)
+	commits, err := sq.FetchAll(db.conn, sq.
+		Queryf(query).
+		SetDialect(sq.DialectMySQL),
+		commitMapper,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to verify commits for peer %s: %w", peerID, err)
+	}
+
+	for _, commit := range commits {
+		fmt.Println(commit)
 	}
 
 	return nil
@@ -379,16 +395,18 @@ func (db *DB) Pull(peerID string) error {
 func (db *DB) Merge(peerID string) error {
 	db.log.Infof("Merging from peer %s", peerID)
 
-	commit, err := db.GetFirstCommit()
-	if err != nil {
-		return fmt.Errorf("failed to get first commit while adding peer: %w", err)
-	}
-
 	txn, err := db.conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
 	}
 	defer txn.Rollback()
+
+	// retrieve mergeBase between peer branch and main
+	var mergeBase string
+	err = txn.QueryRow(fmt.Sprintf("SELECT DOLT_MERGE_BASE('%s/main', 'main');", peerID)).Scan(&mergeBase)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve merge base for peer branch %s: %w", peerID, err)
+	}
 
 	tempPeerBranch := randSeq(6)
 	tempMainBranch := randSeq(6)
@@ -398,7 +416,8 @@ func (db *DB) Merge(peerID string) error {
 		return fmt.Errorf("failed to use db: %w", err)
 	}
 
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s', '%s');", tempPeerBranch, commit.Hash))
+	// create temp peer branch from old commit (this is needed to avoid conflicts) which will be used for storing the peer changes
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_CHECKOUT('-b', '%s', '%s');", tempPeerBranch, mergeBase))
 	if err != nil {
 		return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
 	}
@@ -410,11 +429,13 @@ func (db *DB) Merge(peerID string) error {
 		}
 	}()
 
+	// merge peer main branch into temp peer branch
 	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_MERGE('%s/main');", peerID))
 	if err != nil {
 		return fmt.Errorf("failed to merge peer branch %s: %w", peerID, err)
 	}
 
+	// create temp main branch from main
 	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', 'main', '%s');", tempMainBranch))
 	if err != nil {
 		return fmt.Errorf("failed to copy source branch: %w", err)
@@ -478,10 +499,9 @@ func (db *DB) Merge(peerID string) error {
 		return fmt.Errorf("conflicts found while merging branch for peer '%s'", peerID)
 	}
 
-	// if no conflict and a ff happend, we commit the transaction and we return because we don't need a dolt commit
 	if fastForwards > 0 {
 		//
-		// fast forward merge (no commit needed)
+		// fast forward merge (no dolt commit needed)
 		//
 
 		_, err = txn.Exec("CALL DOLT_CHECKOUT('main');")

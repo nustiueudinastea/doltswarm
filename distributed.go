@@ -71,6 +71,11 @@ func (db *DB) eventHandler(event Event) error {
 			return fmt.Errorf("error pulling from peer '%s': %v", event.Peer, err)
 		}
 
+		err = db.VerifySignatures(event.Peer)
+		if err != nil {
+			return fmt.Errorf("error verifying commit signatures from peer '%s': %v", event.Peer, err)
+		}
+
 		err = db.Merge(event.Peer)
 		if err != nil {
 			return fmt.Errorf("error merging from peer '%s': %v", event.Peer, err)
