@@ -4,8 +4,59 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bokwoon95/sq"
 	"github.com/segmentio/ksuid"
 )
+
+type TAG struct {
+	sq.TableStruct `sq:"dolt_tags"`
+	TAG_NAME       sq.StringField
+	TAG_HASH       sq.StringField
+	TAGGER         sq.StringField
+	EMAIL          sq.StringField
+	DATE           sq.TimeField
+	MESSAGE        sq.StringField
+}
+
+type Tag struct {
+	Name    string
+	Hash    string
+	Tagger  string
+	Email   string
+	Date    time.Time
+	Message string
+}
+
+func tagMapper(row *sq.Row) Tag {
+	tag := Tag{
+		Name:    row.String("tag_name"),
+		Hash:    row.String("tag_hash"),
+		Tagger:  row.String("tagger"),
+		Email:   row.String("email"),
+		Date:    row.Time("date"),
+		Message: row.String("message"),
+	}
+	return tag
+}
+
+type Commit struct {
+	Hash      string
+	Committer string
+	Email     string
+	Date      time.Time
+	Message   string
+}
+
+func commitMapper(row *sq.Row) Commit {
+	commit := Commit{
+		Hash:      row.String("commit_hash"),
+		Committer: row.String("committer"),
+		Email:     row.String("email"),
+		Date:      row.Time("date"),
+		Message:   row.String("message"),
+	}
+	return commit
+}
 
 func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 	tx, err := db.Begin()
@@ -27,7 +78,7 @@ func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 
 	// commit
 	var commitHash string
-	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s@%s>', '--date', '%s');", commitMsg, db.signer.PublicKey(), db.signer.PublicKey(), db.domain, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
+	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s@%s>', '--date', '%s');", commitMsg, db.signer.GetID(), db.signer.GetID(), db.domain, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
 		return "", fmt.Errorf("failed to commit table: %w", err)
 	}
@@ -40,10 +91,10 @@ func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to sign commit '%s': %w", commitHash, err)
 	}
-	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.PublicKey(), db.signer.PublicKey(), db.domain, signature, commitHash)
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.GetID(), db.signer.GetID(), db.domain, signature, commitHash)
 	_, err = tx.Exec(tagcmd)
 	if err != nil {
-		return "", fmt.Errorf("failed to create tag for signature: %w", err)
+		return "", fmt.Errorf("failed to create signature tag (%s) : %w", signature, err)
 	}
 
 	err = tx.Commit()
@@ -83,7 +134,7 @@ func (db *DB) Insert(table string, data string) error {
 
 	// commit
 	var commitHash string
-	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s@%s>', '--date', '%s');", data, db.signer.PublicKey(), db.signer.PublicKey(), db.domain, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
+	err = tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-a', '-m', '%s', '--author', '%s <%s@%s>', '--date', '%s');", data, db.signer.GetID(), db.signer.GetID(), db.domain, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
 		return fmt.Errorf("failed to commit: %w", err)
 	}
@@ -96,10 +147,10 @@ func (db *DB) Insert(table string, data string) error {
 	if err != nil {
 		return fmt.Errorf("failed to sign commit '%s': %w", commitHash, err)
 	}
-	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.PublicKey(), db.signer.PublicKey(), db.domain, signature, commitHash)
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.GetID(), db.signer.GetID(), db.domain, signature, commitHash)
 	_, err = tx.Exec(tagcmd)
 	if err != nil {
-		return fmt.Errorf("failed to create tag for signature: %w", err)
+		return fmt.Errorf("failed to create signature tag (%s) : %w", signature, err)
 	}
 
 	err = tx.Commit()

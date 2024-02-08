@@ -29,14 +29,6 @@ const (
 	FactorySwarm = "swarm"
 )
 
-type Commit struct {
-	Hash      string
-	Committer string
-	Email     string
-	Date      time.Time
-	Message   string
-}
-
 type Remote struct {
 	Name       string
 	URL        string
@@ -54,19 +46,9 @@ type DoltMREnvRetriever interface {
 
 type Signer interface {
 	Sign(commit string) (string, error)
-	Verify(data []byte, signature string) error
+	Verify(commit string, signature string, publicKey string) error
 	PublicKey() string
-}
-
-func commitMapper(row *sq.Row) Commit {
-	commit := Commit{
-		Hash:      row.String("commit_hash"),
-		Committer: row.String("committer"),
-		Email:     row.String("email"),
-		Date:      row.Time("date"),
-		Message:   row.String("message"),
-	}
-	return commit
+	GetID() string
 }
 
 type DB struct {
@@ -112,9 +94,9 @@ func (db *DB) Open() error {
 
 	var dbConn string
 	if db.init {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&multistatements=true", db.workingDir, db.signer.PublicKey(), db.signer.PublicKey(), db.domain)
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.domain)
 	} else {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&database=%s&multistatements=true", db.workingDir, db.signer.PublicKey(), db.signer.PublicKey(), db.domain, db.name)
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&database=%s&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.domain, db.name)
 	}
 
 	sqld, err := sql.Open("dolt", dbConn)
@@ -375,6 +357,8 @@ func (db *DB) Pull(peerID string) error {
 }
 
 func (db *DB) VerifySignatures(peerID string) error {
+
+	// retrieve commits specific to peer branch
 	query := fmt.Sprintf("SELECT {*} FROM dolt_log('main..%s/main');", peerID)
 	commits, err := sq.FetchAll(db.conn, sq.
 		Queryf(query).
@@ -382,11 +366,39 @@ func (db *DB) VerifySignatures(peerID string) error {
 		commitMapper,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to verify commits for peer %s: %w", peerID, err)
+		return fmt.Errorf("failed to retrieve commits for peer %s: %w", peerID, err)
 	}
 
+	// build the list of commit hashes
+	commitHashes := make(sq.RowValue, len(commits))
 	for _, commit := range commits {
-		fmt.Println(commit)
+		commitHashes = append(commitHashes, commit.Hash)
+	}
+
+	// retrieve signatures for peer commits (from tags)
+	t := sq.New[TAG]("")
+	tags, err := sq.FetchAll(db.conn, sq.
+		From(t).
+		Where(
+			t.TAG_HASH.In(commitHashes),
+			t.TAGGER.EqString(peerID),
+		).
+		SetDialect(sq.DialectMySQL),
+		tagMapper,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve tags for peer %s: %w", peerID, err)
+	}
+
+	if len(tags) != len(commits) {
+		return fmt.Errorf("cannot find all signatures for peer %s", peerID)
+	}
+
+	for _, tag := range tags {
+		err = db.signer.Verify(tag.Hash, tag.Name, tag.Message)
+		if err != nil {
+			return fmt.Errorf("failed to verify signature for commit %s: %w", tag.Hash, err)
+		}
 	}
 
 	return nil
