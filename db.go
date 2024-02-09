@@ -306,6 +306,27 @@ func (db *DB) InitLocal() error {
 		return fmt.Errorf("failed to commit db creation: %w", err)
 	}
 
+	_, err = db.conn.ExecContext(ctx, fmt.Sprintf("USE %s;", db.name))
+	if err != nil {
+		return fmt.Errorf("failed to use db: %w", err)
+	}
+
+	commit, err := db.GetFirstCommit()
+	if err != nil {
+		return fmt.Errorf("failed to retrieve init commit: %w", err)
+	}
+
+	// create commit signature and add it to a tag
+	signature, err := db.signer.Sign(commit.Hash)
+	if err != nil {
+		return fmt.Errorf("failed to sign init commit '%s': %w", commit.Hash, err)
+	}
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.GetID(), db.signer.GetID(), db.domain, signature, commit.Hash)
+	_, err = db.conn.ExecContext(ctx, tagcmd)
+	if err != nil {
+		return fmt.Errorf("failed to create signature tag (%s) for init commit (%s): %w", signature, commit.Hash, err)
+	}
+
 	return nil
 }
 
