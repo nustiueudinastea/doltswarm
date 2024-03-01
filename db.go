@@ -412,7 +412,7 @@ func (db *DB) VerifySignatures(peerID string) error {
 	}
 
 	if len(tags) != len(commits) {
-		return fmt.Errorf("cannot find all signatures for peer %s", peerID)
+		db.log.Warnf("cannot find all signatures for peer %s", peerID)
 	}
 
 	for _, tag := range tags {
