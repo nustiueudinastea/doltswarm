@@ -60,12 +60,12 @@ type DB struct {
 	eventQueue chan Event
 	workingDir string
 	grpcServer *grpc.Server
-	log        *logrus.Logger
+	log        *logrus.Entry
 	dbClients  *concurrentmap.Map[string, *DBClient]
 	signer     Signer
 }
 
-func New(dir string, name string, logger *logrus.Logger, init bool, domain string) (*DB, error) {
+func New(dir string, name string, logger *logrus.Entry, init bool, domain string) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
@@ -138,8 +138,8 @@ func (db *DB) Open() error {
 func (db *DB) p2pSetup(withGRPCservers bool) error {
 	db.log.Infof("doing p2p setup (grpc: %v)", withGRPCservers)
 	// register new factory
-	dbfactory.DBFactories[FactorySwarm] = NewDoltSwarmFactory(db.name, db, logrus.NewEntry(db.log))
-	dbfactory.RegisterFactory(FactorySwarm, NewDoltSwarmFactory(db.name, db, logrus.NewEntry(db.log)))
+	dbfactory.DBFactories[FactorySwarm] = NewDoltSwarmFactory(db.name, db, db.log)
+	dbfactory.RegisterFactory(FactorySwarm, NewDoltSwarmFactory(db.name, db, db.log))
 
 	if withGRPCservers {
 		// prepare dolt chunk store server
@@ -148,8 +148,8 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 			return fmt.Errorf("error getting chunk store: %s", err.Error())
 		}
 		chunkStoreCache := NewCSCache(cs.(remotesrv.RemoteSrvStore))
-		chunkStoreServer := NewServerChunkStore(logrus.NewEntry(db.log), chunkStoreCache, db.GetFilePath())
-		syncerServer := NewServerSyncer(logrus.NewEntry(db.log), db)
+		chunkStoreServer := NewServerChunkStore(db.log, chunkStoreCache, db.GetFilePath())
+		syncerServer := NewServerSyncer(db.log, db)
 
 		// register grpc servers
 		if db.grpcServer == nil {
