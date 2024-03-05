@@ -330,6 +330,11 @@ func (rcs *RemoteChunkStore) StatsSummary() string {
 	return "Unsupported"
 }
 
+func (rcs *RemoteChunkStore) PersistGhostHashes(ctx context.Context, refs hash.HashSet) error {
+	rcs.log.Trace("calling PersistGhostHashes")
+	return fmt.Errorf("not supported")
+}
+
 func (rcs *RemoteChunkStore) Close() error {
 	rcs.log.Trace("calling Close")
 	return nil
