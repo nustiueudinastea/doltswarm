@@ -143,7 +143,7 @@ func (rcs *RemoteChunkStore) GetManyCompressed(ctx context.Context, hashes hash.
 	}
 
 	if len(notCached) > 0 {
-		err := rcs.downloadChunksAndCache(ctx, hashes, notCached, found)
+		err := rcs.downloadChunksAndCache(ctx, notCached, found)
 
 		if err != nil {
 			return err
@@ -153,7 +153,7 @@ func (rcs *RemoteChunkStore) GetManyCompressed(ctx context.Context, hashes hash.
 	return nil
 }
 
-func (rcs *RemoteChunkStore) downloadChunksAndCache(ctx context.Context, hashes hash.HashSet, notCached []hash.Hash, found func(context.Context, nbs.CompressedChunk)) error {
+func (rcs *RemoteChunkStore) downloadChunksAndCache(ctx context.Context, notCached []hash.Hash, found func(context.Context, nbs.CompressedChunk)) error {
 	toSend := make(map[hash.Hash]struct{}, len(notCached))
 	for _, h := range notCached {
 		toSend[h] = struct{}{}
