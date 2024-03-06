@@ -1,6 +1,7 @@
 package doltswarm
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -81,8 +82,24 @@ func doCommit(tx *sql.Tx, msg string, domain string, signer Signer) (string, err
 	return commitHash, nil
 }
 
+func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return db.conn.ExecContext(ctx, query, args...)
+}
+
+func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return db.conn.QueryContext(ctx, query, args...)
+}
+
+func (db *DB) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
+	return db.conn.PrepareContext(ctx, query)
+}
+
+func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	return db.conn.BeginTx(ctx, opts)
+}
+
 func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(context.TODO(), nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to start transaction: %w", err)
 	}

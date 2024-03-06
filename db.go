@@ -244,7 +244,7 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 	if !db.init {
 		// this part is executed if the db is already initialized
 		// so that the client is still available when doing initialization from another peer
-		_, err := db.Exec(fmt.Sprintf("CALL DOLT_REMOTE('add','%s','%s://%s');", peerID, FactorySwarm, peerID))
+		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('add','%s','%s://%s');", peerID, FactorySwarm, peerID))
 		if err != nil {
 			return fmt.Errorf("failed to add remote for peer %s: %w", peerID, err)
 		}
@@ -266,7 +266,7 @@ func (db *DB) RemovePeer(peerID string) error {
 	db.dbClients.Delete(peerID)
 
 	if !db.init {
-		_, err := db.Exec(fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
+		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
 		if err != nil {
 			if !strings.Contains(err.Error(), "remote not found") && !strings.Contains(err.Error(), "unknown remote") {
 				return fmt.Errorf("failed to remove remote for peer %s: %w", peerID, err)
@@ -338,7 +338,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 	tries := 0
 	for tries < 10 {
 		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main', '%s://%s/%s', '%s');", FactorySwarm, peerID, db.name, db.name)
-		_, err := db.Exec(query)
+		_, err := db.ExecContext(context.TODO(), query)
 		if err != nil {
 			if strings.Contains(err.Error(), "could not get client") {
 				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
@@ -358,7 +358,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 
 func (db *DB) Pull(peerID string) error {
 	db.log.Infof("Pulling from peer %s", peerID)
-	txn, err := db.Begin()
+	txn, err := db.BeginTx(context.TODO(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
 	}
@@ -456,7 +456,7 @@ func (db *DB) Merge(peerID string) error {
 	}
 	defer func() {
 		// delete temp branch
-		_, err = db.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempPeerBranch))
+		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempPeerBranch))
 		if err != nil {
 			db.log.Errorf("failed to delete temp branch: %v", err)
 		}
@@ -475,7 +475,7 @@ func (db *DB) Merge(peerID string) error {
 	}
 	defer func() {
 		// delete temp branch
-		_, err = db.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempMainBranch))
+		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempMainBranch))
 		if err != nil {
 			db.log.Errorf("failed to delete temp branch: %v", err)
 		}
@@ -592,18 +592,6 @@ func (db *DB) Merge(peerID string) error {
 
 	db.log.Infof("Finished merging from peer %s", peerID)
 	return nil
-}
-
-func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
-	return db.conn.ExecContext(context.Background(), query)
-}
-
-func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
-	return db.conn.QueryContext(context.Background(), query)
-}
-
-func (db *DB) Begin() (*sql.Tx, error) {
-	return db.conn.BeginTx(context.Background(), nil)
 }
 
 func (db *DB) GetLastCommit(branch string) (Commit, error) {
