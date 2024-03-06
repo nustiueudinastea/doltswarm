@@ -65,7 +65,7 @@ type DB struct {
 	signer     Signer
 }
 
-func New(dir string, name string, logger *logrus.Entry, init bool, domain string) (*DB, error) {
+func New(dir string, name string, logger *logrus.Entry, init bool) (*DB, error) {
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
@@ -74,7 +74,6 @@ func New(dir string, name string, logger *logrus.Entry, init bool, domain string
 	db := &DB{
 		init:       init,
 		name:       name,
-		domain:     domain,
 		workingDir: workingDir,
 		log:        logger,
 		eventQueue: make(chan Event, 300),
@@ -94,9 +93,9 @@ func (db *DB) Open() error {
 
 	var dbConn string
 	if db.init {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.domain)
+		dbConn = fmt.Sprintf("file://%s?multistatements=true", db.workingDir)
 	} else {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@%s&database=%s&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.domain, db.name)
+		dbConn = fmt.Sprintf("file://%s?database=%s&multistatements=true", db.workingDir, db.name)
 	}
 
 	sqld, err := sql.Open("dolt", dbConn)
@@ -291,8 +290,9 @@ func (db *DB) GetClients() map[string]*DBClient {
 	return db.dbClients.Snapshot()
 }
 
-func (db *DB) InitLocal() error {
+func (db *DB) InitLocal(domain string) error {
 	db.log.Infof("Initializing local db %s", db.name)
+	db.domain = domain
 
 	ctx := context.Background()
 
