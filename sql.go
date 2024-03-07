@@ -59,11 +59,11 @@ func commitMapper(row *sq.Row) Commit {
 	return commit
 }
 
-func doCommit(tx *sql.Tx, msg string, domain string, signer Signer) (string, error) {
+func doCommit(tx *sql.Tx, msg string, signer Signer) (string, error) {
 
 	// commit
 	var commitHash string
-	err := tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-A', '-m', '%s', '--author', '%s <%s@%s>', '--date', '%s');", msg, signer.GetID(), signer.GetID(), domain, time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
+	err := tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-A', '-m', '%s', '--author', '%s <%s@doltswarm>', '--date', '%s');", msg, signer.GetID(), signer.GetID(), time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
 		return "", fmt.Errorf("failed to commit table: %w", err)
 	}
@@ -73,7 +73,7 @@ func doCommit(tx *sql.Tx, msg string, domain string, signer Signer) (string, err
 	if err != nil {
 		return "", fmt.Errorf("failed to sign commit '%s': %w", commitHash, err)
 	}
-	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", signer.PublicKey(), signer.GetID(), signer.GetID(), domain, signature, commitHash)
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@doltswarm>', '%s', '%s');", signer.PublicKey(), signer.GetID(), signer.GetID(), signature, commitHash)
 	_, err = tx.Exec(tagcmd)
 	if err != nil {
 		return "", fmt.Errorf("failed to create signature tag (%s) : %w", signature, err)
@@ -119,7 +119,7 @@ func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 		return "", fmt.Errorf("no signer available")
 	}
 
-	commitHash, err := doCommit(tx, commitMsg, db.domain, db.signer)
+	commitHash, err := doCommit(tx, commitMsg, db.signer)
 	if err != nil {
 		return "", fmt.Errorf("failed to commit: %w", err)
 	}

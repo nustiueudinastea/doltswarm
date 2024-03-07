@@ -54,7 +54,6 @@ type Signer interface {
 type DB struct {
 	init       bool
 	name       string
-	domain     string
 	stoppers   *concurrentmap.Map[string, func() error]
 	conn       *sql.Conn
 	eventQueue chan Event
@@ -93,9 +92,9 @@ func (db *DB) Open() error {
 
 	var dbConn string
 	if db.init {
-		dbConn = fmt.Sprintf("file://%s?multistatements=true", db.workingDir)
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID())
 	} else {
-		dbConn = fmt.Sprintf("file://%s?database=%s&multistatements=true", db.workingDir, db.name)
+		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&database=%s&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.name)
 	}
 
 	sqld, err := sql.Open("dolt", dbConn)
@@ -168,7 +167,9 @@ func (db *DB) p2pSetup(withGRPCservers bool) error {
 }
 
 func (db *DB) Close() error {
-	defer db.conn.Close()
+	if db.conn != nil {
+		defer db.conn.Close()
+	}
 	db.dbClients.Iter(func(key string, client *DBClient) bool {
 		err := db.RemovePeer(client.GetID())
 		if err != nil {
@@ -290,9 +291,8 @@ func (db *DB) GetClients() map[string]*DBClient {
 	return db.dbClients.Snapshot()
 }
 
-func (db *DB) InitLocal(domain string) error {
+func (db *DB) InitLocal() error {
 	db.log.Infof("Initializing local db %s", db.name)
-	db.domain = domain
 
 	ctx := context.Background()
 
@@ -321,7 +321,7 @@ func (db *DB) InitLocal(domain string) error {
 	if err != nil {
 		return fmt.Errorf("failed to sign init commit '%s': %w", commit.Hash, err)
 	}
-	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@%s>', '%s', '%s');", db.signer.PublicKey(), db.signer.GetID(), db.signer.GetID(), db.domain, signature, commit.Hash)
+	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@doltswarm>', '%s', '%s');", db.signer.PublicKey(), db.signer.GetID(), db.signer.GetID(), signature, commit.Hash)
 	_, err = db.conn.ExecContext(ctx, tagcmd)
 	if err != nil {
 		return fmt.Errorf("failed to create signature tag (%s) for init commit (%s): %w", signature, commit.Hash, err)
