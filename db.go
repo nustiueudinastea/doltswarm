@@ -52,116 +52,115 @@ type Signer interface {
 }
 
 type DB struct {
-	init       bool
-	name       string
-	stoppers   *concurrentmap.Map[string, func() error]
-	conn       *sql.Conn
-	eventQueue chan Event
-	workingDir string
-	grpcServer *grpc.Server
-	log        *logrus.Entry
-	dbClients  *concurrentmap.Map[string, *DBClient]
-	signer     Signer
+	name        string
+	initialized bool
+	stoppers    *concurrentmap.Map[string, func() error]
+	conn        *sql.Conn
+	eventQueue  chan Event
+	workingDir  string
+	grpcServer  *grpc.Server
+	log         *logrus.Entry
+	dbClients   *concurrentmap.Map[string, *DBClient]
+	signer      Signer
 }
 
-func New(dir string, name string, logger *logrus.Entry, init bool) (*DB, error) {
+func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, error) {
+
+	if logger == nil {
+		return nil, fmt.Errorf("logger is nil")
+	}
+
+	if signer == nil {
+		return nil, fmt.Errorf("signer is nil")
+	}
+
 	workingDir, err := filesys.LocalFS.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
 	}
 
 	db := &DB{
-		init:       init,
 		name:       name,
 		workingDir: workingDir,
 		log:        logger,
 		eventQueue: make(chan Event, 300),
 		dbClients:  concurrentmap.New[string, *DBClient](),
 		stoppers:   concurrentmap.New[string, func() error](),
+		signer:     signer,
+	}
+
+	err = ensureDir(db.workingDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db: %w", err)
+	}
+
+	dbConn := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID())
+	sqld, err := sql.Open("dolt", dbConn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db: %w", err)
+	}
+
+	db.conn, err = sqld.Conn(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db connection: %w", err)
+	}
+
+	if db.conn.PingContext(context.Background()) != nil {
+		return nil, fmt.Errorf("failed to ping db: %w", err)
+	}
+
+	dbs, err := db.GetDatabase(db.name)
+	if err == nil && dbs == db.name {
+		db.initialized = true
+		_, err = db.conn.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
+		if err != nil {
+			return nil, fmt.Errorf("failed to use db: %w", err)
+		}
+		_, err = db.conn.ExecContext(context.Background(), "CALL DOLT_REMOTE('remove','origin');")
+		if err != nil && !strings.Contains(err.Error(), "unknown remote") {
+			return nil, fmt.Errorf("failed to remove origin remote during init: %w", err)
+		}
+	}
+	err = db.p2pSetup()
+	if err != nil {
+		return nil, fmt.Errorf("failed to do p2p setup: %w", err)
 	}
 
 	return db, nil
 }
 
-func (db *DB) Open() error {
-
-	err := ensureDir(db.workingDir)
-	if err != nil {
-		return fmt.Errorf("failed to open db: %w", err)
-	}
-
-	var dbConn string
-	if db.init {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID())
-	} else {
-		dbConn = fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&database=%s&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.name)
-	}
-
-	sqld, err := sql.Open("dolt", dbConn)
-	if err != nil {
-		return fmt.Errorf("failed to open db: %w", err)
-	}
-
-	db.conn, err = sqld.Conn(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to open db connection: %w", err)
-	}
-
-	if db.conn.PingContext(context.Background()) != nil {
-		return fmt.Errorf("failed to ping db: %w", err)
-	}
-
-	dbs, err := db.GetDatabase(db.name)
-	if err == nil && dbs == db.name {
-		err = db.p2pSetup(true)
-		if err != nil {
-			return fmt.Errorf("failed to do p2p setup: %w", err)
-		}
-
-		_, err = db.conn.ExecContext(context.Background(), "CALL DOLT_REMOTE('remove','origin');")
-		if err != nil && !strings.Contains(err.Error(), "unknown remote") {
-			return fmt.Errorf("failed to remove origin remote during init: %w", err)
-		}
-
-	} else {
-		err = db.p2pSetup(false)
-		if err != nil {
-			return fmt.Errorf("failed to do p2p setup: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (db *DB) p2pSetup(withGRPCservers bool) error {
-	db.log.Infof("doing p2p setup (grpc: %v)", withGRPCservers)
+func (db *DB) p2pSetup() error {
+	db.log.Info("doing p2p setup")
 	// register new factory
 	dbfactory.DBFactories[FactorySwarm] = NewDoltSwarmFactory(db.name, db, db.log)
 	dbfactory.RegisterFactory(FactorySwarm, NewDoltSwarmFactory(db.name, db, db.log))
 
-	if withGRPCservers {
-		// prepare dolt chunk store server
-		cs, err := db.GetChunkStore()
-		if err != nil {
-			return fmt.Errorf("error getting chunk store: %s", err.Error())
-		}
-		chunkStoreCache := NewCSCache(cs.(remotesrv.RemoteSrvStore))
-		chunkStoreServer := NewServerChunkStore(db.log, chunkStoreCache, db.GetFilePath())
-		syncerServer := NewServerSyncer(db.log, db)
-
-		// register grpc servers
-		if db.grpcServer == nil {
-			return fmt.Errorf("grpc server not initialized")
-		}
-		proto.RegisterDownloaderServer(db.grpcServer, chunkStoreServer)
-		remotesapi.RegisterChunkStoreServiceServer(db.grpcServer, chunkStoreServer)
-		proto.RegisterDBSyncerServer(db.grpcServer, syncerServer)
-
-		// start event processor
-		db.stoppers.Set("dbEventProcessor", db.startRemoteEventProcessor())
-	}
-
 	db.log.Info("p2p setup done")
+
+	return nil
+}
+
+func (db *DB) EnableGRPCServers() error {
+
+	// prepare dolt chunk store server
+	cs, err := db.GetChunkStore()
+	if err != nil {
+		return fmt.Errorf("error getting chunk store: %s", err.Error())
+	}
+	chunkStoreCache := NewCSCache(cs.(remotesrv.RemoteSrvStore))
+	chunkStoreServer := NewServerChunkStore(db.log, chunkStoreCache, db.GetFilePath())
+	syncerServer := NewServerSyncer(db.log, db)
+
+	// register grpc servers
+	if db.grpcServer == nil {
+		return fmt.Errorf("grpc server not initialized")
+	}
+	proto.RegisterDownloaderServer(db.grpcServer, chunkStoreServer)
+	remotesapi.RegisterChunkStoreServiceServer(db.grpcServer, chunkStoreServer)
+	proto.RegisterDBSyncerServer(db.grpcServer, syncerServer)
+
+	// start event processor
+	db.stoppers.Set("dbEventProcessor", db.startRemoteEventProcessor())
 
 	return nil
 }
@@ -225,10 +224,6 @@ func (db *DB) AddGRPCServer(server *grpc.Server) {
 	db.grpcServer = server
 }
 
-func (db *DB) AddSigner(signer Signer) {
-	db.signer = signer
-}
-
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 	if _, ok := db.dbClients.Get(peerID); !ok {
 		db.dbClients.Set(peerID, &DBClient{
@@ -242,7 +237,7 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 		db.log.Infof("Client for peer %s already exists", peerID)
 	}
 
-	if !db.init {
+	if db.initialized {
 		// this part is executed if the db is already initialized
 		// so that the client is still available when doing initialization from another peer
 		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('add','%s','%s://%s');", peerID, FactorySwarm, peerID))
@@ -266,7 +261,7 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 func (db *DB) RemovePeer(peerID string) error {
 	db.dbClients.Delete(peerID)
 
-	if !db.init {
+	if db.initialized {
 		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
 		if err != nil {
 			if !strings.Contains(err.Error(), "remote not found") && !strings.Contains(err.Error(), "unknown remote") {
@@ -327,6 +322,8 @@ func (db *DB) InitLocal() error {
 		return fmt.Errorf("failed to create signature tag (%s) for init commit (%s): %w", signature, commit.Hash, err)
 	}
 
+	db.initialized = true
+
 	return nil
 }
 
@@ -352,6 +349,8 @@ func (db *DB) InitFromPeer(peerID string) error {
 		db.log.Infof("Successfully cloned db from peer %s", peerID)
 		return nil
 	}
+
+	db.initialized = true
 
 	return fmt.Errorf("failed to clone db from peer %s. Peer not found", peerID)
 }
@@ -687,4 +686,8 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 	}
 
 	return commits, nil
+}
+
+func (db *DB) Initialized() bool {
+	return db.initialized
 }
