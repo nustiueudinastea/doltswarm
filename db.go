@@ -430,7 +430,7 @@ func (db *DB) VerifySignatures(peerID string) error {
 	for _, tag := range tags {
 		err = db.signer.Verify(tag.Hash, tag.Name, tag.Message)
 		if err != nil {
-			return fmt.Errorf("failed to verify signature for commit %s: %w", tag.Hash, err)
+			return fmt.Errorf("failed to verify signature %s for commit %s from public key %s: %w", tag.Name, tag.Hash, tag.Message, err)
 		}
 	}
 
