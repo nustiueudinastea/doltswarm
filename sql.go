@@ -98,6 +98,31 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 	return db.conn.BeginTx(ctx, opts)
 }
 
+// Commit
+func (db *DB) Commit(commitMsg string) (string, error) {
+	tx, err := db.BeginTx(context.TODO(), nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	commitHash, err := doCommit(tx, commitMsg, db.signer)
+	if err != nil {
+		return "", fmt.Errorf("failed to commit: %w", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// advertise new head
+	db.AdvertiseHead()
+
+	return commitHash, nil
+
+}
+
 func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
 	tx, err := db.BeginTx(context.TODO(), nil)
 	if err != nil {

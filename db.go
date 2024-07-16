@@ -56,6 +56,7 @@ type DB struct {
 	initialized bool
 	stoppers    *concurrentmap.Map[string, func() error]
 	conn        *sql.Conn
+	db          *sql.DB
 	eventQueue  chan Event
 	workingDir  string
 	grpcServer  *grpc.Server
@@ -95,12 +96,12 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 	}
 
 	dbConn := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID())
-	sqld, err := sql.Open("dolt", dbConn)
+	db.db, err = sql.Open("dolt", dbConn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
-	db.conn, err = sqld.Conn(context.Background())
+	db.conn, err = db.db.Conn(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db connection: %w", err)
 	}
@@ -141,6 +142,8 @@ func (db *DB) p2pSetup() error {
 }
 
 func (db *DB) EnableGRPCServers() error {
+
+	db.log.Debug("enabling grpc servers")
 
 	// prepare dolt chunk store server
 	cs, err := db.GetChunkStore()
@@ -232,20 +235,29 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 			ChunkStoreServiceClient: remotesapi.NewChunkStoreServiceClient(conn),
 			DownloaderClient:        proto.NewDownloaderClient(conn),
 		})
-		db.log.Infof("Added client for peer %s", peerID)
+		db.log.Debugf("added swarm client for peer %s", peerID)
 	} else {
-		db.log.Infof("Client for peer %s already exists", peerID)
+		db.log.Debugf("swarm client for peer %s already exists", peerID)
 	}
 
 	if db.initialized {
+
+		// TODO: change this to a check if the remote exists
+		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
+		if err != nil {
+			if !strings.Contains(err.Error(), "remote not found") && !strings.Contains(err.Error(), "unknown remote") {
+				return fmt.Errorf("failed to remove remote for peer %s: %w", peerID, err)
+			}
+		}
+
 		// this part is executed if the db is already initialized
 		// so that the client is still available when doing initialization from another peer
-		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('add','%s','%s://%s');", peerID, FactorySwarm, peerID))
+		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('add','%s','%s://%s');", peerID, FactorySwarm, peerID))
 		if err != nil {
 			return fmt.Errorf("failed to add remote for peer %s: %w", peerID, err)
 		}
 
-		db.log.Infof("Added remote for peer %s", peerID)
+		db.log.Debugf("added swarm remote for peer %s", peerID)
 
 		err = db.RequestHeadFromPeer(peerID)
 		if err != nil {
@@ -259,9 +271,11 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 }
 
 func (db *DB) RemovePeer(peerID string) error {
+	db.log.Debugf("deleting swarm client for peer %s", peerID)
 	db.dbClients.Delete(peerID)
 
 	if db.initialized {
+		db.log.Debugf("deleting swarm remote for peer %s", peerID)
 		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
 		if err != nil {
 			if !strings.Contains(err.Error(), "remote not found") && !strings.Contains(err.Error(), "unknown remote") {
@@ -269,8 +283,6 @@ func (db *DB) RemovePeer(peerID string) error {
 			}
 		}
 	}
-
-	db.log.Infof("Removed remote for peer %s", peerID)
 
 	return nil
 }
@@ -291,9 +303,10 @@ func (db *DB) InitLocal() error {
 
 	ctx := context.Background()
 
-	_, err := db.conn.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE %s;", db.name))
+	sqlCmd := fmt.Sprintf("CREATE DATABASE %s;", db.name)
+	_, err := db.conn.ExecContext(ctx, sqlCmd)
 	if err != nil {
-		return fmt.Errorf("failed to create db: %w", err)
+		return fmt.Errorf("failed to exec '%s': %w", sqlCmd, err)
 	}
 
 	_, err = db.conn.ExecContext(ctx, "commit;")
@@ -686,6 +699,10 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 	}
 
 	return commits, nil
+}
+
+func (db *DB) GetSqlDB() *sql.DB {
+	return db.db
 }
 
 func (db *DB) Initialized() bool {
