@@ -105,7 +105,7 @@ func (db *DB) AdvertiseHead() {
 			return
 		}
 
-		db.log.Infof("Advertising head '%s' to all peers (%d)", commit.Hash, len(clients))
+		db.log.Debugf("Advertising head '%s' to all peers (%d)", commit.Hash, len(clients))
 
 		req := &proto.AdvertiseHeadRequest{Head: commit.Hash}
 
@@ -118,7 +118,7 @@ func (db *DB) AdvertiseHead() {
 
 		}
 
-		db.log.Infof("Advertised head '%s' to all peers", commit.Hash)
+		db.log.Debugf("Finished advertising head '%s' to all peers", commit.Hash)
 	}()
 }
 
