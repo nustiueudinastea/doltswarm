@@ -18,6 +18,7 @@ import (
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/nustiueudinastea/doltswarm/proto"
+	"github.com/rs/xid"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
 	"google.golang.org/grpc"
@@ -51,18 +52,23 @@ type Signer interface {
 	GetID() string
 }
 
+type Notifier interface {
+	Notify()
+}
+
 type DB struct {
-	name        string
-	initialized bool
-	stoppers    *concurrentmap.Map[string, func() error]
-	conn        *sql.Conn
-	db          *sql.DB
-	eventQueue  chan Event
-	workingDir  string
-	grpcServer  *grpc.Server
-	log         *logrus.Entry
-	dbClients   *concurrentmap.Map[string, *DBClient]
-	signer      Signer
+	name                 string
+	initialized          bool
+	stoppers             *concurrentmap.Map[string, func() error]
+	tableChangeCallbacks *concurrentmap.Map[string, Notifier]
+	conn                 *sql.Conn
+	db                   *sql.DB
+	eventQueue           chan Event
+	workingDir           string
+	grpcServer           *grpc.Server
+	log                  *logrus.Entry
+	dbClients            *concurrentmap.Map[string, *DBClient]
+	signer               Signer
 }
 
 func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, error) {
@@ -81,13 +87,14 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 	}
 
 	db := &DB{
-		name:       name,
-		workingDir: workingDir,
-		log:        logger,
-		eventQueue: make(chan Event, 300),
-		dbClients:  concurrentmap.New[string, *DBClient](),
-		stoppers:   concurrentmap.New[string, func() error](),
-		signer:     signer,
+		name:                 name,
+		workingDir:           workingDir,
+		log:                  logger,
+		eventQueue:           make(chan Event, 300),
+		dbClients:            concurrentmap.New[string, *DBClient](),
+		stoppers:             concurrentmap.New[string, func() error](),
+		tableChangeCallbacks: concurrentmap.New[string, Notifier](),
+		signer:               signer,
 	}
 
 	err = ensureDir(db.workingDir)
@@ -125,6 +132,10 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 	err = db.p2pSetup()
 	if err != nil {
 		return nil, fmt.Errorf("failed to do p2p setup: %w", err)
+	}
+
+	if db.Initialized() {
+		db.RequestHeadFromAllPeers()
 	}
 
 	return db, nil
@@ -166,6 +177,22 @@ func (db *DB) EnableGRPCServers() error {
 	db.stoppers.Set("dbEventProcessor", db.startRemoteEventProcessor())
 
 	return nil
+}
+
+func (db *DB) triggerTableChangeCallbacks(tableName string) {
+	notifiers := db.tableChangeCallbacks.Snapshot()
+	for table, n := range notifiers {
+		if strings.Contains(table, tableName) {
+			db.log.Debugf("triggering table change notification for table '%s'", tableName)
+			go n.Notify()
+		}
+	}
+}
+
+func (db *DB) RegisterTableChangeCallback(tableName string, n Notifier) {
+	guid := xid.New()
+	table := tableName + "_" + guid.String()
+	db.tableChangeCallbacks.Set(table, n)
 }
 
 func (db *DB) Close() error {
@@ -597,6 +624,23 @@ func (db *DB) Merge(peerID string) error {
 	err = txn.Commit()
 	if err != nil {
 		return fmt.Errorf("failed to commit merge transaction: %w", err)
+	}
+
+	// Trigger table change callbacks
+	query := fmt.Sprintf("SELECT to_table_name FROM dolt_schema_diff('%s', 'main')", targetBranch)
+	rows, err = db.QueryContext(context.TODO(), query)
+	if err != nil {
+		return fmt.Errorf("failed to query changed tables: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tableName string
+		err := rows.Scan(&tableName)
+		if err != nil {
+			return fmt.Errorf("failed to scan table name: %w", err)
+		}
+		db.triggerTableChangeCallbacks(tableName)
 	}
 
 	// advertise new head

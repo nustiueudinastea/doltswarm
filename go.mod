@@ -14,6 +14,7 @@ require (
 	github.com/bokwoon95/sq v0.4.4
 	github.com/dolthub/dolt/go v0.40.5-0.20231206174848-7c88abef6e9f
 	github.com/dolthub/driver v0.0.0-00010101000000-000000000000
+	github.com/rs/xid v1.4.0
 	github.com/sirupsen/logrus v1.9.3
 	go.uber.org/multierr v1.11.0
 	google.golang.org/grpc v1.61.0
