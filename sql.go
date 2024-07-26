@@ -9,6 +9,10 @@ import (
 	"github.com/bokwoon95/sq"
 )
 
+type Queryer interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+}
+
 type TAG struct {
 	sq.TableStruct `sq:"dolt_tags"`
 	TAG_NAME       sq.StringField
@@ -88,8 +92,9 @@ func doCommit(tx *sql.Tx, msg string, signer Signer) (string, error) {
 	return commitHash, nil
 }
 
-func (db *DB) getChangedTables(tx *sql.Tx) ([]string, error) {
-	rows, err := tx.QueryContext(context.TODO(), "SELECT to_table_name FROM DOLT_DIFF_SUMMARY('WORKING', 'HEAD')")
+func getChangedTables(q Queryer, from string, to string) ([]string, error) {
+	query := fmt.Sprintf("SELECT to_table_name FROM DOLT_DIFF_SUMMARY('%s', '%s')", from, to)
+	rows, err := q.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query changed tables: %w", err)
 	}
@@ -137,26 +142,19 @@ func (db *DB) Commit(commitMsg string) (string, error) {
 		return "", fmt.Errorf("failed to commit: %w", err)
 	}
 
+	// find out which tables changed
+	changedTables, err := getChangedTables(tx, "HEAD^", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("failed to get changed tables: %w", err)
+	}
+
 	err = tx.Commit()
 	if err != nil {
 		return "", fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	// Trigger table change callbacks
-	rows, err := db.QueryContext(context.TODO(), "SELECT to_table_name FROM dolt_schema_diff('HEAD^', 'HEAD')")
-	if err != nil {
-		return "", fmt.Errorf("failed to query changed tables: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var tableName string
-		fmt.Println("Table changed: ", tableName)
-		err := rows.Scan(&tableName)
-		if err != nil {
-			return "", fmt.Errorf("failed to scan table name: %w", err)
-		}
-		fmt.Println("Table changed: ", tableName)
+	// trigger table change callbacks after successful commit
+	for _, tableName := range changedTables {
 		db.triggerTableChangeCallbacks(tableName)
 	}
 
@@ -186,7 +184,7 @@ func (db *DB) ExecAndCommit(execFunc ExecFunc, commitMsg string) (string, error)
 	}
 
 	// find out which tables changed
-	changedTables, err := db.getChangedTables(tx)
+	changedTables, err := getChangedTables(tx, "WORKING", "HEAD")
 	if err != nil {
 		return "", err
 	}

@@ -387,10 +387,11 @@ func (db *DB) InitFromPeer(peerID string) error {
 		}
 
 		db.log.Infof("Successfully cloned db from peer %s", peerID)
+		db.initialized = true
+		// the _ matches any table name so all callbacks are triggered
+		db.triggerTableChangeCallbacks("_")
 		return nil
 	}
-
-	db.initialized = true
 
 	return fmt.Errorf("failed to clone db from peer %s. Peer not found", peerID)
 }
