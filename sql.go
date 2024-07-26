@@ -65,7 +65,7 @@ func doCommit(tx *sql.Tx, msg string, signer Signer) (string, error) {
 	var commitHash string
 	err := tx.QueryRow(fmt.Sprintf("CALL DOLT_COMMIT('-A', '-m', '%s', '--author', '%s <%s@doltswarm>', '--date', '%s');", msg, signer.GetID(), signer.GetID(), time.Now().Format(time.RFC3339Nano))).Scan(&commitHash)
 	if err != nil {
-		return "", fmt.Errorf("failed to commit table: %w", err)
+		return "", fmt.Errorf("failed to run commit procedure: %w", err)
 	}
 
 	// create commit signature and add it to a tag
@@ -116,11 +116,90 @@ func (db *DB) Commit(commitMsg string) (string, error) {
 		return "", fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
+	// Trigger table change callbacks
+	rows, err := db.QueryContext(context.TODO(), "SELECT to_table_name FROM dolt_schema_diff('HEAD^', 'HEAD')")
+	if err != nil {
+		return "", fmt.Errorf("failed to query changed tables: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tableName string
+		fmt.Println("Table changed: ", tableName)
+		err := rows.Scan(&tableName)
+		if err != nil {
+			return "", fmt.Errorf("failed to scan table name: %w", err)
+		}
+		fmt.Println("Table changed: ", tableName)
+		db.triggerTableChangeCallbacks(tableName)
+	}
+
 	// advertise new head
 	db.AdvertiseHead()
 
 	return commitHash, nil
 
+}
+
+type ExecFunc func(*sql.Tx) error
+
+func (db *DB) TxAndCommit(execFunc ExecFunc, commitMsg string) (string, error) {
+	tx, err := db.BeginTx(context.TODO(), nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec("CALL DOLT_CHECKOUT('main');")
+	if err != nil {
+		return "", fmt.Errorf("failed to checkout main branch: %w", err)
+	}
+
+	err = execFunc(tx)
+	if err != nil {
+		return "", fmt.Errorf("failed to run exec function: %w", err)
+	}
+
+	if db.signer == nil {
+		return "", fmt.Errorf("no signer available")
+	}
+
+	// Find out what tables changed before committing
+	rows, err := tx.QueryContext(context.TODO(), "SELECT to_table_name FROM DOLT_DIFF_SUMMARY('WORKING', 'HEAD')")
+	if err != nil {
+		return "", fmt.Errorf("failed to query changed tables: %w", err)
+	}
+	defer rows.Close()
+
+	var changedTables []string
+	for rows.Next() {
+		var tableName string
+		err := rows.Scan(&tableName)
+		if err != nil {
+			return "", fmt.Errorf("failed to scan table name: %w", err)
+		}
+		changedTables = append(changedTables, tableName)
+	}
+
+	commitHash, err := doCommit(tx, commitMsg, db.signer)
+	if err != nil {
+		return "", fmt.Errorf("failed to commit: %w", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Trigger table change callbacks after successful commit
+	for _, tableName := range changedTables {
+		db.triggerTableChangeCallbacks(tableName)
+	}
+
+	// advertise new head
+	db.AdvertiseHead()
+
+	return commitHash, nil
 }
 
 func (db *DB) ExecAndCommit(query string, commitMsg string) (string, error) {
