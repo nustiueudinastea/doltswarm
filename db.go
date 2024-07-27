@@ -387,6 +387,12 @@ func (db *DB) InitFromPeer(peerID string) error {
 		}
 
 		db.log.Infof("Successfully cloned db from peer %s", peerID)
+
+		_, err = db.conn.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
+		if err != nil {
+			return fmt.Errorf("failed to use db after cloning from remote: %w", err)
+		}
+
 		db.initialized = true
 		// the _ matches any table name so all callbacks are triggered
 		db.triggerTableChangeCallbacks("_")
@@ -627,20 +633,14 @@ func (db *DB) Merge(peerID string) error {
 		return fmt.Errorf("failed to commit merge transaction: %w", err)
 	}
 
-	// Trigger table change callbacks
-	query := fmt.Sprintf("SELECT to_table_name FROM dolt_schema_diff('%s', 'main')", targetBranch)
-	rows, err = db.QueryContext(context.TODO(), query)
+	// find out which tables changed
+	changedTables, err := getChangedTables(db.db, targetBranch, "main")
 	if err != nil {
-		return fmt.Errorf("failed to query changed tables: %w", err)
+		return fmt.Errorf("failed to get changed tables: %w", err)
 	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var tableName string
-		err := rows.Scan(&tableName)
-		if err != nil {
-			return fmt.Errorf("failed to scan table name: %w", err)
-		}
+	// trigger table change callbacks
+	for _, tableName := range changedTables {
 		db.triggerTableChangeCallbacks(tableName)
 	}
 
