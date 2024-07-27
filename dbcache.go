@@ -15,6 +15,8 @@
 package doltswarm
 
 import (
+	"context"
+
 	"github.com/dolthub/dolt/go/libraries/doltcore/remotesrv"
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/hash"
@@ -30,7 +32,7 @@ type RemoteSrvStore interface {
 	chunks.TableFileStore
 
 	Path() (string, bool)
-	GetChunkLocationsWithPaths(hashes hash.HashSet) (map[string]map[hash.Hash]nbs.Range, error)
+	GetChunkLocationsWithPaths(ctx context.Context, hashes hash.HashSet) (map[string]map[hash.Hash]nbs.Range, error)
 }
 
 var _ RemoteSrvStore = &nbs.NomsBlockStore{}
