@@ -101,7 +101,7 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
-	dbConnString := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID())
+	dbConnString := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true&database=%s", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.name)
 	db.sqldb, err = sql.Open("dolt", dbConnString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db: %w", err)
@@ -111,8 +111,8 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		return nil, fmt.Errorf("failed to ping db: %w", err)
 	}
 
-	dbs, err := db.GetDatabase(db.name)
-	if err == nil && dbs == db.name {
+	dbName, err := db.GetDatabase(db.name)
+	if err == nil && dbName == db.name {
 		db.initialized = true
 		_, err = db.sqldb.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
 		if err != nil {
