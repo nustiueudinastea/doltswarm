@@ -114,19 +114,19 @@ func getChangedTables(q Queryer, from string, to string) ([]string, error) {
 }
 
 func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return db.conn.ExecContext(ctx, query, args...)
+	return db.sqldb.ExecContext(ctx, query, args...)
 }
 
 func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return db.conn.QueryContext(ctx, query, args...)
+	return db.sqldb.QueryContext(ctx, query, args...)
 }
 
 func (db *DB) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
-	return db.conn.PrepareContext(ctx, query)
+	return db.sqldb.PrepareContext(ctx, query)
 }
 
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
-	return db.conn.BeginTx(ctx, opts)
+	return db.sqldb.BeginTx(ctx, opts)
 }
 
 // Commit

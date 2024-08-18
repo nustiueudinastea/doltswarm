@@ -61,8 +61,7 @@ type DB struct {
 	initialized          bool
 	stoppers             *concurrentmap.Map[string, func() error]
 	tableChangeCallbacks *concurrentmap.Map[string, Notifier]
-	conn                 *sql.Conn
-	db                   *sql.DB
+	sqldb                *sql.DB
 	eventQueue           chan Event
 	workingDir           string
 	grpcServer           *grpc.Server
@@ -102,29 +101,24 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
-	dbConn := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID())
-	db.db, err = sql.Open("dolt", dbConn)
+	dbConnString := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", db.workingDir, db.signer.GetID(), db.signer.GetID())
+	db.sqldb, err = sql.Open("dolt", dbConnString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
-	db.conn, err = db.db.Conn(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("failed to open db connection: %w", err)
-	}
-
-	if db.conn.PingContext(context.Background()) != nil {
+	if db.sqldb.PingContext(context.Background()) != nil {
 		return nil, fmt.Errorf("failed to ping db: %w", err)
 	}
 
 	dbs, err := db.GetDatabase(db.name)
 	if err == nil && dbs == db.name {
 		db.initialized = true
-		_, err = db.conn.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
+		_, err = db.sqldb.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
 		if err != nil {
 			return nil, fmt.Errorf("failed to use db: %w", err)
 		}
-		_, err = db.conn.ExecContext(context.Background(), "CALL DOLT_REMOTE('remove','origin');")
+		_, err = db.sqldb.ExecContext(context.Background(), "CALL DOLT_REMOTE('remove','origin');")
 		if err != nil && !strings.Contains(err.Error(), "unknown remote") {
 			return nil, fmt.Errorf("failed to remove origin remote during init: %w", err)
 		}
@@ -196,8 +190,8 @@ func (db *DB) RegisterTableChangeCallback(tableName string, n Notifier) {
 }
 
 func (db *DB) Close() error {
-	if db.conn != nil {
-		defer db.conn.Close()
+	if db.sqldb != nil {
+		defer db.sqldb.Close()
 	}
 	db.dbClients.Iter(func(key string, client *DBClient) bool {
 		err := db.RemovePeer(client.GetID())
@@ -226,7 +220,11 @@ func (db *DB) GetFilePath() string {
 func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 
 	var mrEnv *env.MultiRepoEnv
-	err := db.conn.Raw(func(driverConn any) error {
+	conn, err := db.sqldb.Conn(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve db connection: %w", err)
+	}
+	err = conn.Raw(func(driverConn any) error {
 		r, ok := driverConn.(DoltMREnvRetriever)
 		if !ok {
 			return fmt.Errorf("connection is not of dolt type")
@@ -331,17 +329,17 @@ func (db *DB) InitLocal() error {
 	ctx := context.Background()
 
 	sqlCmd := fmt.Sprintf("CREATE DATABASE %s;", db.name)
-	_, err := db.conn.ExecContext(ctx, sqlCmd)
+	_, err := db.sqldb.ExecContext(ctx, sqlCmd)
 	if err != nil {
 		return fmt.Errorf("failed to exec '%s': %w", sqlCmd, err)
 	}
 
-	_, err = db.conn.ExecContext(ctx, "commit;")
+	_, err = db.sqldb.ExecContext(ctx, "commit;")
 	if err != nil {
 		return fmt.Errorf("failed to commit db creation: %w", err)
 	}
 
-	_, err = db.conn.ExecContext(ctx, fmt.Sprintf("USE %s;", db.name))
+	_, err = db.sqldb.ExecContext(ctx, fmt.Sprintf("USE %s;", db.name))
 	if err != nil {
 		return fmt.Errorf("failed to use db: %w", err)
 	}
@@ -357,7 +355,7 @@ func (db *DB) InitLocal() error {
 		return fmt.Errorf("failed to sign init commit '%s': %w", commit.Hash, err)
 	}
 	tagcmd := fmt.Sprintf("CALL DOLT_TAG('-m', '%s', '--author', '%s <%s@doltswarm>', '%s', '%s');", db.signer.PublicKey(), db.signer.GetID(), db.signer.GetID(), signature, commit.Hash)
-	_, err = db.conn.ExecContext(ctx, tagcmd)
+	_, err = db.sqldb.ExecContext(ctx, tagcmd)
 	if err != nil {
 		return fmt.Errorf("failed to create signature tag (%s) for init commit (%s): %w", signature, commit.Hash, err)
 	}
@@ -388,7 +386,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 
 		db.log.Infof("Successfully cloned db from peer %s", peerID)
 
-		_, err = db.conn.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
+		_, err = db.sqldb.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
 		if err != nil {
 			return fmt.Errorf("failed to use db after cloning from remote: %w", err)
 		}
@@ -427,7 +425,7 @@ func (db *DB) VerifySignatures(peerID string) error {
 
 	// retrieve commits specific to peer branch
 	query := fmt.Sprintf("SELECT {*} FROM dolt_log('main..%s/main');", peerID)
-	commits, err := sq.FetchAll(db.conn, sq.
+	commits, err := sq.FetchAll(db.sqldb, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -444,7 +442,7 @@ func (db *DB) VerifySignatures(peerID string) error {
 
 	// retrieve signatures for peer commits (from tags)
 	t := sq.New[TAG]("")
-	tags, err := sq.FetchAll(db.conn, sq.
+	tags, err := sq.FetchAll(db.sqldb, sq.
 		From(t).
 		Where(
 			t.TAG_HASH.In(commitHashes),
@@ -474,7 +472,7 @@ func (db *DB) VerifySignatures(peerID string) error {
 func (db *DB) Merge(peerID string) error {
 	db.log.Infof("Merging from peer %s", peerID)
 
-	txn, err := db.conn.BeginTx(context.Background(), nil)
+	txn, err := db.sqldb.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
 	}
@@ -600,7 +598,7 @@ func (db *DB) Merge(peerID string) error {
 
 		// get last commit date and use it for our auto merge commit
 		query := fmt.Sprintf("SELECT {*} FROM `%s/%s`.dolt_log LIMIT 1;", db.name, targetBranch)
-		commits, err := sq.FetchAll(db.conn, sq.
+		commits, err := sq.FetchAll(db.sqldb, sq.
 			Queryf(query).
 			SetDialect(sq.DialectMySQL),
 			commitMapper,
@@ -634,7 +632,7 @@ func (db *DB) Merge(peerID string) error {
 	}
 
 	// find out which tables changed
-	changedTables, err := getChangedTables(db.db, targetBranch, "main")
+	changedTables, err := getChangedTables(db.sqldb, targetBranch, "main")
 	if err != nil {
 		return fmt.Errorf("failed to get changed tables: %w", err)
 	}
@@ -654,7 +652,7 @@ func (db *DB) Merge(peerID string) error {
 func (db *DB) GetLastCommit(branch string) (Commit, error) {
 
 	query := fmt.Sprintf("SELECT {*} FROM `%s/%s`.dolt_log LIMIT 1;", db.name, branch)
-	commits, err := sq.FetchAll(db.conn, sq.
+	commits, err := sq.FetchAll(db.sqldb, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -671,7 +669,7 @@ func (db *DB) GetLastCommit(branch string) (Commit, error) {
 }
 
 func (db *DB) GetRemote(name string) (Remote, error) {
-	return sq.FetchOne(db.conn, sq.
+	return sq.FetchOne(db.sqldb, sq.
 		Queryf("SELECT {*} FROM remotes WHERE name = {}", name).
 		SetDialect(sq.DialectMySQL),
 		func(row *sq.Row) Remote {
@@ -687,14 +685,14 @@ func (db *DB) GetRemote(name string) (Remote, error) {
 
 func (db *DB) GetDatabase(name string) (string, error) {
 	dbName := ""
-	err := db.conn.QueryRowContext(context.Background(), fmt.Sprintf("SHOW DATABASES LIKE '%s'", db.name)).Scan(&dbName)
+	err := db.sqldb.QueryRowContext(context.Background(), fmt.Sprintf("SHOW DATABASES LIKE '%s'", db.name)).Scan(&dbName)
 	return dbName, err
 }
 
 func (db *DB) GetFirstCommit() (Commit, error) {
 
 	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log ORDER BY date LIMIT 1;", db.name)
-	commits, err := sq.FetchAll(db.conn, sq.
+	commits, err := sq.FetchAll(db.sqldb, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -712,7 +710,7 @@ func (db *DB) GetFirstCommit() (Commit, error) {
 
 func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log WHERE commit_hash = '%s' LIMIT 1;", db.name, commitHash)
-	commit, err := sq.FetchOne(db.conn, sq.
+	commit, err := sq.FetchOne(db.sqldb, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -733,7 +731,7 @@ func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 
 func (db *DB) GetAllCommits() ([]Commit, error) {
 	query := fmt.Sprintf("SELECT {*} FROM `%s/main`.dolt_log;", db.name)
-	commits, err := sq.FetchAll(db.conn, sq.
+	commits, err := sq.FetchAll(db.sqldb, sq.
 		Queryf(query).
 		SetDialect(sq.DialectMySQL),
 		commitMapper,
@@ -747,7 +745,7 @@ func (db *DB) GetAllCommits() ([]Commit, error) {
 }
 
 func (db *DB) GetSqlDB() *sql.DB {
-	return db.db
+	return db.sqldb
 }
 
 func (db *DB) Initialized() bool {
