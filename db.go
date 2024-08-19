@@ -101,19 +101,27 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
-	dbConnString := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true&database=%s", db.workingDir, db.signer.GetID(), db.signer.GetID(), db.name)
-	db.sqldb, err = sql.Open("dolt", dbConnString)
+	db.sqldb, err = openDB(db.workingDir, db.signer.GetID(), "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
-	if db.sqldb.PingContext(context.Background()) != nil {
-		return nil, fmt.Errorf("failed to ping db: %w", err)
-	}
+	foundDB, err := db.DatabaseExists(db.name)
+	if err == nil && foundDB {
 
-	dbName, err := db.GetDatabase(db.name)
-	if err == nil && dbName == db.name {
+		err = db.sqldb.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to close db connection after init local: %w", err)
+		}
+
 		db.initialized = true
+
+		// re-open the db connection with db name included
+		db.sqldb, err = openDB(db.workingDir, db.signer.GetID(), db.name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to re-open db: %w", err)
+		}
+
 		_, err = db.sqldb.ExecContext(context.Background(), fmt.Sprintf("USE %s;", db.name))
 		if err != nil {
 			return nil, fmt.Errorf("failed to use db: %w", err)
@@ -133,6 +141,30 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 	}
 
 	return db, nil
+}
+
+// re-open the db connection with the new db param
+func openDB(workingDir, signerID, dbName string) (*sql.DB, error) {
+
+	if workingDir == "" || signerID == "" {
+		return nil, fmt.Errorf("workingDir and signerID cannot be empty")
+	}
+
+	dbConnString := fmt.Sprintf("file://%s?commitname=%s&commitemail=%s@doltswarm&multistatements=true", workingDir, signerID, signerID)
+	if dbName != "" {
+		dbConnString = fmt.Sprintf(dbConnString+"&database=%s", dbName)
+	}
+
+	sqldb, err := sql.Open("dolt", dbConnString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db: %w", err)
+	}
+
+	if sqldb.PingContext(context.Background()) != nil {
+		return nil, fmt.Errorf("failed to ping db: %w", err)
+	}
+
+	return sqldb, nil
 }
 
 func (db *DB) p2pSetup() error {
@@ -339,9 +371,15 @@ func (db *DB) InitLocal() error {
 		return fmt.Errorf("failed to commit db creation: %w", err)
 	}
 
-	_, err = db.sqldb.ExecContext(ctx, fmt.Sprintf("USE %s;", db.name))
+	err = db.sqldb.Close()
 	if err != nil {
-		return fmt.Errorf("failed to use db: %w", err)
+		return fmt.Errorf("failed to close db connection after init local: %w", err)
+	}
+
+	// re-open the db connection with db name included
+	db.sqldb, err = openDB(db.workingDir, db.signer.GetID(), db.name)
+	if err != nil {
+		return fmt.Errorf("failed to re-open db after local init: %w", err)
 	}
 
 	commit, err := db.GetFirstCommit()
@@ -368,8 +406,6 @@ func (db *DB) InitLocal() error {
 func (db *DB) InitFromPeer(peerID string) error {
 	db.log.Infof("Initializing from peer %s", peerID)
 
-	// time.Sleep(3 * time.Second)
-
 	tries := 0
 	for tries < 10 {
 		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main', '%s://%s/%s', '%s');", FactorySwarm, peerID, db.name, db.name)
@@ -391,7 +427,19 @@ func (db *DB) InitFromPeer(peerID string) error {
 			return fmt.Errorf("failed to use db after cloning from remote: %w", err)
 		}
 
+		err = db.sqldb.Close()
+		if err != nil {
+			return fmt.Errorf("failed to close db connection after init local: %w", err)
+		}
+
 		db.initialized = true
+
+		// re-open the db connection with db name included
+		db.sqldb, err = openDB(db.workingDir, db.signer.GetID(), db.name)
+		if err != nil {
+			return fmt.Errorf("failed to re-open db: %w", err)
+		}
+
 		// the _ matches any table name so all callbacks are triggered
 		db.triggerTableChangeCallbacks("_")
 		return nil
@@ -513,7 +561,7 @@ func (db *DB) Merge(peerID string) error {
 	}
 
 	// create temp main branch from main
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', 'main', '%s');", tempMainBranch))
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_B RANCH('-c', 'main', '%s');", tempMainBranch))
 	if err != nil {
 		return fmt.Errorf("failed to copy source branch: %w", err)
 	}
@@ -683,10 +731,10 @@ func (db *DB) GetRemote(name string) (Remote, error) {
 	)
 }
 
-func (db *DB) GetDatabase(name string) (string, error) {
+func (db *DB) DatabaseExists(name string) (bool, error) {
 	dbName := ""
 	err := db.sqldb.QueryRowContext(context.Background(), fmt.Sprintf("SHOW DATABASES LIKE '%s'", db.name)).Scan(&dbName)
-	return dbName, err
+	return "" != dbName, err
 }
 
 func (db *DB) GetFirstCommit() (Commit, error) {
