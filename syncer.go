@@ -13,6 +13,8 @@ const (
 	ExternalHeadEvent = "new_head"
 )
 
+var _ proto.DBSyncerServer = (*ServerSyncer)(nil)
+
 func NewServerSyncer(logger *logrus.Entry, db *DB) *ServerSyncer {
 	return &ServerSyncer{
 		db: db,

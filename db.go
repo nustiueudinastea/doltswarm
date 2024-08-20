@@ -64,7 +64,6 @@ type DB struct {
 	sqldb                *sql.DB
 	eventQueue           chan Event
 	workingDir           string
-	grpcServer           *grpc.Server
 	log                  *logrus.Entry
 	dbClients            *concurrentmap.Map[string, *DBClient]
 	signer               Signer
@@ -178,7 +177,7 @@ func (db *DB) p2pSetup() error {
 	return nil
 }
 
-func (db *DB) EnableGRPCServers() error {
+func (db *DB) EnableGRPCServers(server *grpc.Server) error {
 
 	db.log.Debug("enabling grpc servers")
 
@@ -187,17 +186,14 @@ func (db *DB) EnableGRPCServers() error {
 	if err != nil {
 		return fmt.Errorf("error getting chunk store: %s", err.Error())
 	}
+
 	chunkStoreCache := NewCSCache(cs.(remotesrv.RemoteSrvStore))
 	chunkStoreServer := NewServerChunkStore(db.log, chunkStoreCache, db.GetFilePath())
-	syncerServer := NewServerSyncer(db.log, db)
+	proto.RegisterDownloaderServer(server, chunkStoreServer)
+	remotesapi.RegisterChunkStoreServiceServer(server, chunkStoreServer)
 
-	// register grpc servers
-	if db.grpcServer == nil {
-		return fmt.Errorf("grpc server not initialized")
-	}
-	proto.RegisterDownloaderServer(db.grpcServer, chunkStoreServer)
-	remotesapi.RegisterChunkStoreServiceServer(db.grpcServer, chunkStoreServer)
-	proto.RegisterDBSyncerServer(db.grpcServer, syncerServer)
+	syncerServer := NewServerSyncer(db.log, db)
+	proto.RegisterDBSyncerServer(server, syncerServer)
 
 	// start event processor
 	db.stoppers.Set("dbEventProcessor", db.startRemoteEventProcessor())
@@ -278,10 +274,6 @@ func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 
 	dbd := doltdb.HackDatasDatabaseFromDoltDB(env.DoltDB)
 	return datas.ChunkStoreFromDatabase(dbd), nil
-}
-
-func (db *DB) AddGRPCServer(server *grpc.Server) {
-	db.grpcServer = server
 }
 
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
