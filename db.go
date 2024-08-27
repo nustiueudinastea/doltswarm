@@ -553,7 +553,7 @@ func (db *DB) Merge(peerID string) error {
 	}
 
 	// create temp main branch from main
-	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_B RANCH('-c', 'main', '%s');", tempMainBranch))
+	_, err = txn.Exec(fmt.Sprintf("CALL DOLT_BRANCH('-c', 'main', '%s');", tempMainBranch))
 	if err != nil {
 		return fmt.Errorf("failed to copy source branch: %w", err)
 	}
