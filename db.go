@@ -542,7 +542,7 @@ func (db *DB) Merge(peerID string) error {
 		// delete temp branch
 		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempPeerBranch))
 		if err != nil {
-			db.log.Errorf("failed to delete temp branch: %v", err)
+			db.log.Errorf("failed to delete temp branch '%s' for peer commits: %v", tempPeerBranch, err)
 		}
 	}()
 
@@ -561,7 +561,7 @@ func (db *DB) Merge(peerID string) error {
 		// delete temp branch
 		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempMainBranch))
 		if err != nil {
-			db.log.Errorf("failed to delete temp branch: %v", err)
+			db.log.Errorf("failed to delete temp branch '%s' for main: %v", tempMainBranch, err)
 		}
 	}()
 
@@ -577,10 +577,18 @@ func (db *DB) Merge(peerID string) error {
 		return fmt.Errorf("failed to retrieve peer hash: %w", err)
 	}
 
-	// establish deterministic merge direction based on simple string comparison
+	// if hasMain is ancestor of hashPeer, then the merge order should be set to peer -> main. Otherwise, we decide merge direction based on a string comparison
+	// the reason is because if hashMain is not ancestor of hashPeer, it means that both branches have diverged independetly.
+	var mainAncestorOfPeer sql.NullBool
+	err = txn.QueryRow(fmt.Sprintf("select has_ancestor('%s', '%s');", tempPeerBranch, hashMain.String)).Scan(&mainAncestorOfPeer)
+	if err != nil || !hashPeer.Valid {
+		return fmt.Errorf("failed to retrieve peer hash: %w", err)
+	}
+
+	// establish deterministic merge direction based on simple string comparison, but only if main hash is not ancestor of peer
 	sourceBranch := tempPeerBranch
 	targetBranch := tempMainBranch
-	if hashMain.String > hashPeer.String {
+	if !mainAncestorOfPeer.Bool && hashMain.String > hashPeer.String {
 		sourceBranch = tempMainBranch
 		targetBranch = tempPeerBranch
 	}
@@ -649,9 +657,6 @@ func (db *DB) Merge(peerID string) error {
 
 		_, err = txn.Exec(fmt.Sprintf("CALL DOLT_COMMIT('-A', '--author', 'merge <merge@merge.com>', '--date', '%s', '-m', 'auto merge');", commits[0].Date.Format(time.RFC3339Nano)))
 		if err != nil {
-			if strings.Contains(err.Error(), "nothing to commit") {
-				return nil
-			}
 			return fmt.Errorf("failed to commit merge: %w", err)
 		}
 
