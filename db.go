@@ -272,7 +272,8 @@ func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 		return nil, fmt.Errorf("failed to retrieve db env")
 	}
 
-	dbd := doltdb.HackDatasDatabaseFromDoltDB(env.DoltDB)
+	doltDB := env.DoltDB(context.Background())
+	dbd := doltdb.HackDatasDatabaseFromDoltDB(doltDB)
 	return datas.ChunkStoreFromDatabase(dbd), nil
 }
 

@@ -22,6 +22,11 @@ func (rtf RemoteTableFile) LocationPrefix() string {
 	return ""
 }
 
+// LocationSuffix
+func (rtf RemoteTableFile) LocationSuffix() string {
+	return ""
+}
+
 // FileID gets the id of the file
 func (rtf RemoteTableFile) FileID() string {
 	return rtf.info.FileId

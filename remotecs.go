@@ -107,7 +107,7 @@ func (rcs *RemoteChunkStore) GetMany(ctx context.Context, hashes hash.HashSet, f
 	rcs.log.Trace("calling GetMany")
 	ae := atomicerr.New()
 	decompressedSize := uint64(0)
-	err := rcs.GetManyCompressed(ctx, hashes, func(ctx context.Context, cc nbs.CompressedChunk) {
+	err := rcs.GetManyCompressed(ctx, hashes, func(ctx context.Context, cc nbs.ToChunker) {
 		if ae.IsSet() {
 			return
 		}
@@ -127,9 +127,9 @@ func (rcs *RemoteChunkStore) GetMany(ctx context.Context, hashes hash.HashSet, f
 	return nil
 }
 
-func (rcs *RemoteChunkStore) GetManyCompressed(ctx context.Context, hashes hash.HashSet, found func(context.Context, nbs.CompressedChunk)) error {
+func (rcs *RemoteChunkStore) GetManyCompressed(ctx context.Context, hashes hash.HashSet, found func(context.Context, nbs.ToChunker)) error {
 	rcs.log.Trace("calling GetManyCompressed")
-	hashToChunk := rcs.cache.Get(hashes)
+	hashToChunk := rcs.cache.GetCachedChunks(hashes)
 
 	notCached := make([]hash.Hash, 0, len(hashes))
 	for h := range hashes {
@@ -153,7 +153,7 @@ func (rcs *RemoteChunkStore) GetManyCompressed(ctx context.Context, hashes hash.
 	return nil
 }
 
-func (rcs *RemoteChunkStore) downloadChunksAndCache(ctx context.Context, notCached []hash.Hash, found func(context.Context, nbs.CompressedChunk)) error {
+func (rcs *RemoteChunkStore) downloadChunksAndCache(ctx context.Context, notCached []hash.Hash, found func(context.Context, nbs.ToChunker)) error {
 	toSend := make(map[hash.Hash]struct{}, len(notCached))
 	for _, h := range notCached {
 		toSend[h] = struct{}{}
@@ -185,9 +185,8 @@ func (rcs *RemoteChunkStore) downloadChunksAndCache(ctx context.Context, notCach
 			if err != nil {
 				return fmt.Errorf("failed to create compressed chunk for hash '%s': %w", chunkMsg.GetHash(), err)
 			}
-			if rcs.cache.PutChunk(compressedChunk) {
-				return fmt.Errorf("cache full")
-			}
+
+			rcs.cache.InsertChunks([]nbs.ToChunker{compressedChunk})
 
 			if _, send := toSend[h]; send {
 				found(ctx, compressedChunk)
@@ -214,7 +213,7 @@ func (rcs *RemoteChunkStore) Has(ctx context.Context, h hash.Hash) (bool, error)
 func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (hash.HashSet, error) {
 	rcs.log.Trace("calling HasMany")
 
-	notCached := rcs.cache.Has(hashes)
+	notCached := rcs.cache.GetCachedHas(hashes)
 
 	if len(notCached) == 0 {
 		return notCached, nil
@@ -224,7 +223,8 @@ func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (
 	hashSl, byteSl := remotestorage.HashSetToSlices(notCached)
 
 	absent := make(hash.HashSet)
-	var found []nbs.CompressedChunk
+	// var found []nbs.CompressedChunk
+	found := make(hash.HashSet)
 	var err error
 
 	batchItr(len(hashSl), maxHasManyBatchSize, func(st, end int) (stop bool) {
@@ -260,8 +260,7 @@ func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (
 				absent[currHash] = struct{}{}
 				j++
 			} else {
-				c := nbs.ChunkToCompressedChunk(chunks.NewChunkWithHash(currHash, []byte{}))
-				found = append(found, c)
+				found.Insert(currHash)
 			}
 		}
 
@@ -277,9 +276,7 @@ func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (
 	}
 
 	if len(found) > 0 {
-		if rcs.cache.Put(found) {
-			return hash.HashSet{}, remotestorage.ErrCacheCapacityExceeded
-		}
+		rcs.cache.InsertHas(found)
 	}
 
 	return absent, nil
