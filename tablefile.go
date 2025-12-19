@@ -37,6 +37,11 @@ func (rtf RemoteTableFile) NumChunks() int {
 	return int(rtf.info.NumChunks)
 }
 
+// SplitOffset returns the byte offset from the beginning of the storage file where we transition from data to index.
+func (rtf RemoteTableFile) SplitOffset() uint64 {
+	return rtf.info.GetSplitOffset()
+}
+
 // Open returns an io.ReadCloser which can be used to read the bytes of a table file.
 func (rtf RemoteTableFile) Open(ctx context.Context) (io.ReadCloser, uint64, error) {
 	if rtf.info.RefreshAfter != nil && rtf.info.RefreshAfter.AsTime().After(time.Now()) {

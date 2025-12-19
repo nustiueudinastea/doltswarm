@@ -380,11 +380,11 @@ func (rcs *RemoteChunkStore) Size(ctx context.Context) (uint64, error) {
 	return rcs.repoSize, nil
 }
 
-func (rcs *RemoteChunkStore) WriteTableFile(ctx context.Context, fileId string, numChunks int, contentHash []byte, getRd func() (io.ReadCloser, uint64, error)) error {
+func (rcs *RemoteChunkStore) WriteTableFile(ctx context.Context, fileId string, splitOffset uint64, numChunks int, contentHash []byte, getRd func() (io.ReadCloser, uint64, error)) error {
 	return fmt.Errorf("not supported")
 }
 
-func (rcs *RemoteChunkStore) AddTableFilesToManifest(ctx context.Context, fileIdToNumChunks map[string]int) error {
+func (rcs *RemoteChunkStore) AddTableFilesToManifest(ctx context.Context, fileIdToNumChunks map[string]int, getAddrs chunks.GetAddrsCurry) error {
 	return fmt.Errorf("not supported")
 }
 
