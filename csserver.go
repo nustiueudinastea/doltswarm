@@ -289,7 +289,7 @@ func (rs *ServerChunkStore) DownloadChunks(req *proto.DownloadChunksRequest, ser
 	for _, hashStr := range req.Hashes {
 		h := hash.Parse(hashStr)
 
-		chunk, err := cs.Get(context.TODO(), h)
+		chunk, err := cs.Get(server.Context(), h)
 		if err != nil {
 			return err
 		}

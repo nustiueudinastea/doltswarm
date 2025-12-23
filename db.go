@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bokwoon95/sq"
@@ -58,15 +60,20 @@ type Notifier interface {
 
 type DB struct {
 	name                 string
-	initialized          bool
+	initialized          atomic.Bool
 	stoppers             *concurrentmap.Map[string, func() error]
 	tableChangeCallbacks *concurrentmap.Map[string, Notifier]
 	sqldb                *sql.DB
+	sqlMu                sync.RWMutex // Protects sqldb during close/reopen operations
 	eventQueue           chan Event
 	workingDir           string
 	log                  *logrus.Entry
 	dbClients            *concurrentmap.Map[string, *DBClient]
+	peerConns            *concurrentmap.Map[string, *grpc.ClientConn] // Store connections for cleanup
 	signer               Signer
+	shutdownWg           sync.WaitGroup // Track active operations for graceful shutdown
+	ctx                  context.Context
+	cancel               context.CancelFunc
 }
 
 func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, error) {
@@ -84,15 +91,20 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		return nil, fmt.Errorf("failed to get absolute path for %s: %v", workingDir, err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	db := &DB{
 		name:                 name,
 		workingDir:           workingDir,
 		log:                  logger,
 		eventQueue:           make(chan Event, 300),
 		dbClients:            concurrentmap.New[string, *DBClient](),
+		peerConns:            concurrentmap.New[string, *grpc.ClientConn](),
 		stoppers:             concurrentmap.New[string, func() error](),
 		tableChangeCallbacks: concurrentmap.New[string, Notifier](),
 		signer:               signer,
+		ctx:                  ctx,
+		cancel:               cancel,
 	}
 
 	err = ensureDir(db.workingDir)
@@ -108,15 +120,18 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 	foundDB, err := db.DatabaseExists(db.name)
 	if err == nil && foundDB {
 
+		db.sqlMu.Lock()
 		err = db.sqldb.Close()
 		if err != nil {
+			db.sqlMu.Unlock()
 			return nil, fmt.Errorf("failed to close db connection after init local: %w", err)
 		}
 
-		db.initialized = true
+		db.initialized.Store(true)
 
 		// re-open the db connection with db name included
 		db.sqldb, err = openDB(db.workingDir, db.signer.GetID(), db.name)
+		db.sqlMu.Unlock()
 		if err != nil {
 			return nil, fmt.Errorf("failed to re-open db: %w", err)
 		}
@@ -135,7 +150,7 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		return nil, fmt.Errorf("failed to do p2p setup: %w", err)
 	}
 
-	if db.Initialized() {
+	if db.initialized.Load() {
 		db.RequestHeadFromAllPeers()
 	}
 
@@ -218,17 +233,12 @@ func (db *DB) RegisterTableChangeCallback(tableName string, n Notifier) {
 }
 
 func (db *DB) Close() error {
-	if db.sqldb != nil {
-		defer db.sqldb.Close()
-	}
-	db.dbClients.Iter(func(key string, client *DBClient) bool {
-		err := db.RemovePeer(client.GetID())
-		if err != nil {
-			db.log.Warnf("failed to remove peer %s: %v", client.GetID(), err)
-		}
-		return true
-	})
+	db.log.Info("Starting graceful shutdown...")
 
+	// Signal shutdown to all operations
+	db.cancel()
+
+	// Stop all stoppers first (this includes the event processor)
 	var finalerr error
 	db.stoppers.Iter(func(key string, stopper func() error) bool {
 		err := stopper()
@@ -238,6 +248,50 @@ func (db *DB) Close() error {
 		db.log.Infof("Stopped %s", key)
 		return true
 	})
+
+	// Wait for in-flight operations to complete (with timeout)
+	done := make(chan struct{})
+	go func() {
+		db.shutdownWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		db.log.Info("All in-flight operations completed")
+	case <-time.After(30 * time.Second):
+		db.log.Warn("Shutdown timeout waiting for in-flight operations")
+	}
+
+	// Close peer connections
+	db.peerConns.Iter(func(key string, conn *grpc.ClientConn) bool {
+		if conn != nil {
+			if err := conn.Close(); err != nil {
+				db.log.Warnf("failed to close connection for peer %s: %v", key, err)
+			}
+		}
+		return true
+	})
+
+	// Remove peers
+	db.dbClients.Iter(func(key string, client *DBClient) bool {
+		err := db.RemovePeer(client.GetID())
+		if err != nil {
+			db.log.Warnf("failed to remove peer %s: %v", client.GetID(), err)
+		}
+		return true
+	})
+
+	// Close SQL connection last
+	db.sqlMu.Lock()
+	if db.sqldb != nil {
+		if err := db.sqldb.Close(); err != nil {
+			finalerr = multierr.Append(finalerr, err)
+		}
+	}
+	db.sqlMu.Unlock()
+
+	db.log.Info("Shutdown complete")
 	return finalerr
 }
 
@@ -278,6 +332,13 @@ func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 }
 
 func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
+	db.log.Infof("AddPeer called for peer %s (initialized=%v, clients=%d)", peerID, db.initialized.Load(), db.dbClients.Len())
+
+	// Store connection for later cleanup
+	if conn != nil {
+		db.peerConns.Set(peerID, conn)
+	}
+
 	if _, ok := db.dbClients.Get(peerID); !ok {
 		db.dbClients.Set(peerID, &DBClient{
 			id:                      peerID,
@@ -285,29 +346,34 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 			ChunkStoreServiceClient: remotesapi.NewChunkStoreServiceClient(conn),
 			DownloaderClient:        proto.NewDownloaderClient(conn),
 		})
-		db.log.Debugf("added swarm client for peer %s", peerID)
+		db.log.Infof("added swarm client for peer %s (total clients: %d)", peerID, db.dbClients.Len())
 	} else {
 		db.log.Debugf("swarm client for peer %s already exists", peerID)
 	}
 
-	if db.initialized {
-
-		// TODO: change this to a check if the remote exists
-		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
+	if db.initialized.Load() {
+		// Check if the remote already exists before adding
+		// This avoids a race condition where removing and re-adding the remote
+		// can cause concurrent Pull/Merge operations to fail with "no remote"
+		_, err := db.GetRemote(peerID)
 		if err != nil {
-			if !strings.Contains(err.Error(), "remote not found") && !strings.Contains(err.Error(), "unknown remote") {
-				return fmt.Errorf("failed to remove remote for peer %s: %w", peerID, err)
+			// Remote doesn't exist, add it
+			db.log.Debugf("remote for peer %s not found, adding it", peerID)
+			// Use parameterized query to prevent SQL injection
+			ctx, cancel := context.WithTimeout(db.ctx, 30*time.Second)
+			defer cancel()
+			_, err = db.ExecContext(ctx, "CALL DOLT_REMOTE('add', ?, ?);", peerID, fmt.Sprintf("%s://%s", FactorySwarm, peerID))
+			if err != nil {
+				if !strings.Contains(err.Error(), "remote already exists") {
+					return fmt.Errorf("failed to add remote for peer %s: %w", peerID, err)
+				}
+				db.log.Debugf("remote for peer %s already exists (race)", peerID)
+			} else {
+				db.log.Infof("added swarm remote for peer %s", peerID)
 			}
+		} else {
+			db.log.Debugf("swarm remote for peer %s already exists", peerID)
 		}
-
-		// this part is executed if the db is already initialized
-		// so that the client is still available when doing initialization from another peer
-		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('add','%s','%s://%s');", peerID, FactorySwarm, peerID))
-		if err != nil {
-			return fmt.Errorf("failed to add remote for peer %s: %w", peerID, err)
-		}
-
-		db.log.Debugf("added swarm remote for peer %s", peerID)
 
 		err = db.RequestHeadFromPeer(peerID)
 		if err != nil {
@@ -321,16 +387,38 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 }
 
 func (db *DB) RemovePeer(peerID string) error {
-	db.log.Debugf("deleting swarm client for peer %s", peerID)
-	db.dbClients.Delete(peerID)
+	db.log.Infof("RemovePeer called for peer %s (initialized=%v, clients=%d)", peerID, db.initialized.Load(), db.dbClients.Len())
 
-	if db.initialized {
+	if _, ok := db.dbClients.Get(peerID); ok {
+		db.dbClients.Delete(peerID)
+		db.log.Infof("deleted swarm client for peer %s (remaining clients: %d)", peerID, db.dbClients.Len())
+	} else {
+		db.log.Debugf("swarm client for peer %s not found, nothing to delete", peerID)
+	}
+
+	// Clean up connection (but don't close - let Close() handle that to avoid closing active connections)
+	db.peerConns.Delete(peerID)
+
+	if db.initialized.Load() {
+		// Check if remote exists before trying to remove
+		_, err := db.GetRemote(peerID)
+		if err != nil {
+			db.log.Debugf("remote for peer %s not found, nothing to remove", peerID)
+			return nil
+		}
+
 		db.log.Debugf("deleting swarm remote for peer %s", peerID)
-		_, err := db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_REMOTE('remove','%s');", peerID))
+		// Use parameterized query to prevent SQL injection
+		ctx, cancel := context.WithTimeout(db.ctx, 30*time.Second)
+		defer cancel()
+		_, err = db.ExecContext(ctx, "CALL DOLT_REMOTE('remove', ?);", peerID)
 		if err != nil {
 			if !strings.Contains(err.Error(), "remote not found") && !strings.Contains(err.Error(), "unknown remote") {
 				return fmt.Errorf("failed to remove remote for peer %s: %w", peerID, err)
 			}
+			db.log.Debugf("remote for peer %s already removed (race)", peerID)
+		} else {
+			db.log.Infof("deleted swarm remote for peer %s", peerID)
 		}
 	}
 
@@ -364,13 +452,16 @@ func (db *DB) InitLocal() error {
 		return fmt.Errorf("failed to commit db creation: %w", err)
 	}
 
+	db.sqlMu.Lock()
 	err = db.sqldb.Close()
 	if err != nil {
+		db.sqlMu.Unlock()
 		return fmt.Errorf("failed to close db connection after init local: %w", err)
 	}
 
 	// re-open the db connection with db name included
 	db.sqldb, err = openDB(db.workingDir, db.signer.GetID(), db.name)
+	db.sqlMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to re-open db after local init: %w", err)
 	}
@@ -391,7 +482,7 @@ func (db *DB) InitLocal() error {
 		return fmt.Errorf("failed to create signature tag (%s) for init commit (%s): %w", signature, commit.Hash, err)
 	}
 
-	db.initialized = true
+	db.initialized.Store(true)
 
 	return nil
 }
@@ -401,8 +492,10 @@ func (db *DB) InitFromPeer(peerID string) error {
 
 	tries := 0
 	for tries < 10 {
+		ctx, cancel := context.WithTimeout(db.ctx, 60*time.Second)
 		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main', '%s://%s/%s', '%s');", FactorySwarm, peerID, db.name, db.name)
-		_, err := db.ExecContext(context.TODO(), query)
+		_, err := db.ExecContext(ctx, query)
+		cancel()
 		if err != nil {
 			if strings.Contains(err.Error(), "could not get client") {
 				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
@@ -420,15 +513,18 @@ func (db *DB) InitFromPeer(peerID string) error {
 			return fmt.Errorf("failed to use db after cloning from remote: %w", err)
 		}
 
+		db.sqlMu.Lock()
 		err = db.sqldb.Close()
 		if err != nil {
+			db.sqlMu.Unlock()
 			return fmt.Errorf("failed to close db connection after init local: %w", err)
 		}
 
-		db.initialized = true
+		db.initialized.Store(true)
 
 		// re-open the db connection with db name included
 		db.sqldb, err = openDB(db.workingDir, db.signer.GetID(), db.name)
+		db.sqlMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to re-open db: %w", err)
 		}
@@ -443,7 +539,7 @@ func (db *DB) InitFromPeer(peerID string) error {
 
 func (db *DB) Pull(peerID string) error {
 	db.log.Infof("Pulling from peer %s", peerID)
-	txn, err := db.BeginTx(context.TODO(), nil)
+	txn, err := db.BeginTx(db.ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
 	}
@@ -540,8 +636,10 @@ func (db *DB) Merge(peerID string) error {
 		return fmt.Errorf("failed to checkout branch for peer %s: %w", peerID, err)
 	}
 	defer func() {
-		// delete temp branch
-		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempPeerBranch))
+		// delete temp branch - use background context since db.ctx may be cancelled during shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempPeerBranch))
 		if err != nil {
 			db.log.Errorf("failed to delete temp branch '%s' for peer commits: %v", tempPeerBranch, err)
 		}
@@ -559,8 +657,10 @@ func (db *DB) Merge(peerID string) error {
 		return fmt.Errorf("failed to copy source branch: %w", err)
 	}
 	defer func() {
-		// delete temp branch
-		_, err = db.ExecContext(context.TODO(), fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempMainBranch))
+		// delete temp branch - use background context since db.ctx may be cancelled during shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-d', '%s');", tempMainBranch))
 		if err != nil {
 			db.log.Errorf("failed to delete temp branch '%s' for main: %v", tempMainBranch, err)
 		}
@@ -715,8 +815,10 @@ func (db *DB) GetLastCommit(branch string) (Commit, error) {
 }
 
 func (db *DB) GetRemote(name string) (Remote, error) {
+	// Use dolt_remotes system table (not 'remotes')
+	query := fmt.Sprintf("SELECT {*} FROM `%s`.dolt_remotes WHERE name = {}", db.name)
 	return sq.FetchOne(db.sqldb, sq.
-		Queryf("SELECT {*} FROM remotes WHERE name = {}", name).
+		Queryf(query, name).
 		SetDialect(sq.DialectMySQL),
 		func(row *sq.Row) Remote {
 			return Remote{
@@ -795,5 +897,10 @@ func (db *DB) GetSqlDB() *sql.DB {
 }
 
 func (db *DB) Initialized() bool {
-	return db.initialized
+	return db.initialized.Load()
+}
+
+// Context returns the DB's context for use by operations that need cancellation support
+func (db *DB) Context() context.Context {
+	return db.ctx
 }

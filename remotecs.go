@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"sync"
 	"sync/atomic"
 
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
@@ -84,6 +85,7 @@ type RemoteChunkStore struct {
 	nbfVersion  string
 	repoSize    uint64
 	root        hash.Hash
+	rootMu      sync.RWMutex // Protects root field for concurrent access
 	log         *logrus.Entry
 }
 
@@ -303,13 +305,18 @@ func (rcs *RemoteChunkStore) loadRoot(ctx context.Context) error {
 	if err != nil {
 		return remotestorage.NewRpcError(err, "Root", rcs.peerID, req)
 	}
+	rcs.rootMu.Lock()
 	rcs.root = hash.New(resp.RootHash)
+	rcs.rootMu.Unlock()
 	return nil
 }
 
 func (rcs *RemoteChunkStore) Root(ctx context.Context) (hash.Hash, error) {
 	rcs.log.Trace("calling Root")
-	return rcs.root, nil
+	rcs.rootMu.RLock()
+	root := rcs.root
+	rcs.rootMu.RUnlock()
+	return root, nil
 }
 
 func (rcs *RemoteChunkStore) Commit(ctx context.Context, current, last hash.Hash) (bool, error) {

@@ -131,7 +131,7 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 
 // Commit
 func (db *DB) Commit(commitMsg string) (string, error) {
-	tx, err := db.BeginTx(context.TODO(), nil)
+	tx, err := db.BeginTx(db.ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to start transaction: %w", err)
 	}
@@ -166,7 +166,7 @@ func (db *DB) Commit(commitMsg string) (string, error) {
 }
 
 func (db *DB) ExecAndCommit(execFunc ExecFunc, commitMsg string) (string, error) {
-	tx, err := db.BeginTx(context.TODO(), nil)
+	tx, err := db.BeginTx(db.ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to start transaction: %w", err)
 	}
