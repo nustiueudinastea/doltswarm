@@ -133,9 +133,9 @@ func (rcs *RemoteChunkStore) GetManyCompressed(ctx context.Context, hashes hash.
 
 	notCached := make([]hash.Hash, 0, len(hashes))
 	for h := range hashes {
-		c := hashToChunk[h]
+		c, ok := hashToChunk[h]
 
-		if c.IsEmpty() {
+		if !ok || c == nil || c.IsEmpty() {
 			notCached = append(notCached, h)
 		} else {
 			found(ctx, c)
@@ -294,7 +294,7 @@ func (rcs *RemoteChunkStore) Version() string {
 
 func (rcs *RemoteChunkStore) Rebase(ctx context.Context) error {
 	rcs.log.Trace("calling Rebase")
-	return fmt.Errorf("not supported")
+	return rcs.loadRoot(ctx)
 }
 
 func (rcs *RemoteChunkStore) loadRoot(ctx context.Context) error {

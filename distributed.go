@@ -112,7 +112,10 @@ func (db *DB) AdvertiseHead() {
 		for _, client := range clients {
 			_, err := client.AdvertiseHead(context.TODO(), req, grpc.WaitForReady(true))
 			if err != nil {
-				db.log.Errorf("Error advertising head to peer '%s': %v", client.GetID(), err)
+				// Silence "unknown service proto.DBSyncer" error - expected when peer hasn't finished initialization
+				if !strings.Contains(err.Error(), "unknown service proto.DBSyncer") {
+					db.log.Errorf("Error advertising head to peer '%s': %v", client.GetID(), err)
+				}
 				continue
 			}
 
