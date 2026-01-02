@@ -1,8 +1,8 @@
-version: '3'
+version: "3"
 
 vars:
   CGO_FLAGS: 'CGO_LDFLAGS="-L/opt/homebrew/opt/icu4c@78/lib" CGO_CPPFLAGS="-I/opt/homebrew/opt/icu4c@78/include" CGO_CFLAGS="-I/opt/homebrew/opt/icu4c@78/include"'
-  GO_ENV: 'GONOSUMDB=github.com/nustiueudinastea/*'
+  GO_ENV: "GONOSUMDB=github.com/nustiueudinastea/*"
   DOCKER_IMAGE: doltswarmdemo
   NR_INSTANCES: '{{.NR_INSTANCES | default "5"}}'
   TIMEOUT: '{{.TIMEOUT | default "20m"}}'
@@ -14,7 +14,7 @@ tasks:
     desc: Build the ddolt binary (integration test demo CLI)
     dir: integration
     cmds:
-      - '{{.GO_ENV}} {{.CGO_FLAGS}} go build -o ddolt .'
+      - "{{.GO_ENV}} {{.CGO_FLAGS}} go build -o ddolt ."
 
   integration:
     desc: Build Docker image and run all integration tests (Docker, one container per peer)
@@ -51,7 +51,12 @@ tasks:
     dir: integration
     interactive: true
     cmds:
-      - '{{.GO_ENV}} {{.CGO_FLAGS}} {{.KEEP_CONTAINERS}} NR_INSTANCES={{.NR_INSTANCES}} go test -v -timeout {{.TIMEOUT}} ./...'
+      - |
+        set -euo pipefail
+        BIN=$(mktemp -t doltswarm-integration.test-XXXXXX)
+        {{.GO_ENV}} {{.CGO_FLAGS}} go test -c -o "$BIN"
+        {{.GO_ENV}} {{.CGO_FLAGS}} {{.KEEP_CONTAINERS}} NR_INSTANCES={{.NR_INSTANCES}} "$BIN" -test.v -test.timeout {{.TIMEOUT}}
+        rm -f "$BIN"
 
   docker:build:
     desc: Build the Docker image for integration tests

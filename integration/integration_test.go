@@ -596,8 +596,7 @@ type lateJoinerInfo struct {
 type containerInfo struct {
 	id       string
 	name     string
-	port     int
-	hostPort int
+	hostPort int // unique port for host to connect (internal port is always basePort)
 	peerID   string
 }
 
@@ -820,13 +819,12 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	logger.Info("Starting first container with local init...")
 	firstContainer := containerInfo{
 		name:     containerPrefix + "1",
-		port:     basePort,
 		hostPort: basePort,
 	}
 
 	// First, init the database
 	initEnv := []string{
-		fmt.Sprintf("PORT=%d", firstContainer.port),
+		fmt.Sprintf("PORT=%d", basePort),
 		"LISTEN_ADDR=0.0.0.0",
 		"DB_PATH=/data",
 		"LOG_LEVEL=debug",
@@ -868,13 +866,13 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 
 	// Now start the first server container from the committed image
 	serverEnv := []string{
-		fmt.Sprintf("PORT=%d", firstContainer.port),
+		fmt.Sprintf("PORT=%d", basePort),
 		"LISTEN_ADDR=0.0.0.0",
 		"DB_PATH=/data",
 		"LOG_LEVEL=debug",
 	}
 
-	firstServerID, err := runServerContainer(ctx, cli, firstContainer.name, firstContainer.port, firstContainer.hostPort, serverEnv, networkID, true)
+	firstServerID, err := runServerContainer(ctx, cli, firstContainer.name, firstContainer.hostPort, serverEnv, networkID, true)
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
 		os.RemoveAll(testDir)
@@ -905,15 +903,13 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	// Keep track of all started containers' IP and peer IDs for bootstrap
 	type peerAddr struct {
 		ip     string
-		port   int
 		peerID string
 	}
-	startedPeers := []peerAddr{{ip: firstContainerIP, port: firstContainer.port, peerID: peerID}}
+	startedPeers := []peerAddr{{ip: firstContainerIP, peerID: peerID}}
 
 	// Start remaining containers
 	for i := 1; i < numInstances; i++ {
 		containerName := fmt.Sprintf("%s%d", containerPrefix, i+1)
-		port := basePort + i
 		hostPort := basePort + i
 
 		logger.Infof("Starting container %d with bootstrap peers (%d peers)...", i+1, len(startedPeers))
@@ -921,13 +917,13 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		// Build bootstrap peers list from all previously started containers
 		var bootstrapAddrs []string
 		for _, p := range startedPeers {
-			addr := fmt.Sprintf("/ip4/%s/udp/%d/quic-v1/p2p/%s", p.ip, p.port, p.peerID)
+			addr := fmt.Sprintf("/ip4/%s/udp/%d/quic-v1/p2p/%s", p.ip, basePort, p.peerID)
 			bootstrapAddrs = append(bootstrapAddrs, addr)
 		}
 		bootstrapPeersStr := strings.Join(bootstrapAddrs, ",")
 
 		env := []string{
-			fmt.Sprintf("PORT=%d", port),
+			fmt.Sprintf("PORT=%d", basePort),
 			"LISTEN_ADDR=0.0.0.0",
 			"DB_PATH=/data",
 			"LOG_LEVEL=debug",
@@ -970,7 +966,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		cli.ContainerRemove(ctx, initID, container.RemoveOptions{})
 
 		// Start server from committed image
-		serverID, err := runServerContainer(ctx, cli, containerName, port, hostPort, env, networkID, false)
+		serverID, err := runServerContainer(ctx, cli, containerName, hostPort, env, networkID, false)
 		if err != nil {
 			setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
 			setup.cleanup()
@@ -980,7 +976,6 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		setup.containers[i] = containerInfo{
 			id:       serverID,
 			name:     containerName,
-			port:     port,
 			hostPort: hostPort,
 		}
 
@@ -999,7 +994,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		if err != nil {
 			logger.Warnf("Could not get IP for container %d: %v", i+1, err)
 		} else {
-			startedPeers = append(startedPeers, peerAddr{ip: containerIP, port: port, peerID: containerPeerID})
+			startedPeers = append(startedPeers, peerAddr{ip: containerIP, peerID: containerPeerID})
 		}
 	}
 
@@ -1185,28 +1180,22 @@ func runInitFromPeerContainer(ctx context.Context, cli *client.Client, name stri
 	return resp.ID, nil
 }
 
-// runServerContainer runs a server container
-func runServerContainer(ctx context.Context, cli *client.Client, name string, port, hostPort int, env []string, networkID string, fromInitialized bool) (string, error) {
+// runServerContainer runs a server container (all containers use basePort internally)
+func runServerContainer(ctx context.Context, cli *client.Client, name string, hostPort int, env []string, networkID string, fromInitialized bool) (string, error) {
 	imageName := dockerImage
 	if fromInitialized {
 		imageName = dockerImage + "-initialized"
 	} else {
 		// For non-first containers, use their specific initialized image
-		// Extract container number from name (e.g., "ddolt-test-15" -> "15")
 		parts := strings.Split(name, "-")
 		if len(parts) > 0 {
-			containerNum := parts[len(parts)-1]
-			if _, err := strconv.Atoi(containerNum); err == nil {
+			if containerNum := parts[len(parts)-1]; containerNum != "1" {
 				imageName = fmt.Sprintf("%s-initialized-%s", dockerImage, containerNum)
-			} else {
-				imageName = dockerImage + "-initialized"
 			}
-		} else {
-			imageName = dockerImage + "-initialized"
 		}
 	}
 
-	portStr := fmt.Sprintf("%d/udp", port)
+	portStr := fmt.Sprintf("%d/udp", basePort)
 	hostPortStr := fmt.Sprintf("%d", hostPort)
 
 	config := &container.Config{
@@ -1659,8 +1648,7 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 
 	idx := len(setup.containers) + 1
 	containerName := fmt.Sprintf("%s%d", containerPrefix, idx)
-	port := basePort + (idx - 1)
-	hostPort := port
+	hostPort := basePort + (idx - 1)
 
 	// Build bootstrap list from existing containers
 	var bootstrapAddrs []string
@@ -1670,11 +1658,11 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 			logger.Warnf("late joiner: failed to get IP for %s: %v", c.name, err)
 			continue
 		}
-		bootstrapAddrs = append(bootstrapAddrs, fmt.Sprintf("/ip4/%s/udp/%d/quic-v1/p2p/%s", ip, c.port, c.peerID))
+		bootstrapAddrs = append(bootstrapAddrs, fmt.Sprintf("/ip4/%s/udp/%d/quic-v1/p2p/%s", ip, basePort, c.peerID))
 	}
 
 	env := []string{
-		fmt.Sprintf("PORT=%d", port),
+		fmt.Sprintf("PORT=%d", basePort),
 		"LISTEN_ADDR=0.0.0.0",
 		"DB_PATH=/data",
 		"LOG_LEVEL=debug",
@@ -1684,7 +1672,7 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 		env = append(env, fmt.Sprintf("BOOTSTRAP_PEERS=%s", strings.Join(bootstrapAddrs, ",")))
 	}
 
-	logger.Infof("Starting late joiner %s (port %d)", containerName, port)
+	logger.Infof("Starting late joiner %s (hostPort %d)", containerName, hostPort)
 	initID, err := runInitFromPeerContainer(ctx, setup.cli, containerName+"-init", env, setup.networkID)
 	if err != nil {
 		t.Fatalf("failed to start late-joiner init: %v", err)
@@ -1709,7 +1697,7 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 	}
 	setup.cli.ContainerRemove(ctx, initID, container.RemoveOptions{})
 
-	serverID, err := runServerContainer(ctx, setup.cli, containerName, port, hostPort, env, setup.networkID, false)
+	serverID, err := runServerContainer(ctx, setup.cli, containerName, hostPort, env, setup.networkID, false)
 	if err != nil {
 		t.Fatalf("failed to start late-joiner server: %v", err)
 	}
@@ -1754,12 +1742,13 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 		return nil
 	}
 
-	newInfo := containerInfo{
-		id:       serverID,
-		name:     containerName,
-		port:     port,
-		hostPort: hostPort,
-		peerID:   peerID,
+	return &lateJoinerInfo{
+		container: containerInfo{
+			id:       serverID,
+			name:     containerName,
+			hostPort: hostPort,
+			peerID:   peerID,
+		},
+		client: newClient,
 	}
-	return &lateJoinerInfo{container: newInfo, client: newClient}
 }
