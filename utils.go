@@ -78,10 +78,16 @@ func copyFileChunksFromResponse(w *io.PipeWriter, res proto.Downloader_DownloadF
 func buildTableFileInfo(tableList []chunks.TableFile) []*remotesapi.TableFileInfo {
 	tableFileInfo := make([]*remotesapi.TableFileInfo, 0)
 	for _, t := range tableList {
+		// FileId must remain the raw table file id (base32 hash). LocationPrefix/Suffix
+		// are used only to form the download URL.
+		fileID := t.FileID()
+		url := t.LocationPrefix() + fileID + t.LocationSuffix()
+
 		tableFileInfo = append(tableFileInfo, &remotesapi.TableFileInfo{
-			FileId:    t.FileID(),
-			NumChunks: uint32(t.NumChunks()),
-			Url:       t.FileID(),
+			FileId:      fileID,
+			NumChunks:   uint32(t.NumChunks()),
+			Url:         url,
+			SplitOffset: t.SplitOffset(),
 		})
 	}
 	return tableFileInfo

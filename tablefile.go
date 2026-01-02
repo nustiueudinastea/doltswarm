@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
+	"github.com/dolthub/dolt/go/store/nbs"
 	"github.com/nustiueudinastea/doltswarm/proto"
 )
 
@@ -22,8 +26,14 @@ func (rtf RemoteTableFile) LocationPrefix() string {
 	return ""
 }
 
-// LocationSuffix
+// LocationSuffix infers suffix from URL (e.g., .darc) to help downstream
+// openChunkSources choose the correct table file format.
 func (rtf RemoteTableFile) LocationSuffix() string {
+	if u, err := url.Parse(rtf.info.Url); err == nil {
+		if strings.HasSuffix(u.Path, nbs.ArchiveFileSuffix) {
+			return nbs.ArchiveFileSuffix
+		}
+	}
 	return ""
 }
 
@@ -52,9 +62,18 @@ func (rtf RemoteTableFile) Open(ctx context.Context) (io.ReadCloser, uint64, err
 		}
 	}
 
+	// Prefer the URL path as the download identifier so we include any suffix
+	// such as ".darc". Fallback to FileId for older manifests.
+	id := rtf.info.FileId
+	if u, err := url.Parse(rtf.info.Url); err == nil {
+		if base := path.Base(u.Path); base != "" && base != "." && base != "/" {
+			id = base
+		}
+	}
+
 	response, err := rtf.client.DownloadFile(
 		ctx,
-		&proto.DownloadFileRequest{Id: rtf.info.FileId},
+		&proto.DownloadFileRequest{Id: id},
 	)
 	if err != nil {
 		return nil, 0, fmt.Errorf("client.LoadFile: %w", err)
