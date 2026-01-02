@@ -65,49 +65,59 @@ var logger = logrus.New()
 var keepDockerResources bool
 
 var (
-	currentSetup   *dockerTestSetup
-	currentSetupMu sync.Mutex
+	sharedSetup   *dockerTestSetup
+	sharedSetupMu sync.Mutex
 )
 
-// TestMain installs a signal handler so Ctrl+C cleans up containers unless KEEP_DOCKER_CONTAINERS is set
+// TestMain creates the shared Docker environment once before all tests run
 func TestMain(m *testing.M) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, unix.SIGTERM)
 	defer stop()
 
-	// Signal watcher
-	sigDone := make(chan struct{})
+	// Signal watcher for cleanup on interrupt
 	go func() {
 		<-ctx.Done()
 		logger.Warn("Signal received, cleaning up test resources")
 		if keepDockerResources {
 			logger.Warn("KEEP_DOCKER_CONTAINERS set; leaving Docker resources running")
 		} else {
-			currentSetupMu.Lock()
-			s := currentSetup
-			currentSetupMu.Unlock()
+			sharedSetupMu.Lock()
+			s := sharedSetup
+			sharedSetupMu.Unlock()
 			if s != nil && s.cleanup != nil {
 				s.cleanup()
 			}
 		}
-		close(sigDone)
 		os.Exit(1)
 	}()
 
+	// Create shared Docker environment ONCE before all tests
+	logger.Infof("Creating shared Docker environment with %d instances...", nrOfInstances)
+	setup, err := createDockerEnvironment(nrOfInstances)
+	if err != nil {
+		logger.Fatalf("Failed to create Docker environment: %v", err)
+	}
+	sharedSetupMu.Lock()
+	sharedSetup = setup
+	sharedSetupMu.Unlock()
+	logger.Info("Shared Docker environment ready")
+
+	// Run all tests
 	code := m.Run()
 
-	// Normal end-of-run cleanup if desired
+	// Cleanup after all tests complete
 	if !keepDockerResources {
-		currentSetupMu.Lock()
-		s := currentSetup
-		currentSetupMu.Unlock()
+		sharedSetupMu.Lock()
+		s := sharedSetup
+		sharedSetupMu.Unlock()
 		if s != nil && s.cleanup != nil {
+			logger.Info("Cleaning up shared Docker environment...")
 			s.cleanup()
 		}
 	} else {
 		logger.Info("KEEP_DOCKER_CONTAINERS set; skipping end-of-run cleanup")
 	}
-	clearCurrentSetup()
-	close(sigDone)
+
 	os.Exit(code)
 }
 
@@ -128,6 +138,42 @@ func init() {
 		keepDockerResources = true
 		logger.Infof("KEEP_DOCKER_CONTAINERS set: test will leave Docker resources running")
 	}
+}
+
+// requireSetup returns the shared Docker test setup, failing the test if not available.
+// Tests should call this at the start to get access to containers and clients.
+func requireSetup(t *testing.T) *dockerTestSetup {
+	t.Helper()
+	sharedSetupMu.Lock()
+	defer sharedSetupMu.Unlock()
+	if sharedSetup == nil {
+		t.Fatal("Shared Docker setup not initialized - TestMain should have created it")
+	}
+	return sharedSetup
+}
+
+// getClients returns the current list of clients from shared setup (thread-safe)
+func getClients(t *testing.T) []*p2p.P2PClient {
+	t.Helper()
+	setup := requireSetup(t)
+	sharedSetupMu.Lock()
+	defer sharedSetupMu.Unlock()
+	// Return a copy to avoid race conditions
+	clients := make([]*p2p.P2PClient, len(setup.clients))
+	copy(clients, setup.clients)
+	return clients
+}
+
+// addLateJoiner adds a late joiner to the shared setup (thread-safe)
+func addLateJoiner(t *testing.T, late *lateJoinerInfo) {
+	t.Helper()
+	sharedSetupMu.Lock()
+	defer sharedSetupMu.Unlock()
+	if sharedSetup == nil {
+		t.Fatal("Cannot add late joiner: shared setup not initialized")
+	}
+	sharedSetup.containers = append(sharedSetup.containers, late.container)
+	sharedSetup.clients = append(sharedSetup.clients, late.client)
 }
 
 // ConvergenceResult holds the result of convergence verification
@@ -609,20 +655,6 @@ func createDockerClient() (*client.Client, error) {
 	return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 }
 
-// setCurrentSetup stores the active setup for signal-driven cleanup
-func setCurrentSetup(s *dockerTestSetup) {
-	currentSetupMu.Lock()
-	defer currentSetupMu.Unlock()
-	currentSetup = s
-}
-
-// clearCurrentSetup clears the active setup
-func clearCurrentSetup() {
-	currentSetupMu.Lock()
-	defer currentSetupMu.Unlock()
-	currentSetup = nil
-}
-
 // createNetwork creates a Docker network for the test
 func createNetwork(ctx context.Context, cli *client.Client) (string, error) {
 	// First, try to remove any existing network with the same name
@@ -649,8 +681,8 @@ func createNetwork(ctx context.Context, cli *client.Client) (string, error) {
 	return resp.ID, nil
 }
 
-// ensureImage ensures the Docker image is available
-func ensureImage(ctx context.Context, cli *client.Client, t *testing.T) error {
+// ensureImageWithError checks if the Docker image exists, returning an error if not
+func ensureImageWithError(ctx context.Context, cli *client.Client) error {
 	// Check if image exists
 	images, err := cli.ImageList(ctx, image.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("reference", dockerImage)),
@@ -659,7 +691,7 @@ func ensureImage(ctx context.Context, cli *client.Client, t *testing.T) error {
 		return fmt.Errorf("failed to list images: %w", err)
 	}
 	if len(images) == 0 {
-		t.Fatalf("Docker image '%s' not found. Build it with: docker build -t %s .", dockerImage, dockerImage)
+		return fmt.Errorf("Docker image '%s' not found. Build it with: docker build -t %s .", dockerImage, dockerImage)
 	}
 	return nil
 }
@@ -824,18 +856,19 @@ func cleanupNetwork(ctx context.Context, cli *client.Client, networkID string) {
 	}
 }
 
-// setupDockerEnvironment creates the Docker test environment
-func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
+// createDockerEnvironment creates the Docker test environment.
+// This is called once from TestMain, not from individual tests.
+func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	ctx := context.Background()
 
 	cli, err := createDockerClient()
 	if err != nil {
-		t.Fatalf("Failed to create Docker client: %v", err)
+		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
 	// Ensure image exists
-	if err := ensureImage(ctx, cli, t); err != nil {
-		t.Fatal(err)
+	if err := ensureImageWithError(ctx, cli); err != nil {
+		return nil, err
 	}
 
 	// Cleanup any existing containers from previous runs
@@ -844,14 +877,14 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	// Create network
 	networkID, err := createNetwork(ctx, cli)
 	if err != nil {
-		t.Fatalf("Failed to create network: %v", err)
+		return nil, fmt.Errorf("failed to create network: %w", err)
 	}
 
 	setup := &dockerTestSetup{
 		cli:        cli,
 		networkID:  networkID,
 		containers: make([]containerInfo, numInstances),
-		testName:   t.Name(),
+		testName:   "SharedSetup",
 		startTime:  time.Now(),
 	}
 
@@ -859,7 +892,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	testDir, err := os.MkdirTemp("temp", "docker-tst")
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
-		t.Fatal(err)
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 	setup.testDir = testDir
 
@@ -882,7 +915,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
 		os.RemoveAll(testDir)
-		t.Fatalf("Failed to init first container: %v", err)
+		return nil, fmt.Errorf("failed to init first container: %w", err)
 	}
 
 	// Wait for init to complete
@@ -892,13 +925,13 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		if err != nil {
 			logs, _ := getContainerLogs(ctx, cli, initID)
 			logger.Errorf("Init container logs:\n%s", logs)
-			t.Fatalf("Error waiting for init: %v", err)
+			return nil, fmt.Errorf("error waiting for init: %w", err)
 		}
 	case status := <-statusCh:
 		if status.StatusCode != 0 {
 			logs, _ := getContainerLogs(ctx, cli, initID)
 			logger.Errorf("Init container logs:\n%s", logs)
-			t.Fatalf("Init failed with exit code: %d", status.StatusCode)
+			return nil, fmt.Errorf("init failed with exit code: %d", status.StatusCode)
 		}
 	}
 
@@ -908,7 +941,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		Reference: dockerImage + "-initialized",
 	})
 	if err != nil {
-		t.Fatalf("Failed to commit initialized container: %v", err)
+		return nil, fmt.Errorf("failed to commit initialized container: %w", err)
 	}
 	cli.ContainerRemove(ctx, initID, container.RemoveOptions{})
 
@@ -924,7 +957,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
 		os.RemoveAll(testDir)
-		t.Fatalf("Failed to start first server: %v", err)
+		return nil, fmt.Errorf("failed to start first server: %w", err)
 	}
 	firstContainer.id = firstServerID
 	setup.containers[0] = firstContainer
@@ -934,7 +967,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	if err != nil {
 		logs, _ := getContainerLogs(ctx, cli, firstServerID)
 		logger.Errorf("First server logs:\n%s", logs)
-		t.Fatalf("First server failed to start: %v", err)
+		return nil, fmt.Errorf("first server failed to start: %w", err)
 	}
 	setup.containers[0].peerID = peerID
 	logger.Infof("First container started with peer ID: %s", peerID)
@@ -944,7 +977,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
 		os.RemoveAll(testDir)
-		t.Fatalf("Failed to get first container IP: %v", err)
+		return nil, fmt.Errorf("failed to get first container IP: %w", err)
 	}
 	logger.Infof("First container IP: %s", firstContainerIP)
 
@@ -984,7 +1017,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		if err != nil {
 			setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
 			setup.cleanup()
-			t.Fatalf("Failed to init container %d: %v", i+1, err)
+			return nil, fmt.Errorf("failed to init container %d: %w", i+1, err)
 		}
 
 		// Wait for clone to complete
@@ -994,13 +1027,13 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 			if err != nil {
 				logs, _ := getContainerLogs(ctx, cli, initID)
 				logger.Errorf("Init container %d logs:\n%s", i+1, logs)
-				t.Fatalf("Error waiting for init %d: %v", i+1, err)
+				return nil, fmt.Errorf("error waiting for init %d: %w", i+1, err)
 			}
 		case status := <-statusCh:
 			if status.StatusCode != 0 {
 				logs, _ := getContainerLogs(ctx, cli, initID)
 				logger.Errorf("Init container %d logs:\n%s", i+1, logs)
-				t.Fatalf("Init %d failed with exit code: %d", i+1, status.StatusCode)
+				return nil, fmt.Errorf("init %d failed with exit code: %d", i+1, status.StatusCode)
 			}
 		}
 
@@ -1009,7 +1042,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 			Reference: fmt.Sprintf("%s-initialized-%d", dockerImage, i+1),
 		})
 		if err != nil {
-			t.Fatalf("Failed to commit initialized container %d: %v", i+1, err)
+			return nil, fmt.Errorf("failed to commit initialized container %d: %w", i+1, err)
 		}
 		cli.ContainerRemove(ctx, initID, container.RemoveOptions{})
 
@@ -1018,7 +1051,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		if err != nil {
 			setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
 			setup.cleanup()
-			t.Fatalf("Failed to start server %d: %v", i+1, err)
+			return nil, fmt.Errorf("failed to start server %d: %w", i+1, err)
 		}
 
 		setup.containers[i] = containerInfo{
@@ -1032,7 +1065,7 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		if err != nil {
 			logs, _ := getContainerLogs(ctx, cli, serverID)
 			logger.Errorf("Server %d logs:\n%s", i+1, logs)
-			t.Fatalf("Server %d failed to start: %v", i+1, err)
+			return nil, fmt.Errorf("server %d failed to start: %w", i+1, err)
 		}
 		setup.containers[i].peerID = containerPeerID
 		logger.Infof("Container %d started with peer ID: %s", i+1, containerPeerID)
@@ -1063,11 +1096,16 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	if err != nil {
 		setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
 		setup.cleanup()
-		t.Fatal(err)
+		return nil, fmt.Errorf("failed to create P2P key: %w", err)
 	}
 
 	// start local manager and clients
-	stopper, clients := startLocalManager(t, setup, p2pkey, peerListChan, tDB)
+	stopper, clients, err := startLocalManagerWithError(setup, p2pkey, peerListChan, tDB)
+	if err != nil {
+		setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
+		setup.cleanup()
+		return nil, fmt.Errorf("failed to start local manager: %w", err)
+	}
 	setup.stopper = stopper
 	setup.clients = clients
 	setup.cleanup = func() {
@@ -1087,17 +1125,14 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 			cleanupAll(ctx, cli, setup)
 			os.RemoveAll(testDir)
 		}
-		clearCurrentSetup()
 	}
 
-	setCurrentSetup(setup)
-
-	return setup
+	return setup, nil
 }
 
-// startLocalManager starts a local libp2p GRPC manager and waits for all current containers
-func startLocalManager(t *testing.T, setup *dockerTestSetup, key *p2p.P2PKey, peerListChan chan peer.IDSlice, extDB p2psrv.ExternalDB) (func() error, []*p2p.P2PClient) {
-	ctx := context.Background()
+// startLocalManagerWithError starts a local libp2p GRPC manager and waits for all current containers.
+// Returns error instead of using t.Fatal, for use in TestMain.
+func startLocalManagerWithError(setup *dockerTestSetup, key *p2p.P2PKey, peerListChan chan peer.IDSlice, extDB p2psrv.ExternalDB) (func() error, []*p2p.P2PClient, error) {
 	// Build bootstrap peers for local manager (using host ports)
 	var bootstrapPeers []string
 	for _, c := range setup.containers {
@@ -1115,17 +1150,13 @@ func startLocalManager(t *testing.T, setup *dockerTestSetup, key *p2p.P2PKey, pe
 		BootstrapPeers: bootstrapPeers,
 	})
 	if err != nil {
-		setup.cleanup = func() { cleanupAll(ctx, setup.cli, setup) }
-		setup.cleanup()
-		t.Fatal(err)
+		return nil, nil, fmt.Errorf("failed to create P2P manager: %w", err)
 	}
 	setup.p2pMgr = p2pMgr
 
 	stopper, err := p2pMgr.StartServer()
 	if err != nil {
-		setup.cleanup = func() { cleanupAll(ctx, setup.cli, setup) }
-		setup.cleanup()
-		t.Fatal(err)
+		return nil, nil, fmt.Errorf("failed to start P2P server: %w", err)
 	}
 
 	// Wait for clients to connect
@@ -1140,9 +1171,8 @@ func startLocalManager(t *testing.T, setup *dockerTestSetup, key *p2p.P2PKey, pe
 			for _, c := range connectedClients {
 				logger.Infof("  Connected: %s", c.GetID()[:12])
 			}
-			setup.cleanup = func() { cleanupAll(ctx, setup.cli, setup) }
-			setup.cleanup()
-			t.Fatalf("Timeout waiting for clients to connect: got %d/%d", len(connectedClients), n)
+			stopper()
+			return nil, nil, fmt.Errorf("timeout waiting for clients to connect: got %d/%d", len(connectedClients), n)
 		}
 		if time.Since(lastLog) >= 10*time.Second {
 			lastLog = time.Now()
@@ -1153,7 +1183,7 @@ func startLocalManager(t *testing.T, setup *dockerTestSetup, key *p2p.P2PKey, pe
 	}
 	logger.Infof("All %d clients connected", n)
 
-	return stopper, p2pMgr.GetClients()
+	return stopper, p2pMgr.GetClients(), nil
 }
 
 // runInitContainer runs a container that initializes the database locally
@@ -1319,51 +1349,56 @@ func getScaledConvergenceTimeout(numInstances int) time.Duration {
 	return defaultConvergenceTimeout + time.Duration(extraInstances*15)*time.Second
 }
 
-// TestIntegration is the main Docker-based integration test
-func TestIntegration(t *testing.T) {
-	t.Logf("Docker integration starting with %d instances", nrOfInstances)
-	setup := setupDockerEnvironment(t, nrOfInstances)
-	defer setup.cleanup()
+// TestInit verifies that all containers started correctly and have initial convergence.
+// This should run first (Go runs tests in alphabetical order within a file,
+// but tests are defined in order of dependency).
+func TestInit(t *testing.T) {
+	clients := getClients(t)
+	convergenceTimeout := getScaledConvergenceTimeout(len(clients))
 
-	convergenceTimeout := getScaledConvergenceTimeout(nrOfInstances)
-	logger.Infof("==== Starting Docker Integration Test (timeout: %v) ====", convergenceTimeout)
-	t.Logf("Containers booted, timeout set to %v", convergenceTimeout)
+	t.Logf("==== TestInit: Verifying %d clients (timeout: %v) ====", len(clients), convergenceTimeout)
 
 	// Verify all clients can be pinged
-	t.Logf("Pinging clients...")
-	for _, client := range setup.clients {
+	t.Log("Pinging clients...")
+	for _, c := range clients {
 		ctx, cancel := context.WithTimeout(context.Background(), grpcCallTimeout)
-		_, err := client.Ping(ctx, &p2pproto.PingRequest{Ping: "test"})
+		_, err := c.Ping(ctx, &p2pproto.PingRequest{Ping: "test"})
 		cancel()
 		if err != nil {
-			t.Fatalf("Failed to ping client %s: %v", client.GetID()[:12], err)
+			t.Fatalf("Failed to ping client %s: %v", c.GetID()[:12], err)
 		}
 	}
 	logger.Info("All clients responding to ping")
 
 	// Check initial head convergence
 	logger.Info("Checking initial head convergence...")
-	t.Logf("Waiting for initial head convergence")
 	ctx := context.Background()
-	headResult, err := waitForHeadConvergence(ctx, setup.clients, convergenceTimeout, defaultPollInterval)
+	headResult, err := waitForHeadConvergence(ctx, clients, convergenceTimeout, defaultPollInterval)
 	if err != nil {
 		t.Fatalf("Error checking head convergence: %v", err)
 	}
 	if !headResult.Converged {
-		t.Errorf("Initial heads not converged: %v", headResult.AllHeads)
-	} else {
-		logger.Infof("Initial heads converged in %v", headResult.Duration)
+		t.Fatalf("Initial heads not converged: %v", headResult.AllHeads)
 	}
+	logger.Infof("Initial heads converged in %v", headResult.Duration)
+}
 
-	// Insert data from each initial client
-	logger.Info("Inserting data from each initial client...")
-	t.Log("Inserting one row per initial client")
-	insertOnePerClient(t, setup.clients)
+// TestInsertAndConvergence verifies that inserts from each client propagate and converge.
+func TestInsertAndConvergence(t *testing.T) {
+	setup := requireSetup(t)
+	clients := getClients(t)
+	convergenceTimeout := getScaledConvergenceTimeout(len(clients))
+
+	logger.Info("==== TestInsertAndConvergence ====")
+
+	// Insert data from each client
+	t.Log("Inserting one row per client")
+	insertOnePerClient(t, clients)
 
 	// Wait for convergence after inserts
 	logger.Info("Waiting for convergence after inserts...")
-	t.Log("Waiting for convergence after inserts")
-	headResult, err = waitForHeadConvergence(ctx, setup.clients, convergenceTimeout, defaultPollInterval)
+	ctx := context.Background()
+	headResult, err := waitForHeadConvergence(ctx, clients, convergenceTimeout, defaultPollInterval)
 	if err != nil {
 		t.Fatalf("Error waiting for head convergence: %v", err)
 	}
@@ -1373,47 +1408,56 @@ func TestIntegration(t *testing.T) {
 			t.Logf("  %s: %s", peerID[:12], head[:12])
 		}
 		// Print container logs for debugging
-		cli, _ := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		for _, c := range setup.containers {
-			logs, err := getContainerLogs(ctx, cli, c.id)
+			logs, err := getContainerLogs(ctx, setup.cli, c.id)
 			if err != nil {
 				t.Logf("Could not get logs for container %s: %v", c.name, err)
 			} else {
-				t.Logf("=== Container %s logs (last 100 lines) ===\n%s", c.name, logs)
+				t.Logf("=== Container %s logs ===\n%s", c.name, logs)
 			}
 		}
-	} else {
-		logger.Infof("Head convergence achieved in %v", headResult.Duration)
+		t.FailNow()
 	}
+	logger.Infof("Head convergence achieved in %v", headResult.Duration)
 
 	// Verify commit history convergence
 	logger.Info("Verifying commit history convergence...")
-	t.Log("Verifying commit history convergence")
-	assertHistoryConverged(t, setup.clients, convergenceTimeout)
+	assertHistoryConverged(t, clients, convergenceTimeout)
+}
 
-	// Start a late joiner and ensure it catches up
-	logger.Info("Starting late joiner container...")
+// TestLateJoiner starts a new container after the cluster is running and verifies it catches up.
+func TestLateJoiner(t *testing.T) {
+	setup := requireSetup(t)
+	convergenceTimeout := getScaledConvergenceTimeout(len(setup.clients) + 1)
+
+	logger.Info("==== TestLateJoiner ====")
+
+	// Start a late joiner
 	late := startLateJoiner(t, setup)
 	if late == nil {
 		t.Fatal("late joiner failed to start")
 	}
-	setup.containers = append(setup.containers, late.container)
-	setup.clients = append(setup.clients, late.client)
+
+	// Add late joiner to the shared setup
+	addLateJoiner(t, late)
+
+	// Get updated client list
+	clients := getClients(t)
+	t.Logf("Cluster now has %d clients", len(clients))
 
 	// Wait for convergence including late joiner
 	logger.Info("Waiting for convergence including late joiner...")
-	assertHistoryConverged(t, setup.clients, convergenceTimeout)
+	assertHistoryConverged(t, clients, convergenceTimeout)
 }
 
 // TestSequentialWritesPropagation tests that sequential writes from one peer propagate to all others
 func TestSequentialWritesPropagation(t *testing.T) {
-	setup := setupDockerEnvironment(t, nrOfInstances)
-	defer setup.cleanup()
+	clients := getClients(t)
 
 	logger.Info("==== Starting TestSequentialWritesPropagation ====")
 
 	// Pick first client as the writer
-	writer := setup.clients[0]
+	writer := clients[0]
 	commitHashes := []string{}
 
 	// Write 5 commits sequentially from one peer
@@ -1437,7 +1481,7 @@ func TestSequentialWritesPropagation(t *testing.T) {
 	// Verify each commit propagates to all peers
 	ctx := context.Background()
 	for i, commit := range commitHashes {
-		peerStatus, err := waitForCommitOnAllPeers(ctx, setup.clients, commit, defaultConvergenceTimeout, defaultPollInterval)
+		peerStatus, err := waitForCommitOnAllPeers(ctx, clients, commit, defaultConvergenceTimeout, defaultPollInterval)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1454,7 +1498,7 @@ func TestSequentialWritesPropagation(t *testing.T) {
 	}
 
 	// Final convergence check
-	headResult, err := waitForHeadConvergence(ctx, setup.clients, defaultConvergenceTimeout, defaultPollInterval)
+	headResult, err := waitForHeadConvergence(ctx, clients, defaultConvergenceTimeout, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1465,7 +1509,7 @@ func TestSequentialWritesPropagation(t *testing.T) {
 	}
 
 	// Verify commit history is identical across all peers
-	historyResult, err := waitForCommitHistoryConvergence(ctx, setup.clients, defaultConvergenceTimeout, defaultPollInterval)
+	historyResult, err := waitForCommitHistoryConvergence(ctx, clients, defaultConvergenceTimeout, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1479,9 +1523,8 @@ func TestSequentialWritesPropagation(t *testing.T) {
 
 // TestConcurrentWrites tests that concurrent writes from multiple peers converge deterministically
 func TestConcurrentWrites(t *testing.T) {
-	t.Logf("Docker concurrent test with %d instances", nrOfInstances)
-	setup := setupDockerEnvironment(t, nrOfInstances)
-	defer setup.cleanup()
+	clients := getClients(t)
+	t.Logf("Docker concurrent test with %d clients", len(clients))
 
 	logger.Info("==== Starting TestConcurrentWrites ====")
 	t.Log("Starting concurrent writes")
@@ -1493,9 +1536,9 @@ func TestConcurrentWrites(t *testing.T) {
 		commit string
 		err    error
 	}
-	resultsChan := make(chan commitResult, len(setup.clients))
+	resultsChan := make(chan commitResult, len(clients))
 
-	for i, client := range setup.clients {
+	for i, client := range clients {
 		wg.Add(1)
 		go func(idx int, c *p2p.P2PClient) {
 			defer wg.Done()
@@ -1535,7 +1578,7 @@ func TestConcurrentWrites(t *testing.T) {
 	ctx := context.Background()
 	logger.Info("Waiting for head convergence after concurrent writes")
 
-	headResult, err := waitForHeadConvergence(ctx, setup.clients, 2*time.Minute, defaultPollInterval)
+	headResult, err := waitForHeadConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1547,7 +1590,7 @@ func TestConcurrentWrites(t *testing.T) {
 
 	// Verify deterministic merge - all peers should have same commit order
 	logger.Info("Verifying deterministic merge (same commit order on all peers)")
-	historyResult, err := waitForCommitHistoryConvergence(ctx, setup.clients, time.Minute, defaultPollInterval)
+	historyResult, err := waitForCommitHistoryConvergence(ctx, clients, time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1557,14 +1600,13 @@ func TestConcurrentWrites(t *testing.T) {
 			t.Logf("Peer %s: %v", peerID[:12], peerCommits)
 		}
 	} else {
-		logger.Infof("All peers have identical commit history with %d commits", len(historyResult.AllCommitLists[setup.clients[0].GetID()]))
+		logger.Infof("All peers have identical commit history with %d commits", len(historyResult.AllCommitLists[clients[0].GetID()]))
 	}
 }
 
 // TestCommitOrderConsistency tests that commits from different peers maintain consistent ordering
 func TestCommitOrderConsistency(t *testing.T) {
-	setup := setupDockerEnvironment(t, nrOfInstances)
-	defer setup.cleanup()
+	clients := getClients(t)
 
 	logger.Info("==== Starting TestCommitOrderConsistency ====")
 
@@ -1573,7 +1615,7 @@ func TestCommitOrderConsistency(t *testing.T) {
 	allCommits := []string{}
 
 	for round := 0; round < rounds; round++ {
-		for i, client := range setup.clients {
+		for i, client := range clients {
 			uid, err := ksuid.NewRandom()
 			if err != nil {
 				t.Fatal(err)
@@ -1599,7 +1641,7 @@ func TestCommitOrderConsistency(t *testing.T) {
 	ctx := context.Background()
 	logger.Infof("Waiting for all %d commits to propagate", len(allCommits))
 
-	headResult, err := waitForHeadConvergence(ctx, setup.clients, 2*time.Minute, defaultPollInterval)
+	headResult, err := waitForHeadConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1608,7 +1650,7 @@ func TestCommitOrderConsistency(t *testing.T) {
 	}
 
 	// Verify all peers have same commit order
-	historyResult, err := waitForCommitHistoryConvergence(ctx, setup.clients, 2*time.Minute, defaultPollInterval)
+	historyResult, err := waitForCommitHistoryConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -132,6 +132,18 @@ tasks:
       - rm -rf integration/temp/tst* || true
       - rm -f integration/ddolt || true
 
+  clean:logs:
+    desc: Clean up integration test logs
+    summary: |
+      Remove all saved container logs from integration/logs directory.
+      These logs are automatically saved when integration tests complete.
+
+      Example:
+        task clean:logs   # Remove all test logs
+    cmds:
+      - rm -rf integration/logs/*
+      - echo "Cleaned integration/logs/"
+
   kill:
     desc: Kill all running ddolt processes
     cmds:
