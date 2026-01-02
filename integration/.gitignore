@@ -4,3 +4,4 @@ ddolt
 .envrc
 integration
 *.test
+logs/

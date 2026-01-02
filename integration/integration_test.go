@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,7 @@ const (
 	containerPrefix   = "ddolt-test-"
 	basePort          = 10500
 	testLabel         = "doltswarmdemo-test"
+	logsDir           = "logs"
 
 	// Convergence test timeouts
 	defaultConvergenceTimeout = 120 * time.Second
@@ -585,6 +587,8 @@ type dockerTestSetup struct {
 	p2pMgr     *p2p.P2P
 	stopper    func() error
 	cleanup    func()
+	testName   string
+	startTime  time.Time
 }
 
 // lateJoinerInfo holds info for the late-joining container
@@ -739,6 +743,48 @@ func getContainerLogs(ctx context.Context, cli *client.Client, containerID strin
 	return string(logBytes), nil
 }
 
+// saveContainerLogs saves all container logs to a timestamped directory
+// Directory structure: logs/<testname>_<timestamp>/<container_name>.log
+func saveContainerLogs(ctx context.Context, setup *dockerTestSetup) error {
+	if setup == nil || setup.cli == nil || len(setup.containers) == 0 {
+		return nil
+	}
+
+	// Create timestamped directory name: TestName_2006-01-02_15-04-05
+	timestamp := setup.startTime.Format("2006-01-02_15-04-05")
+	testLogDir := filepath.Join(logsDir, fmt.Sprintf("%s_%s", setup.testName, timestamp))
+
+	// Create the logs directory
+	if err := os.MkdirAll(testLogDir, 0755); err != nil {
+		return fmt.Errorf("failed to create logs directory %s: %w", testLogDir, err)
+	}
+
+	logger.Infof("Saving container logs to %s", testLogDir)
+
+	// Save logs for each container
+	for _, c := range setup.containers {
+		if c.id == "" {
+			continue
+		}
+
+		logs, err := getContainerLogs(ctx, setup.cli, c.id)
+		if err != nil {
+			logger.Warnf("Failed to get logs for container %s: %v", c.name, err)
+			continue
+		}
+
+		logFile := filepath.Join(testLogDir, c.name+".log")
+		if err := os.WriteFile(logFile, []byte(logs), 0644); err != nil {
+			logger.Warnf("Failed to write logs for container %s: %v", c.name, err)
+			continue
+		}
+
+		logger.Infof("Saved logs for %s to %s", c.name, logFile)
+	}
+
+	return nil
+}
+
 // getContainerIP returns the IP address of a container in the specified network
 func getContainerIP(ctx context.Context, cli *client.Client, containerID string, networkName string) (string, error) {
 	inspect, err := cli.ContainerInspect(ctx, containerID)
@@ -805,6 +851,8 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 		cli:        cli,
 		networkID:  networkID,
 		containers: make([]containerInfo, numInstances),
+		testName:   t.Name(),
+		startTime:  time.Now(),
 	}
 
 	// Create test directory for local p2p manager
@@ -1023,6 +1071,11 @@ func setupDockerEnvironment(t *testing.T, numInstances int) *dockerTestSetup {
 	setup.stopper = stopper
 	setup.clients = clients
 	setup.cleanup = func() {
+		// Save container logs before cleanup
+		if err := saveContainerLogs(ctx, setup); err != nil {
+			logger.Warnf("Failed to save container logs: %v", err)
+		}
+
 		if stopper != nil {
 			if err := stopper(); err != nil {
 				logger.Warnf("error stopping local manager: %v", err)
