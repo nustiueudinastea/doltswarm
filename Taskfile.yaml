@@ -1,0 +1,138 @@
+version: '3'
+
+vars:
+  CGO_FLAGS: 'CGO_LDFLAGS="-L/opt/homebrew/opt/icu4c@78/lib" CGO_CPPFLAGS="-I/opt/homebrew/opt/icu4c@78/include" CGO_CFLAGS="-I/opt/homebrew/opt/icu4c@78/include"'
+  GO_ENV: 'GONOSUMDB=github.com/nustiueudinastea/*'
+  DOCKER_IMAGE: doltswarmdemo
+  NR_INSTANCES: '{{.NR_INSTANCES | default "5"}}'
+  TIMEOUT: '{{.TIMEOUT | default "20m"}}'
+  # Set KEEP=1 to leave containers running after tests for log inspection
+  KEEP_CONTAINERS: '{{if eq .KEEP "1"}}KEEP_DOCKER_CONTAINERS=1{{end}}'
+
+tasks:
+  build:
+    desc: Build the ddolt binary (integration test demo CLI)
+    dir: integration
+    cmds:
+      - '{{.GO_ENV}} {{.CGO_FLAGS}} go build -o ddolt .'
+
+  integration:
+    desc: Build Docker image and run all integration tests (Docker, one container per peer)
+    summary: |
+      Build Docker image and run integration tests.
+
+      Options:
+        KEEP=1    Leave containers running after tests (for log inspection)
+        TIMEOUT   Test timeout (default: 20m)
+        NR_INSTANCES  Number of peer instances (default: 5)
+
+      Examples:
+        task integration              # Normal run
+        task integration KEEP=1       # Keep containers after test
+    interactive: true
+    cmds:
+      - ./integration/docker/build-docker.sh
+      - task: integration:quick
+
+  integration:quick:
+    desc: Run integration tests without rebuilding Docker image (faster iteration)
+    summary: |
+      Run integration tests without rebuilding the Docker image.
+      Use this when only test code changed, not the application code.
+
+      Options:
+        KEEP=1    Leave containers running after tests (for log inspection)
+        TIMEOUT   Test timeout (default: 20m)
+        NR_INSTANCES  Number of peer instances (default: 5)
+
+      Examples:
+        task integration:quick              # Quick run without rebuild
+        task integration:quick KEEP=1       # Keep containers after test
+    dir: integration
+    interactive: true
+    cmds:
+      - '{{.GO_ENV}} {{.CGO_FLAGS}} {{.KEEP_CONTAINERS}} NR_INSTANCES={{.NR_INSTANCES}} go test -v -timeout {{.TIMEOUT}} ./...'
+
+  docker:build:
+    desc: Build the Docker image for integration tests
+    cmds:
+      - ./integration/docker/build-docker.sh
+
+  docker:shell:
+    desc: Open a shell in the Docker container
+    cmds:
+      - docker run --rm -it {{.DOCKER_IMAGE}} /bin/bash
+
+  docker:clean:
+    desc: Clean up Docker test containers, networks, and initialized images
+    summary: |
+      Remove all test containers, the test network, and initialized images.
+      Use this after running tests with KEEP=1 to clean up.
+
+      Example:
+        task integration KEEP=1   # Run tests, keep containers
+        docker logs ddolt-test-1  # Inspect logs
+        task docker:clean         # Clean up when done
+    cmds:
+      - docker ps -a --filter "label=doltswarmdemo-test" -q | xargs -r docker rm -f || true
+      - docker network rm doltswarmdemo-test || true
+      - docker images --filter "reference=doltswarmdemo-initialized*" -q | xargs -r docker rmi -f || true
+
+  docker:logs:
+    desc: Show logs from all test containers (use CONTAINER=name for specific one)
+    summary: |
+      View logs from test containers.
+
+      Options:
+        CONTAINER   Specific container name (e.g., ddolt-test-1)
+        TAIL        Number of lines to show (default: 100)
+        GREP        Pattern to filter logs
+
+      Examples:
+        task docker:logs                           # All containers, last 100 lines
+        task docker:logs CONTAINER=ddolt-test-1   # Specific container
+        task docker:logs GREP="reorder|retry"     # Filter by pattern
+        task docker:logs TAIL=500                 # More lines
+    vars:
+      TAIL: '{{.TAIL | default "100"}}'
+    cmds:
+      - |
+        {{if .CONTAINER}}
+          {{if .GREP}}
+            docker logs --tail {{.TAIL}} {{.CONTAINER}} 2>&1 | grep -E "{{.GREP}}" || true
+          {{else}}
+            docker logs --tail {{.TAIL}} {{.CONTAINER}} 2>&1
+          {{end}}
+        {{else}}
+          for c in $(docker ps -a --filter "label=doltswarmdemo-test" --format "{{`{{.Names}}`}}"); do
+            echo "=== $c ==="
+            {{if .GREP}}
+              docker logs --tail {{.TAIL}} "$c" 2>&1 | grep -E "{{.GREP}}" || true
+            {{else}}
+              docker logs --tail {{.TAIL}} "$c" 2>&1
+            {{end}}
+            echo ""
+          done
+        {{end}}
+
+  docker:ps:
+    desc: List running test containers
+    cmds:
+      - docker ps -a --filter "label=doltswarmdemo-test" --format "table {{`{{.Names}}`}}\t{{`{{.Status}}`}}\t{{`{{.Ports}}`}}"
+
+  clean:
+    desc: Clean up test artifacts and processes
+    cmds:
+      - pkill -9 -f ddolt || true
+      - rm -rf integration/temp/tst* || true
+      - rm -f integration/ddolt || true
+
+  kill:
+    desc: Kill all running ddolt processes
+    cmds:
+      - pkill -9 -f ddolt || true
+
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list

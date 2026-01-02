@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -60,6 +61,8 @@ func p2pRun(noGUI bool, noCommits bool, commitInterval int) error {
 		return fmt.Errorf("db not initialized")
 	}
 
+	logSystemTables("server-start")
+
 	// Handle OS signals
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -98,6 +101,57 @@ func p2pRun(noGUI bool, noCommits bool, commitInterval int) error {
 	wg.Wait()
 
 	return nil
+}
+
+// logSystemTables prints Dolt system tables and remotes to help debug missing system tables
+func logSystemTables(tag string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	log.Infof("[%s] Debug: listing Dolt system tables (dolt_%%)", tag)
+	rows, err := dbi.QueryContext(ctx, "SHOW TABLES LIKE 'dolt_%';")
+	if err != nil {
+		log.Warnf("[%s] failed to list system tables: %v", tag, err)
+	} else {
+		defer rows.Close()
+		for rows.Next() {
+			var tbl string
+			if scanErr := rows.Scan(&tbl); scanErr == nil {
+				log.Infof("[%s] system table: %s", tag, tbl)
+			}
+		}
+	}
+
+	log.Infof("[%s] Debug: checking dolt_commit_parents presence", tag)
+	var hasParents bool
+	rc, err := dbi.QueryContext(ctx, "SHOW TABLES LIKE 'dolt_commit_parents';")
+	if err != nil {
+		log.Warnf("[%s] dolt_commit_parents missing or query error: %v", tag, err)
+	} else {
+		for rc.Next() {
+			hasParents = true
+		}
+		rc.Close()
+		if hasParents {
+			log.Infof("[%s] dolt_commit_parents found", tag)
+		} else {
+			log.Warnf("[%s] dolt_commit_parents NOT found", tag)
+		}
+	}
+
+	log.Infof("[%s] Debug: current dolt remotes", tag)
+	remotes, err := dbi.QueryContext(ctx, "SELECT name, url FROM dolt_remotes;")
+	if err != nil {
+		log.Warnf("[%s] failed to list remotes: %v", tag, err)
+		return
+	}
+	defer remotes.Close()
+	for remotes.Next() {
+		var name, url string
+		if scanErr := remotes.Scan(&name, &url); scanErr == nil {
+			log.Infof("[%s] remote: %s -> %s", tag, name, url)
+		}
+	}
 }
 
 func startCommitUpdater(noCommits bool, commitInterval int) func() error {
@@ -169,6 +223,7 @@ func Init(localInit bool, peerInit string, port int) error {
 		if err != nil {
 			return fmt.Errorf("failed to init local db: %w", err)
 		}
+		logSystemTables("init-local")
 
 		execFunc := func(tx *sql.Tx) error {
 			_, err := tx.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s(
@@ -201,6 +256,7 @@ func Init(localInit bool, peerInit string, port int) error {
 		if err != nil {
 			return fmt.Errorf("error initialising from peer: %w", err)
 		}
+		logSystemTables("init-peer")
 
 		return nil
 	} else {

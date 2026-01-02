@@ -74,6 +74,7 @@ type DB struct {
 	shutdownWg           sync.WaitGroup // Track active operations for graceful shutdown
 	ctx                  context.Context
 	cancel               context.CancelFunc
+	reconciler           *Reconciler // HLC-based commit reconciler
 }
 
 func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, error) {
@@ -106,6 +107,9 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		ctx:                  ctx,
 		cancel:               cancel,
 	}
+
+	// Initialize reconciler
+	db.reconciler = NewReconciler(db, signer.GetID(), logger)
 
 	err = ensureDir(db.workingDir)
 	if err != nil {
@@ -238,6 +242,11 @@ func (db *DB) Close() error {
 	// Signal shutdown to all operations
 	db.cancel()
 
+	// Stop reconciler
+	if db.reconciler != nil {
+		db.reconciler.Stop()
+	}
+
 	// Stop all stoppers first (this includes the event processor)
 	var finalerr error
 	db.stoppers.Iter(func(key string, stopper func() error) bool {
@@ -273,14 +282,18 @@ func (db *DB) Close() error {
 		return true
 	})
 
-	// Remove peers
+	// Remove peers - collect IDs first to avoid modifying map while iterating
+	var peerIDs []string
 	db.dbClients.Iter(func(key string, client *DBClient) bool {
-		err := db.RemovePeer(client.GetID())
-		if err != nil {
-			db.log.Warnf("failed to remove peer %s: %v", client.GetID(), err)
-		}
+		peerIDs = append(peerIDs, client.GetID())
 		return true
 	})
+	for _, peerID := range peerIDs {
+		err := db.RemovePeer(peerID)
+		if err != nil {
+			db.log.Warnf("failed to remove peer %s: %v", peerID, err)
+		}
+	}
 
 	// Close SQL connection last
 	db.sqlMu.Lock()
@@ -490,17 +503,37 @@ func (db *DB) InitLocal() error {
 func (db *DB) InitFromPeer(peerID string) error {
 	db.log.Infof("Initializing from peer %s", peerID)
 
+	const maxRetries = 20
 	tries := 0
-	for tries < 10 {
+	for tries < maxRetries {
 		ctx, cancel := context.WithTimeout(db.ctx, 60*time.Second)
 		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main', '%s://%s/%s', '%s');", FactorySwarm, peerID, db.name, db.name)
 		_, err := db.ExecContext(ctx, query)
 		cancel()
 		if err != nil {
-			if strings.Contains(err.Error(), "could not get client") {
+			errStr := err.Error()
+			// Retry if peer is not available yet
+			if strings.Contains(errStr, "could not get client") {
 				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
 				tries++
 				time.Sleep(2 * time.Second)
+				continue
+			}
+			// Retry on "no such file or directory" - this happens when cloning during
+			// active reconciliation (source peer's files change between manifest read
+			// and file fetch). Use exponential backoff since peers may need time to stabilize.
+			if strings.Contains(errStr, "no such file or directory") {
+				// Exponential backoff: 2s, 4s, 8s, 16s, 30s, 30s...
+				backoff := time.Duration(1<<uint(tries)) * time.Second
+				if backoff < 2*time.Second {
+					backoff = 2 * time.Second
+				}
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				db.log.Infof("Clone race condition detected (file moved during clone). Retrying in %v... (%d/%d)", backoff, tries+1, maxRetries)
+				tries++
+				time.Sleep(backoff)
 				continue
 			}
 			return fmt.Errorf("failed to clone db: %w", err)
@@ -534,12 +567,21 @@ func (db *DB) InitFromPeer(peerID string) error {
 		return nil
 	}
 
-	return fmt.Errorf("failed to clone db from peer %s. Peer not found", peerID)
+	return fmt.Errorf("failed to clone db from peer %s after %d attempts", peerID, maxRetries)
 }
 
 func (db *DB) Pull(peerID string) error {
 	db.log.Infof("Pulling from peer %s", peerID)
-	txn, err := db.BeginTx(db.ctx, nil)
+
+	ctx, cancel := context.WithTimeout(db.ctx, 30*time.Second)
+	defer cancel()
+
+	// Ensure remote exists before fetching
+	if _, err := db.ensureRemoteExists(ctx, peerID); err != nil {
+		return err
+	}
+
+	txn, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
 	}
@@ -556,6 +598,24 @@ func (db *DB) Pull(peerID string) error {
 	}
 
 	return nil
+}
+
+// ensureRemoteExists adds the Dolt remote for a peer if missing
+func (db *DB) ensureRemoteExists(ctx context.Context, peerID string) (bool, error) {
+	_, err := db.GetRemote(peerID)
+	if err == nil {
+		return false, nil // already exists
+	}
+
+	_, err = db.ExecContext(ctx, "CALL DOLT_REMOTE('add', ?, ?);", peerID, fmt.Sprintf("%s://%s", FactorySwarm, peerID))
+	if err != nil {
+		if strings.Contains(err.Error(), "remote already exists") {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to add remote for peer %s: %w", peerID, err)
+	}
+	db.log.Infof("added swarm remote for peer %s", peerID)
+	return true, nil
 }
 
 func (db *DB) VerifySignatures(peerID string) error {
@@ -903,4 +963,14 @@ func (db *DB) Initialized() bool {
 // Context returns the DB's context for use by operations that need cancellation support
 func (db *DB) Context() context.Context {
 	return db.ctx
+}
+
+// GetReconciler returns the reconciler
+func (db *DB) GetReconciler() *Reconciler {
+	return db.reconciler
+}
+
+// SetCommitRejectedCallback sets the callback for rejected commits
+func (db *DB) SetCommitRejectedCallback(cb CommitRejectedCallback) {
+	db.reconciler.SetCommitRejectedCallback(cb)
 }

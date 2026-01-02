@@ -41,6 +41,13 @@ case "$1" in
         fi
 
         echo "Starting server on $LISTEN_ADDR:$PORT..."
+        # If DEBUG_SQL=1, emit system table list before starting
+        if [ "${DEBUG_SQL:-0}" = "1" ]; then
+            echo "DEBUG: listing system tables (dolt_*):"
+            /app/ddolt $COMMON_ARGS --no-gui --no-commits status >/dev/null 2>&1 || true
+            /app/ddolt $COMMON_ARGS --no-gui --no-commits sql -q "SHOW TABLES LIKE 'dolt_%';" || true
+        fi
+
         exec /app/ddolt $COMMON_ARGS --no-gui --no-commits server "$@"
         ;;
     status)

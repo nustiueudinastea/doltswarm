@@ -2,3 +2,5 @@ temp
 testdolt
 ddolt
 .envrc
+integration
+*.test

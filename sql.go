@@ -65,6 +65,7 @@ func commitMapper(row *sq.Row) Commit {
 	return commit
 }
 
+// doCommit creates a commit with legacy format (kept for backward compatibility)
 func doCommit(tx *sql.Tx, msg string, signer Signer) (string, error) {
 
 	if signer == nil {
@@ -129,15 +130,36 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 	return db.sqldb.BeginTx(ctx, opts)
 }
 
-// Commit
+// Commit creates a commit with HLC ordering
 func (db *DB) Commit(commitMsg string) (string, error) {
+	// Lock reconciler to prevent concurrent commits
+	db.reconciler.mu.Lock()
+	defer db.reconciler.mu.Unlock()
+
+	// Get HLC timestamp for our commit
+	hlc := db.reconciler.GetHLC().Now()
+
+	// Pull-first: apply any known earlier commits first
+	err := db.reconciler.PullEarlierCommits(hlc)
+	if err != nil {
+		db.log.Warnf("Failed to pull earlier commits: %v", err)
+		// Continue anyway
+	}
+
 	tx, err := db.BeginTx(db.ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to start transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	commitHash, err := doCommit(tx, commitMsg, db.signer)
+	// Create metadata with HLC
+	metadata, err := db.CreateCommitMetadata(commitMsg, hlc)
+	if err != nil {
+		return "", fmt.Errorf("failed to create commit metadata: %w", err)
+	}
+
+	// Commit with metadata
+	commitHash, err := doCommitWithMetadata(tx, metadata, db.signer)
 	if err != nil {
 		return "", fmt.Errorf("failed to commit: %w", err)
 	}
@@ -158,14 +180,39 @@ func (db *DB) Commit(commitMsg string) (string, error) {
 		db.triggerTableChangeCallbacks(tableName)
 	}
 
-	// advertise new head
-	db.AdvertiseHead()
+	// Mark our own commit as applied
+	db.reconciler.GetQueue().MarkApplied(&CommitAd{HLC: hlc})
+
+	// Advertise to peers with full metadata
+	db.AdvertiseCommit(&CommitAd{
+		PeerID:      metadata.Author,
+		HLC:         hlc,
+		ContentHash: metadata.ContentHash,
+		CommitHash:  commitHash,
+		Message:     commitMsg,
+		Author:      metadata.Author,
+		Email:       metadata.Email,
+		Date:        metadata.Date,
+		Signature:   metadata.Signature,
+	})
 
 	return commitHash, nil
-
 }
 
 func (db *DB) ExecAndCommit(execFunc ExecFunc, commitMsg string) (string, error) {
+	// Lock reconciler to prevent concurrent commits
+	db.reconciler.mu.Lock()
+	defer db.reconciler.mu.Unlock()
+
+	// Get HLC timestamp
+	hlc := db.reconciler.GetHLC().Now()
+
+	// Pull-first: apply any known earlier commits first
+	err := db.reconciler.PullEarlierCommits(hlc)
+	if err != nil {
+		db.log.Warnf("Failed to pull earlier commits: %v", err)
+	}
+
 	tx, err := db.BeginTx(db.ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to start transaction: %w", err)
@@ -189,8 +236,24 @@ func (db *DB) ExecAndCommit(execFunc ExecFunc, commitMsg string) (string, error)
 		return "", err
 	}
 
-	// dolt commit
-	commitHash, err := doCommit(tx, commitMsg, db.signer)
+	// Get content hash for metadata
+	var contentHash string
+	if err := tx.QueryRow("SELECT dolt_hashof_db('WORKING')").Scan(&contentHash); err != nil {
+		return "", fmt.Errorf("failed to get content hash: %w", err)
+	}
+
+	// Create metadata with HLC
+	author := db.signer.GetID()
+	email := fmt.Sprintf("%s@doltswarm", author)
+	commitDate := time.Now()
+
+	metadata := NewCommitMetadata(commitMsg, hlc, contentHash, author, email, commitDate)
+	if err := metadata.Sign(db.signer); err != nil {
+		return "", fmt.Errorf("failed to sign: %w", err)
+	}
+
+	// Commit with metadata
+	commitHash, err := doCommitWithMetadata(tx, metadata, db.signer)
 	if err != nil {
 		return "", fmt.Errorf("failed to commit: %w", err)
 	}
@@ -206,8 +269,21 @@ func (db *DB) ExecAndCommit(execFunc ExecFunc, commitMsg string) (string, error)
 		db.triggerTableChangeCallbacks(tableName)
 	}
 
-	// advertise new head
-	db.AdvertiseHead()
+	// Mark applied
+	db.reconciler.GetQueue().MarkApplied(&CommitAd{HLC: hlc})
+
+	// Advertise with full metadata
+	db.AdvertiseCommit(&CommitAd{
+		PeerID:      author,
+		HLC:         hlc,
+		ContentHash: contentHash,
+		CommitHash:  commitHash,
+		Message:     commitMsg,
+		Author:      author,
+		Email:       email,
+		Date:        commitDate,
+		Signature:   metadata.Signature,
+	})
 
 	return commitHash, nil
 }
