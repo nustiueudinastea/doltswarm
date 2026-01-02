@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -603,12 +604,34 @@ func (p2p *P2P) connectToBootstrapPeers() {
 }
 
 // GetMultiaddr returns the full multiaddr for this peer
+// It prefers non-loopback addresses over loopback addresses
 func (p2p *P2P) GetMultiaddr() string {
 	addrs := p2p.host.Addrs()
 	if len(addrs) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s/p2p/%s", addrs[0].String(), p2p.host.ID().String())
+
+	// Prefer non-loopback addresses
+	var bestAddr multiaddr.Multiaddr
+	for _, addr := range addrs {
+		addrStr := addr.String()
+		// Skip loopback addresses (127.0.0.1 or ::1)
+		if strings.Contains(addrStr, "/ip4/127.") || strings.Contains(addrStr, "/ip6/::1") {
+			if bestAddr == nil {
+				bestAddr = addr // Keep as fallback
+			}
+			continue
+		}
+		// Found a non-loopback address, use it
+		bestAddr = addr
+		break
+	}
+
+	if bestAddr == nil {
+		bestAddr = addrs[0]
+	}
+
+	return fmt.Sprintf("%s/p2p/%s", bestAddr.String(), p2p.host.ID().String())
 }
 
 func NewKey(workdir string) (*P2PKey, error) {
