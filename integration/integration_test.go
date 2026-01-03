@@ -1607,14 +1607,17 @@ func TestConcurrentWrites(t *testing.T) {
 // TestCommitOrderConsistency tests that commits from different peers maintain consistent ordering
 func TestCommitOrderConsistency(t *testing.T) {
 	clients := getClients(t)
+	numNodes := len(clients)
+	ctx := context.Background()
 
-	logger.Info("==== Starting TestCommitOrderConsistency ====")
+	logger.Infof("==== Starting TestCommitOrderConsistency (%d nodes) ====", numNodes)
 
 	// Interleaved writes: each peer writes one commit in round-robin fashion
 	rounds := 3
 	allCommits := []string{}
 
 	for round := 0; round < rounds; round++ {
+		roundStart := time.Now()
 		for i, client := range clients {
 			uid, err := ksuid.NewRandom()
 			if err != nil {
@@ -1635,21 +1638,37 @@ func TestCommitOrderConsistency(t *testing.T) {
 			// Small delay between writes to allow propagation
 			time.Sleep(200 * time.Millisecond)
 		}
+
+		// Wait for convergence after each round
+		logger.Infof("Round %d complete, waiting for convergence across %d nodes...", round, numNodes)
+		roundResult, err := waitForHeadConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !roundResult.Converged {
+			t.Errorf("Round %d: convergence failed after interleaved writes: %v", round, roundResult.AllHeads)
+		} else {
+			logger.Infof("Round %d: %d nodes converged in %v (round took %v)",
+				round, numNodes, roundResult.Duration, time.Since(roundStart))
+		}
 	}
 
-	// Wait for all commits to propagate
-	ctx := context.Background()
-	logger.Infof("Waiting for all %d commits to propagate", len(allCommits))
+	// Final convergence check
+	logger.Infof("All %d rounds complete, verifying final convergence across %d nodes...", rounds, numNodes)
+	finalStart := time.Now()
 
 	headResult, err := waitForHeadConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !headResult.Converged {
-		t.Errorf("head convergence failed after interleaved writes: %v", headResult.AllHeads)
+		t.Errorf("Final head convergence failed after interleaved writes: %v", headResult.AllHeads)
+	} else {
+		logger.Infof("Final head convergence: %d nodes converged in %v", numNodes, headResult.Duration)
 	}
 
 	// Verify all peers have same commit order
+	logger.Infof("Verifying commit history consistency across %d nodes...", numNodes)
 	historyResult, err := waitForCommitHistoryConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
@@ -1666,7 +1685,8 @@ func TestCommitOrderConsistency(t *testing.T) {
 			refCommits = commits
 			break
 		}
-		logger.Infof("All peers have identical commit order with %d total commits", len(refCommits))
+		logger.Infof("Final history convergence: %d nodes have identical commit order with %d total commits in %v (total verification took %v)",
+			numNodes, len(refCommits), historyResult.Duration, time.Since(finalStart))
 
 		// Verify all our created commits are present
 		missingCommits := []string{}
