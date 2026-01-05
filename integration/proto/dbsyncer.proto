@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-option go_package = "github.com/nustiueudinastea/doltswarm/proto";
+option go_package = "./proto";
 
 package proto;
 
@@ -46,3 +46,4 @@ message RequestCommitsSinceRequest {
 message RequestCommitsSinceResponse {
   repeated AdvertiseCommitRequest commits = 1;
 }
+

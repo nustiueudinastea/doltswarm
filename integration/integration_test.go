@@ -28,7 +28,6 @@ import (
 	"github.com/segmentio/ksuid"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
-	"google.golang.org/grpc"
 )
 
 //
@@ -592,7 +591,7 @@ func countTrue(m map[string]bool) int {
 // testDB is a mock database for the test harness
 type testDB struct{}
 
-func (pr *testDB) AddPeer(peerID string, conn *grpc.ClientConn) error {
+func (pr *testDB) AddPeer(peer doltswarm.Peer) error {
 	return nil
 }
 func (pr *testDB) RemovePeer(peerID string) error {
@@ -613,10 +612,6 @@ func (pr *testDB) InitFromPeer(peerID string) error {
 
 func (pr *testDB) GetLastCommit(branch string) (doltswarm.Commit, error) {
 	return doltswarm.Commit{}, nil
-}
-
-func (pr *testDB) EnableGRPCServers(server *grpc.Server) error {
-	return nil
 }
 
 func (pr *testDB) Initialized() bool {

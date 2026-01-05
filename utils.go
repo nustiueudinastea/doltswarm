@@ -5,10 +5,6 @@ import (
 	"math/rand"
 	"os"
 
-	"io"
-
-	"github.com/nustiueudinastea/doltswarm/proto"
-
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/dolthub/dolt/go/store/chunks"
 )
@@ -48,30 +44,6 @@ func batchItr(elemCount, batchSize int, cb func(start, end int) (stop bool)) {
 		if stop {
 			break
 		}
-	}
-}
-
-func copyFileChunksFromResponse(w *io.PipeWriter, res proto.Downloader_DownloadFileClient) {
-	message := new(proto.DownloadFileResponse)
-	var err error
-	for {
-		err = res.RecvMsg(message)
-		if err == io.EOF {
-			_ = w.Close()
-			break
-		}
-		if err != nil {
-			_ = w.CloseWithError(err)
-			break
-		}
-		if len(message.GetChunk()) > 0 {
-			_, err = w.Write(message.Chunk)
-			if err != nil {
-				_ = res.CloseSend()
-				break
-			}
-		}
-		message.Chunk = message.Chunk[:0]
 	}
 }
 

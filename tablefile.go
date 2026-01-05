@@ -6,19 +6,16 @@ import (
 	"io"
 	"net/url"
 	"path"
-	"strconv"
 	"strings"
-	"time"
 
-	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/dolthub/dolt/go/store/nbs"
-	"github.com/nustiueudinastea/doltswarm/proto"
 )
 
 // RemoteTableFile is an implementation of a TableFile that lives in a DoltChunkStore
 type RemoteTableFile struct {
-	client *DBClient
-	info   *remotesapi.TableFileInfo
+	downloader  DownloaderClient
+	chunkClient ChunkStoreClient
+	info        TableFileInfo
 }
 
 // LocationPrefix
@@ -29,7 +26,7 @@ func (rtf RemoteTableFile) LocationPrefix() string {
 // LocationSuffix infers suffix from URL (e.g., .darc) to help downstream
 // openChunkSources choose the correct table file format.
 func (rtf RemoteTableFile) LocationSuffix() string {
-	if u, err := url.Parse(rtf.info.Url); err == nil {
+	if u, err := url.Parse(rtf.info.URL); err == nil {
 		if strings.HasSuffix(u.Path, nbs.ArchiveFileSuffix) {
 			return nbs.ArchiveFileSuffix
 		}
@@ -39,7 +36,7 @@ func (rtf RemoteTableFile) LocationSuffix() string {
 
 // FileID gets the id of the file
 func (rtf RemoteTableFile) FileID() string {
-	return rtf.info.FileId
+	return rtf.info.FileID
 }
 
 // NumChunks returns the number of chunks in a table file
@@ -49,53 +46,24 @@ func (rtf RemoteTableFile) NumChunks() int {
 
 // SplitOffset returns the byte offset from the beginning of the storage file where we transition from data to index.
 func (rtf RemoteTableFile) SplitOffset() uint64 {
-	return rtf.info.GetSplitOffset()
+	return rtf.info.SplitOffset
 }
 
 // Open returns an io.ReadCloser which can be used to read the bytes of a table file.
 func (rtf RemoteTableFile) Open(ctx context.Context) (io.ReadCloser, uint64, error) {
-	if rtf.info.RefreshAfter != nil && rtf.info.RefreshAfter.AsTime().After(time.Now()) {
-		resp, err := rtf.client.RefreshTableFileUrl(ctx, rtf.info.RefreshRequest)
-		if err == nil {
-			rtf.info.Url = resp.Url
-			rtf.info.RefreshAfter = resp.RefreshAfter
-		}
-	}
-
 	// Prefer the URL path as the download identifier so we include any suffix
 	// such as ".darc". Fallback to FileId for older manifests.
-	id := rtf.info.FileId
-	if u, err := url.Parse(rtf.info.Url); err == nil {
+	id := rtf.info.FileID
+	if u, err := url.Parse(rtf.info.URL); err == nil {
 		if base := path.Base(u.Path); base != "" && base != "." && base != "/" {
 			id = base
 		}
 	}
 
-	response, err := rtf.client.DownloadFile(
-		ctx,
-		&proto.DownloadFileRequest{Id: id},
-	)
+	r, size, err := rtf.downloader.DownloadFile(ctx, id)
 	if err != nil {
-		return nil, 0, fmt.Errorf("client.LoadFile: %w", err)
+		return nil, 0, fmt.Errorf("download file: %w", err)
 	}
-
-	md, err := response.Header()
-	if err != nil {
-		return nil, 0, fmt.Errorf("response.Header: %w", err)
-	}
-
-	var size uint64
-	if sizes := md.Get("file-size"); len(sizes) > 0 {
-		size, err = strconv.ParseUint(sizes[0], 10, 64)
-		if err != nil {
-			return nil, 0, fmt.Errorf("response.Header: file size header not valid: %w", err)
-		}
-	} else {
-		size = 0
-	}
-
-	r, w := io.Pipe()
-	go copyFileChunksFromResponse(w, response)
 
 	return r, size, nil
 }

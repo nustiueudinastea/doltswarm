@@ -22,8 +22,9 @@ import (
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/martinlindhe/base36"
 	"github.com/multiformats/go-multiaddr"
-	p2pproto "github.com/nustiueudinastea/doltswarm/integration/proto"
 	p2psrv "github.com/nustiueudinastea/doltswarm/integration/p2p/server"
+	p2pproto "github.com/nustiueudinastea/doltswarm/integration/proto"
+	"github.com/nustiueudinastea/doltswarm/integration/transport/grpcswarm"
 	cmap "github.com/orcaman/concurrent-map"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
@@ -45,10 +46,19 @@ type P2PClient struct {
 	p2pproto.TesterClient
 
 	id string
+
+	conn *grpc.ClientConn
 }
 
 func (c *P2PClient) GetID() string {
 	return c.id
+}
+
+func (c *P2PClient) Close() error {
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
 }
 
 type P2P struct {
@@ -267,6 +277,7 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 					PingerClient: p2pproto.NewPingerClient(conn),
 					TesterClient: p2pproto.NewTesterClient(conn),
 					id:           peerIDStr,
+					conn:         conn,
 				}
 
 				// test connectivity with a ping
@@ -289,7 +300,7 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 
 				if p2p.externalDB != nil {
 					p2p.log.Debugf("Adding DB remote for peer %s", peerIDStr)
-					err = p2p.externalDB.AddPeer(peerIDStr, conn)
+					err = p2p.externalDB.AddPeer(grpcswarm.NewPeer(peerIDStr, conn))
 					if err != nil {
 						p2p.log.Errorf("Failed to add DB remote for '%s': %v", peerIDStr, err)
 					}
@@ -381,6 +392,7 @@ func (p2p *P2P) setupIncomingPeer(peerID string) {
 		PingerClient: p2pproto.NewPingerClient(grpcConn),
 		TesterClient: p2pproto.NewTesterClient(grpcConn),
 		id:           peerID,
+		conn:         grpcConn,
 	}
 
 	// Test connectivity with a ping (with timeout)
@@ -409,7 +421,7 @@ func (p2p *P2P) setupIncomingPeer(peerID string) {
 
 	if p2p.externalDB != nil {
 		p2p.log.Debugf("Adding DB remote for incoming peer %s", peerID)
-		if err := p2p.externalDB.AddPeer(peerID, grpcConn); err != nil {
+		if err := p2p.externalDB.AddPeer(grpcswarm.NewPeer(peerID, grpcConn)); err != nil {
 			p2p.log.Errorf("Failed to add DB remote for incoming peer '%s': %v", peerID, err)
 		}
 	}
@@ -505,6 +517,12 @@ func (p2p *P2P) closeConnectionHandler(netw network.Network, conn network.Conn) 
 		// Unprotect the peer connection before removal
 		p2p.unprotectPeer(peerIDParsed)
 
+		if v, ok := p2p.clients.Get(peerIDStr); ok {
+			if client, ok := v.(*P2PClient); ok {
+				_ = client.Close()
+			}
+		}
+
 		p2p.clients.Remove(peerIDStr)
 		p2p.log.Debugf("Removed P2P client for peer %s (remaining clients: %d)", peerIDStr, p2p.clients.Count())
 
@@ -535,6 +553,13 @@ func (p2p *P2P) StartServer() (func() error, error) {
 	srv := &p2psrv.Server{DB: p2p.externalDB}
 	p2pproto.RegisterPingerServer(p2p.grpcServer, srv)
 	p2pproto.RegisterTesterServer(p2p.grpcServer, srv)
+	if p2p.externalDB != nil && p2p.externalDB.Initialized() {
+		if swarmDB, ok := any(p2p.externalDB).(grpcswarm.SwarmDB); ok {
+			if err := grpcswarm.Register(p2p.grpcServer, swarmDB, p2p.log.WithField("context", "swarm")); err != nil {
+				return func() error { return nil }, err
+			}
+		}
+	}
 
 	// serve grpc server over libp2p host
 	grpcListener := p2pgrpc.NewListener(ctx, p2p.host, protosRPCProtocol)
@@ -574,6 +599,11 @@ func (p2p *P2P) StartServer() (func() error, error) {
 		p2p.cancelAllPendingRemovals()
 		peerDiscoveryStopper()
 		mdnsService.Close()
+		for _, v := range p2p.clients.Items() {
+			if client, ok := v.(*P2PClient); ok {
+				_ = client.Close()
+			}
+		}
 		p2p.grpcServer.GracefulStop()
 		return p2p.host.Close()
 	}

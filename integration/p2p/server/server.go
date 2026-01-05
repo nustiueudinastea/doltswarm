@@ -9,20 +9,18 @@ import (
 	p2pgrpc "github.com/birros/go-libp2p-grpc"
 	"github.com/nustiueudinastea/doltswarm"
 	"github.com/nustiueudinastea/doltswarm/integration/proto"
-	"google.golang.org/grpc"
 )
 
 var _ proto.PingerServer = (*Server)(nil)
 var _ proto.TesterServer = (*Server)(nil)
 
 type ExternalDB interface {
-	AddPeer(peerID string, conn *grpc.ClientConn) error
+	AddPeer(peer doltswarm.Peer) error
 	RemovePeer(peerID string) error
 	GetAllCommits() ([]doltswarm.Commit, error)
 	ExecAndCommit(execFunc doltswarm.ExecFunc, commitMsg string) (string, error)
 	GetLastCommit(branch string) (doltswarm.Commit, error)
 	InitFromPeer(peerID string) error
-	EnableGRPCServers(server *grpc.Server) error
 	Initialized() bool
 }
 

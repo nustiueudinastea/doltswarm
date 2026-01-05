@@ -9,13 +9,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/dolthub/dolt/go/libraries/doltcore/remotestorage"
 	"github.com/dolthub/dolt/go/store/atomicerr"
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/nbs"
-	"github.com/nustiueudinastea/doltswarm/proto"
 	"github.com/sirupsen/logrus"
 )
 
@@ -27,10 +25,12 @@ const (
 
 var chunkCache = newMapChunkCache()
 
-func NewRemoteChunkStore(client *DBClient, peerID string, dbName string, nbfVersion string, logger *logrus.Entry) (*RemoteChunkStore, error) {
+func NewRemoteChunkStore(peer Peer, dbName string, nbfVersion string, logger *logrus.Entry) (*RemoteChunkStore, error) {
+	peerID := peer.ID()
 	rcs := &RemoteChunkStore{
 		dbName:      dbName,
-		client:      client,
+		chunkClient: peer.ChunkStore(),
+		downloader:  peer.Downloader(),
 		peerID:      peerID,
 		cache:       chunkCache,
 		httpFetcher: &http.Client{},
@@ -43,14 +43,12 @@ func NewRemoteChunkStore(client *DBClient, peerID string, dbName string, nbfVers
 		log:        logger,
 	}
 
-	metadata, err := client.GetRepoMetadata(context.Background(), &remotesapi.GetRepoMetadataRequest{
-		RepoId:   rcs.getRepoId(),
-		RepoPath: "",
-		ClientRepoFormat: &remotesapi.ClientRepoFormat{
-			NbfVersion: nbfVersion,
-			NbsVersion: nbs.StorageVersion,
-		},
-	})
+	metadata, err := rcs.chunkClient.GetRepoMetadata(
+		context.Background(),
+		rcs.getRepoId(),
+		"",
+		ClientRepoFormat{NbfVersion: nbfVersion, NbsVersion: nbs.StorageVersion},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +75,8 @@ type ConcurrencyParams struct {
 
 type RemoteChunkStore struct {
 	dbName      string
-	client      *DBClient
+	chunkClient ChunkStoreClient
+	downloader  DownloaderClient
 	peerID      string
 	cache       remotestorage.ChunkCache
 	httpFetcher HTTPFetcher
@@ -166,38 +165,23 @@ func (rcs *RemoteChunkStore) downloadChunksAndCache(ctx context.Context, notCach
 		hashesToDownload[i] = h.String()
 	}
 
-	response, err := rcs.client.DownloadChunks(ctx, &proto.DownloadChunksRequest{Hashes: hashesToDownload})
-	if err != nil {
-		return fmt.Errorf("failed to download chunks: %w", err)
-	}
-
-	chunkMsg := new(proto.DownloadChunksResponse)
-	for {
-		err = response.RecvMsg(chunkMsg)
-		if err == io.EOF {
-			break
+	return rcs.downloader.DownloadChunks(ctx, hashesToDownload, func(hashStr string, compressed []byte) error {
+		if len(compressed) == 0 {
+			return nil
 		}
+		h := hash.Parse(hashStr)
+		compressedChunk, err := nbs.NewCompressedChunk(h, compressed)
 		if err != nil {
-			return fmt.Errorf("failed to receive chunk: %w", err)
+			return fmt.Errorf("failed to create compressed chunk for hash '%s': %w", hashStr, err)
 		}
 
-		if len(chunkMsg.GetChunk()) > 0 {
-			h := hash.Parse(chunkMsg.GetHash())
-			compressedChunk, err := nbs.NewCompressedChunk(h, chunkMsg.GetChunk())
-			if err != nil {
-				return fmt.Errorf("failed to create compressed chunk for hash '%s': %w", chunkMsg.GetHash(), err)
-			}
+		rcs.cache.InsertChunks([]nbs.ToChunker{compressedChunk})
 
-			rcs.cache.InsertChunks([]nbs.ToChunker{compressedChunk})
-
-			if _, send := toSend[h]; send {
-				found(ctx, compressedChunk)
-			}
+		if _, send := toSend[h]; send {
+			found(ctx, compressedChunk)
 		}
-		chunkMsg.Chunk = chunkMsg.Chunk[:0]
-	}
-
-	return nil
+		return nil
+	})
 }
 
 func (rcs *RemoteChunkStore) Has(ctx context.Context, h hash.Hash) (bool, error) {
@@ -235,17 +219,16 @@ func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (
 		currByteSl := byteSl[st:end]
 
 		// send a request to the remote api to determine which chunks the remote api already has
-		req := &remotesapi.HasChunksRequest{Hashes: currByteSl, RepoPath: rcs.peerID}
-		var resp *remotesapi.HasChunksResponse
-		resp, err = rcs.client.HasChunks(ctx, req)
+		var absentIndices []int32
+		absentIndices, err = rcs.chunkClient.HasChunks(ctx, rcs.peerID, currByteSl)
 		if err != nil {
-			err = remotestorage.NewRpcError(err, "HasChunks", rcs.peerID, req)
+			err = remotestorage.NewRpcError(err, "HasChunks", rcs.peerID, nil)
 			return true
 		}
 
-		numAbsent := len(resp.Absent)
-		sort.Slice(resp.Absent, func(i, j int) bool {
-			return resp.Absent[i] < resp.Absent[j]
+		numAbsent := len(absentIndices)
+		sort.Slice(absentIndices, func(i, j int) bool {
+			return absentIndices[i] < absentIndices[j]
 		})
 
 		// loop over every hash in the current batch, and if they are absent from the remote host add them to the
@@ -255,7 +238,7 @@ func (rcs *RemoteChunkStore) HasMany(ctx context.Context, hashes hash.HashSet) (
 
 			nextAbsent := -1
 			if j < numAbsent {
-				nextAbsent = int(resp.Absent[j])
+				nextAbsent = int(absentIndices[j])
 			}
 
 			if i == nextAbsent {
@@ -300,13 +283,12 @@ func (rcs *RemoteChunkStore) Rebase(ctx context.Context) error {
 }
 
 func (rcs *RemoteChunkStore) loadRoot(ctx context.Context) error {
-	req := &remotesapi.RootRequest{RepoPath: rcs.peerID}
-	resp, err := rcs.client.Root(ctx, req)
+	rootHash, err := rcs.chunkClient.Root(ctx, rcs.peerID)
 	if err != nil {
-		return remotestorage.NewRpcError(err, "Root", rcs.peerID, req)
+		return remotestorage.NewRpcError(err, "Root", rcs.peerID, nil)
 	}
 	rcs.rootMu.Lock()
-	rcs.root = hash.New(resp.RootHash)
+	rcs.root = hash.New(rootHash)
 	rcs.rootMu.Unlock()
 	return nil
 }
@@ -349,8 +331,8 @@ func (rcs *RemoteChunkStore) AccessMode() chunks.ExclusiveAccessMode {
 	return chunks.ExclusiveAccessMode_ReadOnly
 }
 
-func (rcs *RemoteChunkStore) getRepoId() *remotesapi.RepoId {
-	return &remotesapi.RepoId{Org: rcs.peerID, RepoName: rcs.dbName}
+func (rcs *RemoteChunkStore) getRepoId() RepoID {
+	return RepoID{Org: rcs.peerID, RepoName: rcs.dbName}
 }
 
 //
@@ -360,24 +342,19 @@ func (rcs *RemoteChunkStore) getRepoId() *remotesapi.RepoId {
 func (rcs *RemoteChunkStore) Sources(ctx context.Context) (hash.Hash, []chunks.TableFile, []chunks.TableFile, error) {
 	rcs.log.Trace("calling Sources")
 	id := rcs.getRepoId()
-	req := &remotesapi.ListTableFilesRequest{RepoId: id, RepoPath: "", RepoToken: ""}
-	resp, err := rcs.client.ListTableFiles(ctx, req)
+	rootHash, sourceInfos, appendixInfos, err := rcs.chunkClient.ListTableFiles(ctx, id, "", "")
 	if err != nil {
 		return hash.Hash{}, nil, nil, fmt.Errorf("failed to list table files: %w", err)
 	}
-	sourceFiles := getTableFiles(rcs.client, resp.TableFileInfo)
-	// TODO: remove this
-	for _, nfo := range resp.TableFileInfo {
-		rcs.log.Info(nfo)
-	}
-	appendixFiles := getTableFiles(rcs.client, resp.AppendixTableFileInfo)
-	return hash.New(resp.RootHash), sourceFiles, appendixFiles, nil
+	sourceFiles := getTableFiles(rcs.downloader, rcs.chunkClient, sourceInfos)
+	appendixFiles := getTableFiles(rcs.downloader, rcs.chunkClient, appendixInfos)
+	return hash.New(rootHash), sourceFiles, appendixFiles, nil
 }
 
-func getTableFiles(client *DBClient, infoList []*remotesapi.TableFileInfo) []chunks.TableFile {
+func getTableFiles(downloader DownloaderClient, chunkClient ChunkStoreClient, infoList []TableFileInfo) []chunks.TableFile {
 	tableFiles := make([]chunks.TableFile, 0)
 	for _, nfo := range infoList {
-		tableFiles = append(tableFiles, RemoteTableFile{client, nfo})
+		tableFiles = append(tableFiles, RemoteTableFile{downloader: downloader, chunkClient: chunkClient, info: nfo})
 	}
 	return tableFiles
 }

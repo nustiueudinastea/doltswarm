@@ -10,9 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nustiueudinastea/doltswarm/proto"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // RejectionReason indicates why a commit was dropped
@@ -741,51 +739,28 @@ func (r *Reconciler) requestMissingCommits() {
 		return // Old-style commits, skip
 	}
 
-	clients := r.db.GetClients()
-	for _, client := range clients {
-		go func(c *DBClient) {
+	peers := r.db.GetPeers()
+	for _, peer := range peers {
+		go func(p Peer) {
 			ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
 			defer cancel()
 
 			// ensure remote exists before fetch
-			_, _ = r.db.ensureRemoteExists(ctx, c.GetID())
+			_, _ = r.db.ensureRemoteExists(ctx, p.ID())
 
-			resp, err := c.RequestCommitsSince(ctx, &proto.RequestCommitsSinceRequest{
-				SinceHlc: &proto.HLCTimestamp{
-					Wall:    meta.HLC.Wall,
-					Logical: meta.HLC.Logical,
-					PeerId:  meta.HLC.PeerID,
-				},
-			})
+			resp, err := p.Sync().RequestCommitsSince(ctx, meta.HLC)
 			if err != nil {
 				// Silence error if the peer doesn't implement this RPC yet
 				if !strings.Contains(err.Error(), "Unimplemented") {
-					r.log.Debugf("Failed to request commits from %s: %v", c.GetID(), err)
+					r.log.Debugf("Failed to request commits from %s: %v", p.ID(), err)
 				}
 				return
 			}
 
-			for _, commit := range resp.Commits {
-				ad := &CommitAd{
-					PeerID: commit.PeerId,
-					HLC: HLCTimestamp{
-						Wall:    commit.Hlc.Wall,
-						Logical: commit.Hlc.Logical,
-						PeerID:  commit.Hlc.PeerId,
-					},
-					ContentHash: commit.ContentHash,
-					CommitHash:  commit.CommitHash,
-					Message:     commit.Message,
-					Author:      commit.Author,
-					Email:       commit.Email,
-					Signature:   commit.Signature,
-				}
-				if commit.Date != nil {
-					ad.Date = commit.Date.AsTime()
-				}
+			for _, ad := range resp {
 				r.OnRemoteCommit(ad)
 			}
-		}(client)
+		}(peer)
 	}
 }
 
@@ -832,47 +807,6 @@ func (db *DB) CreateCommitMetadata(msg string, hlc HLCTimestamp) (*CommitMetadat
 	}
 
 	return metadata, nil
-}
-
-// CommitAdFromProto converts a proto AdvertiseCommitRequest to CommitAd
-func CommitAdFromProto(req *proto.AdvertiseCommitRequest) *CommitAd {
-	ad := &CommitAd{
-		PeerID: req.PeerId,
-		HLC: HLCTimestamp{
-			Wall:    req.Hlc.Wall,
-			Logical: req.Hlc.Logical,
-			PeerID:  req.Hlc.PeerId,
-		},
-		ContentHash: req.ContentHash,
-		CommitHash:  req.CommitHash,
-		Message:     req.Message,
-		Author:      req.Author,
-		Email:       req.Email,
-		Signature:   req.Signature,
-	}
-	if req.Date != nil {
-		ad.Date = req.Date.AsTime()
-	}
-	return ad
-}
-
-// CommitAdToProto converts a CommitAd to proto AdvertiseCommitRequest
-func CommitAdToProto(ad *CommitAd) *proto.AdvertiseCommitRequest {
-	return &proto.AdvertiseCommitRequest{
-		PeerId: ad.PeerID,
-		Hlc: &proto.HLCTimestamp{
-			Wall:    ad.HLC.Wall,
-			Logical: ad.HLC.Logical,
-			PeerId:  ad.HLC.PeerID,
-		},
-		ContentHash: ad.ContentHash,
-		CommitHash:  ad.CommitHash,
-		Message:     ad.Message,
-		Author:      ad.Author,
-		Email:       ad.Email,
-		Date:        timestamppb.New(ad.Date),
-		Signature:   ad.Signature,
-	}
 }
 
 // doCommitWithMetadata creates a commit with HLC metadata

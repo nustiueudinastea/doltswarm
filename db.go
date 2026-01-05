@@ -10,20 +10,16 @@ import (
 	"time"
 
 	"github.com/bokwoon95/sq"
-	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
-	"github.com/dolthub/dolt/go/libraries/doltcore/remotesrv"
 	"github.com/dolthub/dolt/go/libraries/utils/concurrentmap"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/datas"
-	"github.com/nustiueudinastea/doltswarm/proto"
 	"github.com/rs/xid"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
-	"google.golang.org/grpc"
 
 	_ "github.com/dolthub/driver"
 )
@@ -65,11 +61,9 @@ type DB struct {
 	tableChangeCallbacks *concurrentmap.Map[string, Notifier]
 	sqldb                *sql.DB
 	sqlMu                sync.RWMutex // Protects sqldb during close/reopen operations
-	eventQueue           chan Event
 	workingDir           string
 	log                  *logrus.Entry
-	dbClients            *concurrentmap.Map[string, *DBClient]
-	peerConns            *concurrentmap.Map[string, *grpc.ClientConn] // Store connections for cleanup
+	peers                *concurrentmap.Map[string, Peer]
 	signer               Signer
 	shutdownWg           sync.WaitGroup // Track active operations for graceful shutdown
 	ctx                  context.Context
@@ -98,9 +92,7 @@ func Open(dir string, name string, logger *logrus.Entry, signer Signer) (*DB, er
 		name:                 name,
 		workingDir:           workingDir,
 		log:                  logger,
-		eventQueue:           make(chan Event, 300),
-		dbClients:            concurrentmap.New[string, *DBClient](),
-		peerConns:            concurrentmap.New[string, *grpc.ClientConn](),
+		peers:                concurrentmap.New[string, Peer](),
 		stoppers:             concurrentmap.New[string, func() error](),
 		tableChangeCallbacks: concurrentmap.New[string, Notifier](),
 		signer:               signer,
@@ -196,30 +188,6 @@ func (db *DB) p2pSetup() error {
 	return nil
 }
 
-func (db *DB) EnableGRPCServers(server *grpc.Server) error {
-
-	db.log.Debug("enabling grpc servers")
-
-	// prepare dolt chunk store server
-	cs, err := db.GetChunkStore()
-	if err != nil {
-		return fmt.Errorf("error getting chunk store: %s", err.Error())
-	}
-
-	chunkStoreCache := NewCSCache(cs.(remotesrv.RemoteSrvStore))
-	chunkStoreServer := NewServerChunkStore(db.log, chunkStoreCache, db.GetFilePath())
-	proto.RegisterDownloaderServer(server, chunkStoreServer)
-	remotesapi.RegisterChunkStoreServiceServer(server, chunkStoreServer)
-
-	syncerServer := NewServerSyncer(db.log, db)
-	proto.RegisterDBSyncerServer(server, syncerServer)
-
-	// start event processor
-	db.stoppers.Set("dbEventProcessor", db.startRemoteEventProcessor())
-
-	return nil
-}
-
 func (db *DB) triggerTableChangeCallbacks(tableName string) {
 	notifiers := db.tableChangeCallbacks.Snapshot()
 	for table, n := range notifiers {
@@ -272,20 +240,10 @@ func (db *DB) Close() error {
 		db.log.Warn("Shutdown timeout waiting for in-flight operations")
 	}
 
-	// Close peer connections
-	db.peerConns.Iter(func(key string, conn *grpc.ClientConn) bool {
-		if conn != nil {
-			if err := conn.Close(); err != nil {
-				db.log.Warnf("failed to close connection for peer %s: %v", key, err)
-			}
-		}
-		return true
-	})
-
 	// Remove peers - collect IDs first to avoid modifying map while iterating
 	var peerIDs []string
-	db.dbClients.Iter(func(key string, client *DBClient) bool {
-		peerIDs = append(peerIDs, client.GetID())
+	db.peers.Iter(func(_ string, peer Peer) bool {
+		peerIDs = append(peerIDs, peer.ID())
 		return true
 	})
 	for _, peerID := range peerIDs {
@@ -344,24 +302,15 @@ func (db *DB) GetChunkStore() (chunks.ChunkStore, error) {
 	return datas.ChunkStoreFromDatabase(dbd), nil
 }
 
-func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
-	db.log.Infof("AddPeer called for peer %s (initialized=%v, clients=%d)", peerID, db.initialized.Load(), db.dbClients.Len())
+func (db *DB) AddPeer(peer Peer) error {
+	peerID := peer.ID()
+	db.log.Infof("AddPeer called for peer %s (initialized=%v, peers=%d)", peerID, db.initialized.Load(), db.peers.Len())
 
-	// Store connection for later cleanup
-	if conn != nil {
-		db.peerConns.Set(peerID, conn)
-	}
-
-	if _, ok := db.dbClients.Get(peerID); !ok {
-		db.dbClients.Set(peerID, &DBClient{
-			id:                      peerID,
-			DBSyncerClient:          proto.NewDBSyncerClient(conn),
-			ChunkStoreServiceClient: remotesapi.NewChunkStoreServiceClient(conn),
-			DownloaderClient:        proto.NewDownloaderClient(conn),
-		})
-		db.log.Infof("added swarm client for peer %s (total clients: %d)", peerID, db.dbClients.Len())
+	if _, ok := db.peers.Get(peerID); !ok {
+		db.peers.Set(peerID, peer)
+		db.log.Infof("added swarm peer %s (total peers: %d)", peerID, db.peers.Len())
 	} else {
-		db.log.Debugf("swarm client for peer %s already exists", peerID)
+		db.log.Debugf("swarm peer %s already exists", peerID)
 	}
 
 	if db.initialized.Load() {
@@ -388,29 +337,21 @@ func (db *DB) AddPeer(peerID string, conn *grpc.ClientConn) error {
 			db.log.Debugf("swarm remote for peer %s already exists", peerID)
 		}
 
-		err = db.RequestHeadFromPeer(peerID)
-		if err != nil {
-			if !strings.Contains(err.Error(), "unknown service proto.DBSyncer") {
-				db.log.Errorf("failed to request head from peer %s: %v", peerID, err)
-			}
-		}
+		_ = db.RequestHeadFromPeer(peerID) // legacy no-op
 	}
 
 	return nil
 }
 
 func (db *DB) RemovePeer(peerID string) error {
-	db.log.Infof("RemovePeer called for peer %s (initialized=%v, clients=%d)", peerID, db.initialized.Load(), db.dbClients.Len())
+	db.log.Infof("RemovePeer called for peer %s (initialized=%v, peers=%d)", peerID, db.initialized.Load(), db.peers.Len())
 
-	if _, ok := db.dbClients.Get(peerID); ok {
-		db.dbClients.Delete(peerID)
-		db.log.Infof("deleted swarm client for peer %s (remaining clients: %d)", peerID, db.dbClients.Len())
+	if _, ok := db.peers.Get(peerID); ok {
+		db.peers.Delete(peerID)
+		db.log.Infof("deleted swarm peer %s (remaining peers: %d)", peerID, db.peers.Len())
 	} else {
-		db.log.Debugf("swarm client for peer %s not found, nothing to delete", peerID)
+		db.log.Debugf("swarm peer %s not found, nothing to delete", peerID)
 	}
-
-	// Clean up connection (but don't close - let Close() handle that to avoid closing active connections)
-	db.peerConns.Delete(peerID)
 
 	if db.initialized.Load() {
 		// Check if remote exists before trying to remove
@@ -438,15 +379,15 @@ func (db *DB) RemovePeer(peerID string) error {
 	return nil
 }
 
-func (db *DB) GetClient(peerID string) (*DBClient, error) {
-	if client, ok := db.dbClients.Get(peerID); ok {
-		return client, nil
+func (db *DB) GetPeer(peerID string) (Peer, error) {
+	if peer, ok := db.peers.Get(peerID); ok {
+		return peer, nil
 	}
-	return nil, fmt.Errorf("client for peer %s not found", peerID)
+	return nil, fmt.Errorf("peer %s not found", peerID)
 }
 
-func (db *DB) GetClients() map[string]*DBClient {
-	return db.dbClients.Snapshot()
+func (db *DB) GetPeers() map[string]Peer {
+	return db.peers.Snapshot()
 }
 
 func (db *DB) InitLocal() error {
@@ -510,14 +451,14 @@ func (db *DB) InitFromPeer(peerID string) error {
 		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main', '%s://%s/%s', '%s');", FactorySwarm, peerID, db.name, db.name)
 		_, err := db.ExecContext(ctx, query)
 		cancel()
-		if err != nil {
-			errStr := err.Error()
-			// Retry if peer is not available yet
-			if strings.Contains(errStr, "could not get client") {
-				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
-				tries++
-				time.Sleep(2 * time.Second)
-				continue
+			if err != nil {
+				errStr := err.Error()
+				// Retry if peer is not available yet
+				if strings.Contains(errStr, "could not get client") || strings.Contains(errStr, "could not get peer") || strings.Contains(errStr, "peer "+peerID+" not found") {
+					db.log.Infof("Peer %s not available yet. Retrying...", peerID)
+					tries++
+					time.Sleep(2 * time.Second)
+					continue
 			}
 			// Retry on "no such file or directory" - this happens when cloning during
 			// active reconciliation (source peer's files change between manifest read

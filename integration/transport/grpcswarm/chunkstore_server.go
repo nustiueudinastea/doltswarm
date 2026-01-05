@@ -1,18 +1,4 @@
-// Copyright 2019 Dolthub, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-package doltswarm
+package grpcswarm
 
 import (
 	"context"
@@ -23,27 +9,26 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/nustiueudinastea/doltswarm/proto"
+	"github.com/dolthub/dolt/go/libraries/doltcore/remotesrv"
+	"github.com/dolthub/dolt/go/libraries/doltcore/remotestorage"
+	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/dolt/go/store/nbs"
+	"github.com/nustiueudinastea/doltswarm"
+	"github.com/nustiueudinastea/doltswarm/integration/proto"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
-	"github.com/dolthub/dolt/go/libraries/doltcore/remotestorage"
-	"github.com/dolthub/dolt/go/store/hash"
-	"github.com/dolthub/dolt/go/store/nbs"
 )
 
-var ErrUnimplemented = errors.New("unimplemented")
 var chunkSize = 1024 * 3
 
-const RepoPathField = "repo_path"
-
-func NewServerChunkStore(logger *logrus.Entry, csCache DBCache, filePath string) *ServerChunkStore {
+func NewServerChunkStore(logger *logrus.Entry, csCache doltswarm.DBCache, filePath string) *ServerChunkStore {
 	return &ServerChunkStore{
 		csCache: csCache,
-		bucket:  "",
 		log: logger.WithFields(logrus.Fields{
 			"service": "ChunkStoreService",
 		}),
@@ -51,14 +36,8 @@ func NewServerChunkStore(logger *logrus.Entry, csCache DBCache, filePath string)
 	}
 }
 
-type repoRequest interface {
-	GetRepoId() *remotesapi.RepoId
-	GetRepoPath() string
-}
-
 type ServerChunkStore struct {
-	csCache  DBCache
-	bucket   string
+	csCache  doltswarm.DBCache
 	log      *logrus.Entry
 	filePath string
 
@@ -67,12 +46,12 @@ type ServerChunkStore struct {
 }
 
 func (rs *ServerChunkStore) HasChunks(ctx context.Context, req *remotesapi.HasChunksRequest) (*remotesapi.HasChunksResponse, error) {
-
-	if err := ValidateHasChunksRequest(req); err != nil {
+	if err := validateRepoRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-
-	defer func() { rs.log.Trace("finished") }()
+	if err := validateHashes("hashes", req.Hashes); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 
 	cs, err := rs.getStore()
 	if err != nil {
@@ -80,26 +59,18 @@ func (rs *ServerChunkStore) HasChunks(ctx context.Context, req *remotesapi.HasCh
 	}
 
 	hashes, hashToIndex := remotestorage.ParseByteSlices(req.Hashes)
-
 	absent, err := cs.HasMany(ctx, hashes)
 	if err != nil {
 		rs.log.WithError(err).Error("error calling HasMany")
 		return nil, status.Error(codes.Internal, "HasMany failure:"+err.Error())
 	}
 
-	indices := make([]int32, len(absent))
-
-	n := 0
+	indices := make([]int32, 0, len(absent))
 	for h := range absent {
-		indices[n] = int32(hashToIndex[h])
-		n++
+		indices = append(indices, int32(hashToIndex[h]))
 	}
 
-	resp := &remotesapi.HasChunksResponse{
-		Absent: indices,
-	}
-
-	return resp, nil
+	return &remotesapi.HasChunksResponse{Absent: indices}, nil
 }
 
 func (rs *ServerChunkStore) GetDownloadLocations(ctx context.Context, req *remotesapi.GetDownloadLocsRequest) (*remotesapi.GetDownloadLocsResponse, error) {
@@ -119,12 +90,9 @@ func (rs *ServerChunkStore) Rebase(ctx context.Context, req *remotesapi.RebaseRe
 }
 
 func (rs *ServerChunkStore) Root(ctx context.Context, req *remotesapi.RootRequest) (*remotesapi.RootResponse, error) {
-
-	if err := ValidateRootRequest(req); err != nil {
+	if err := validateRepoRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-
-	defer func() { rs.log.Trace("finished Root") }()
 
 	cs, err := rs.getStore()
 	if err != nil {
@@ -145,13 +113,14 @@ func (rs *ServerChunkStore) Commit(ctx context.Context, req *remotesapi.CommitRe
 }
 
 func (rs *ServerChunkStore) GetRepoMetadata(ctx context.Context, req *remotesapi.GetRepoMetadataRequest) (*remotesapi.GetRepoMetadataResponse, error) {
-	if err := ValidateGetRepoMetadataRequest(req); err != nil {
+	if err := validateRepoRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if req.ClientRepoFormat == nil {
+		return nil, status.Error(codes.InvalidArgument, "expected non-nil client_repo_format")
+	}
 
-	defer func() { rs.log.Trace("finished") }()
-
-	cs, err := rs.getOrCreateStore()
+	cs, err := rs.getStore()
 	if err != nil {
 		return nil, err
 	}
@@ -170,10 +139,9 @@ func (rs *ServerChunkStore) GetRepoMetadata(ctx context.Context, req *remotesapi
 }
 
 func (rs *ServerChunkStore) ListTableFiles(ctx context.Context, req *remotesapi.ListTableFilesRequest) (*remotesapi.ListTableFilesResponse, error) {
-	if err := ValidateListTableFilesRequest(req); err != nil {
+	if err := validateRepoRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	defer func() { rs.log.Trace("finished ListTableFiles") }()
 
 	cs, err := rs.getStore()
 	if err != nil {
@@ -189,29 +157,22 @@ func (rs *ServerChunkStore) ListTableFiles(ctx context.Context, req *remotesapi.
 	tableFileInfo := buildTableFileInfo(tables)
 	appendixTableFileInfo := buildTableFileInfo(appendixTables)
 
-	resp := &remotesapi.ListTableFilesResponse{
+	return &remotesapi.ListTableFilesResponse{
 		RootHash:              root[:],
 		TableFileInfo:         tableFileInfo,
 		AppendixTableFileInfo: appendixTableFileInfo,
-	}
-
-	return resp, nil
+	}, nil
 }
 
-// AddTableFiles updates the remote manifest with new table files without modifying the root hash.
 func (rs *ServerChunkStore) AddTableFiles(ctx context.Context, req *remotesapi.AddTableFilesRequest) (*remotesapi.AddTableFilesResponse, error) {
 	return nil, status.Error(codes.PermissionDenied, "this server only provides read-only access")
 }
 
-func (rs *ServerChunkStore) getStore() (RemoteSrvStore, error) {
-	return rs.getOrCreateStore()
-}
-
-func (rs *ServerChunkStore) getOrCreateStore() (RemoteSrvStore, error) {
+func (rs *ServerChunkStore) getStore() (remotesrv.RemoteSrvStore, error) {
 	cs, err := rs.csCache.Get()
 	if err != nil {
 		rs.log.WithError(err).Error("Failed to retrieve chunkstore")
-		if errors.Is(err, ErrUnimplemented) {
+		if errors.Is(err, doltswarm.ErrUnimplemented) {
 			return nil, status.Error(codes.Unimplemented, err.Error())
 		}
 		return nil, err
@@ -223,9 +184,7 @@ func (rs *ServerChunkStore) getOrCreateStore() (RemoteSrvStore, error) {
 	return cs, nil
 }
 
-//
-// FileDownloaderServer implementation
-//
+// ---- Downloader service ----
 
 func (rs *ServerChunkStore) DownloadFile(req *proto.DownloadFileRequest, server proto.Downloader_DownloadFileServer) error {
 	if req.GetId() == "" {
@@ -233,47 +192,40 @@ func (rs *ServerChunkStore) DownloadFile(req *proto.DownloadFileRequest, server 
 	}
 
 	filePath := filepath.Join(rs.filePath, ".dolt", "noms", req.Id)
-	rs.log.Info(fmt.Sprintf("Sending file %s", filePath))
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to send file %s: %w", filePath, err)
+		return fmt.Errorf("failed to stat file %s: %w", filePath, err)
 	}
 
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
+	defer f.Close()
 
 	md := metadata.New(map[string]string{
 		"file-name": req.Id,
 		"file-size": strconv.FormatInt(fileInfo.Size(), 10),
 	})
-
-	err = server.SendHeader(md)
-	if err != nil {
+	if err := server.SendHeader(md); err != nil {
 		return status.Error(codes.Internal, "error during sending header")
 	}
 
 	chunk := &proto.DownloadFileResponse{Chunk: make([]byte, chunkSize)}
-	var n int
-
-Loop:
 	for {
-		n, err = f.Read(chunk.Chunk)
+		n, err := f.Read(chunk.Chunk)
 		switch err {
 		case nil:
 		case io.EOF:
-			break Loop
+			return nil
 		default:
-			return status.Errorf(codes.Internal, "io.ReadAll: %v", err)
+			return status.Errorf(codes.Internal, "file read: %v", err)
 		}
 		chunk.Chunk = chunk.Chunk[:n]
-		serverErr := server.Send(chunk)
-		if serverErr != nil {
-			return status.Errorf(codes.Internal, "server.Send: %v", serverErr)
+		if err := server.Send(chunk); err != nil {
+			return status.Errorf(codes.Internal, "server send: %v", err)
 		}
 	}
-	return nil
 }
 
 func (rs *ServerChunkStore) DownloadChunks(req *proto.DownloadChunksRequest, server proto.Downloader_DownloadChunksServer) error {
@@ -288,19 +240,58 @@ func (rs *ServerChunkStore) DownloadChunks(req *proto.DownloadChunksRequest, ser
 
 	for _, hashStr := range req.Hashes {
 		h := hash.Parse(hashStr)
-
 		chunk, err := cs.Get(server.Context(), h)
 		if err != nil {
 			return err
 		}
 		compressedChunk := nbs.ChunkToCompressedChunk(chunk)
 
-		chunkResponse := &proto.DownloadChunksResponse{Hash: hashStr, Chunk: compressedChunk.FullCompressedChunk}
-		serverErr := server.Send(chunkResponse)
-		if serverErr != nil {
-			return status.Errorf(codes.Internal, "server.Send: %v", serverErr)
+		if err := server.Send(&proto.DownloadChunksResponse{Hash: hashStr, Chunk: compressedChunk.FullCompressedChunk}); err != nil {
+			return status.Errorf(codes.Internal, "server send: %v", err)
 		}
-
 	}
 	return nil
+}
+
+// ---- helpers ----
+
+type repoRequest interface {
+	GetRepoId() *remotesapi.RepoId
+	GetRepoPath() string
+}
+
+func validateRepoRequest(req repoRequest) error {
+	if req.GetRepoPath() == "" && req.GetRepoId() == nil {
+		return fmt.Errorf("expected repo_path or repo_id, got neither")
+	} else if req.GetRepoPath() == "" {
+		id := req.GetRepoId()
+		if id.Org == "" || id.RepoName == "" {
+			return fmt.Errorf("expected repo_id.org and repo_id.repo_name, missing at least one")
+		}
+	}
+	return nil
+}
+
+func validateHashes(field string, hashes [][]byte) error {
+	for i, bs := range hashes {
+		if len(bs) != hash.ByteLen {
+			return fmt.Errorf("expected %s[%d] hash to be %d bytes long, was %d", field, i, hash.ByteLen, len(bs))
+		}
+	}
+	return nil
+}
+
+func buildTableFileInfo(tableList []chunks.TableFile) []*remotesapi.TableFileInfo {
+	tableFileInfo := make([]*remotesapi.TableFileInfo, 0, len(tableList))
+	for _, t := range tableList {
+		fileID := t.FileID()
+		url := t.LocationPrefix() + fileID + t.LocationSuffix()
+		tableFileInfo = append(tableFileInfo, &remotesapi.TableFileInfo{
+			FileId:      fileID,
+			NumChunks:   uint32(t.NumChunks()),
+			Url:         url,
+			SplitOffset: t.SplitOffset(),
+		})
+	}
+	return tableFileInfo
 }

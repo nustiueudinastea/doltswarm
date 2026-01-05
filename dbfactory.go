@@ -13,7 +13,7 @@ import (
 )
 
 type ClientRetriever interface {
-	GetClient(peerID string) (*DBClient, error)
+	GetPeer(peerID string) (Peer, error)
 }
 
 func NewDoltSwarmFactory(dbName string, clientRetriever ClientRetriever, logger *logrus.Entry) DoltSwarmFactory {
@@ -45,12 +45,12 @@ func (fact DoltSwarmFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFor
 
 func (fact DoltSwarmFactory) newChunkStore(peerID string, nbfVersion string) (chunks.ChunkStore, error) {
 
-	client, err := fact.clientRetriever.GetClient(peerID)
+	peer, err := fact.clientRetriever.GetPeer(peerID)
 	if err != nil {
-		return nil, fmt.Errorf("could not get client for '%s': %w", peerID, err)
+		return nil, fmt.Errorf("could not get peer for '%s': %w", peerID, err)
 	}
 
-	cs, err := NewRemoteChunkStore(client, peerID, fact.dbName, nbfVersion, fact.logger)
+	cs, err := NewRemoteChunkStore(peer, fact.dbName, nbfVersion, fact.logger)
 	if err != nil {
 		return nil, fmt.Errorf("could not create remote cs for '%s': %w", peerID, err)
 	}

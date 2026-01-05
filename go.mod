@@ -8,7 +8,6 @@ replace (
 )
 
 require (
-	github.com/birros/go-libp2p-grpc v0.0.0
 	github.com/bokwoon95/sq v0.5.1
 	github.com/dolthub/dolt/go v0.40.5-0.20250916084833-f121f4db6fdd
 	github.com/dolthub/driver v0.0.0-00010101000000-000000000000
@@ -16,8 +15,6 @@ require (
 	github.com/rs/xid v1.6.0
 	github.com/sirupsen/logrus v1.9.3
 	go.uber.org/multierr v1.11.0
-	google.golang.org/grpc v1.77.0
-	google.golang.org/protobuf v1.36.11
 )
 
 require (
@@ -62,7 +59,6 @@ require (
 	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20251022180443-0feb69152e9f // indirect
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/denisbrodbeck/machineid v1.0.1 // indirect
 	github.com/dolthub/aws-sdk-go-ini-parser v0.0.0-20250305001723-2821c37f6c12 // indirect
 	github.com/dolthub/eventsapi_schema v0.0.0-20250915094920-eadfd39051ca // indirect
@@ -94,29 +90,16 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect
 	github.com/googleapis/gax-go/v2 v2.14.2 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
-	github.com/ipfs/go-cid v0.6.0 // indirect
 	github.com/juju/gnuflag v1.0.0 // indirect
 	github.com/kch42/buzhash v0.0.0-20160816060738-9bdec3dec7c6 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/lestrrat-go/strftime v1.0.6 // indirect
-	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
-	github.com/libp2p/go-libp2p v0.46.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.15 // indirect
-	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/mohae/uvarint v0.0.0-20160208145430-c3f9e62bf2b0 // indirect
-	github.com/mr-tron/base58 v1.2.0 // indirect
-	github.com/multiformats/go-base32 v0.1.0 // indirect
-	github.com/multiformats/go-base36 v0.2.0 // indirect
-	github.com/multiformats/go-multiaddr v0.16.1 // indirect
-	github.com/multiformats/go-multibase v0.2.0 // indirect
-	github.com/multiformats/go-multicodec v0.10.0 // indirect
-	github.com/multiformats/go-multihash v0.2.3 // indirect
-	github.com/multiformats/go-multistream v0.6.1 // indirect
-	github.com/multiformats/go-varint v0.1.0 // indirect
 	github.com/oracle/oci-go-sdk/v65 v65.55.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
@@ -127,7 +110,6 @@ require (
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/silvasur/buzhash v0.0.0-20160816060738-9bdec3dec7c6 // indirect
 	github.com/sony/gobreaker v0.5.0 // indirect
-	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect
 	github.com/vbauerster/mpb/v8 v8.7.2 // indirect
 	github.com/xitongsys/parquet-go v1.6.2 // indirect
@@ -160,8 +142,9 @@ require (
 	google.golang.org/genproto v0.0.0-20250505200425-f936aa4a68b2 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20251022142026-3a174f9686a8 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251213004720-97cd9d5aeac2 // indirect
+	google.golang.org/grpc v1.77.0 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/go-jose/go-jose.v2 v2.6.3 // indirect
 	gopkg.in/src-d/go-errors.v1 v1.0.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	lukechampine.com/blake3 v1.4.1 // indirect
 )

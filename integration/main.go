@@ -317,15 +317,6 @@ func main() {
 			return fmt.Errorf("failed to create p2p manager: %v", err)
 		}
 
-		// grpc server needs to be added before opening the DB
-		// but only if the db is already initialized
-		if dbi.Initialized() {
-			err = dbi.EnableGRPCServers(p2pmgr.GetGRPCServer())
-			if err != nil {
-				return fmt.Errorf("failed to enable grpc servers: %v", err)
-			}
-		}
-
 		return nil
 	}
 
