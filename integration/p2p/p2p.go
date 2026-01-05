@@ -664,6 +664,15 @@ func (p2p *P2P) GetMultiaddr() string {
 	return fmt.Sprintf("%s/p2p/%s", bestAddr.String(), p2p.host.ID().String())
 }
 
+// NewKeyInMemory generates a new P2P key without persisting it to disk.
+func NewKeyInMemory() (*P2PKey, error) {
+	prvKey, _, err := crypto.GenerateKeyPair(crypto.Ed25519, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &P2PKey{prvKey: prvKey}, nil
+}
+
 func NewKey(workdir string) (*P2PKey, error) {
 	workdirInfo, err := os.Stat(workdir)
 	if err != nil {

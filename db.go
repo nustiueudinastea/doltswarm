@@ -451,14 +451,14 @@ func (db *DB) InitFromPeer(peerID string) error {
 		query := fmt.Sprintf("CALL DOLT_CLONE('-b', 'main', '%s://%s/%s', '%s');", FactorySwarm, peerID, db.name, db.name)
 		_, err := db.ExecContext(ctx, query)
 		cancel()
-			if err != nil {
-				errStr := err.Error()
-				// Retry if peer is not available yet
-				if strings.Contains(errStr, "could not get client") || strings.Contains(errStr, "could not get peer") || strings.Contains(errStr, "peer "+peerID+" not found") {
-					db.log.Infof("Peer %s not available yet. Retrying...", peerID)
-					tries++
-					time.Sleep(2 * time.Second)
-					continue
+		if err != nil {
+			errStr := err.Error()
+			// Retry if peer is not available yet
+			if strings.Contains(errStr, "could not get client") || strings.Contains(errStr, "could not get peer") || strings.Contains(errStr, "peer "+peerID+" not found") {
+				db.log.Infof("Peer %s not available yet. Retrying...", peerID)
+				tries++
+				time.Sleep(2 * time.Second)
+				continue
 			}
 			// Retry on "no such file or directory" - this happens when cloning during
 			// active reconciliation (source peer's files change between manifest read

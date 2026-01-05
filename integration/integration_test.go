@@ -623,7 +623,6 @@ type dockerTestSetup struct {
 	cli        *client.Client
 	networkID  string
 	containers []containerInfo
-	testDir    string
 	clients    []*p2p.P2PClient
 	p2pMgr     *p2p.P2P
 	stopper    func() error
@@ -883,14 +882,6 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 		startTime:  time.Now(),
 	}
 
-	// Create test directory for local p2p manager
-	testDir, err := os.MkdirTemp("temp", "docker-tst")
-	if err != nil {
-		cleanupNetwork(ctx, cli, networkID)
-		return nil, fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	setup.testDir = testDir
-
 	// Start first container with local init
 	logger.Info("Starting first container with local init...")
 	firstContainer := containerInfo{
@@ -909,7 +900,6 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	initID, err := runInitContainer(ctx, cli, firstContainer.name+"-init", initEnv, networkID)
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
-		os.RemoveAll(testDir)
 		return nil, fmt.Errorf("failed to init first container: %w", err)
 	}
 
@@ -951,7 +941,6 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	firstServerID, err := runServerContainer(ctx, cli, firstContainer.name, firstContainer.hostPort, serverEnv, networkID, true)
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
-		os.RemoveAll(testDir)
 		return nil, fmt.Errorf("failed to start first server: %w", err)
 	}
 	firstContainer.id = firstServerID
@@ -971,7 +960,6 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	firstContainerIP, err := getContainerIP(ctx, cli, firstServerID, dockerNetworkName)
 	if err != nil {
 		cleanupNetwork(ctx, cli, networkID)
-		os.RemoveAll(testDir)
 		return nil, fmt.Errorf("failed to get first container IP: %w", err)
 	}
 	logger.Infof("First container IP: %s", firstContainerIP)
@@ -1087,7 +1075,7 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	// Set up local P2P manager to connect to containers
 	peerListChan := make(chan peer.IDSlice, 100)
 	tDB := &testDB{}
-	p2pkey, err := p2p.NewKey(testDir + "/testp2p")
+	p2pkey, err := p2p.NewKeyInMemory()
 	if err != nil {
 		setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
 		setup.cleanup()
@@ -1118,7 +1106,6 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 			logger.Infof("KEEP_DOCKER_CONTAINERS set; leaving containers/network/images in place")
 		} else {
 			cleanupAll(ctx, cli, setup)
-			os.RemoveAll(testDir)
 		}
 	}
 

@@ -27,6 +27,12 @@ const (
 // errMainAdvanced indicates that main branch advanced during reorder operation
 var errMainAdvanced = fmt.Errorf("main branch advanced during reorder")
 
+type sqlRunner interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // CommitRejectedCallback is called when a commit is dropped
 type CommitRejectedCallback func(ad *CommitAd, reason RejectionReason)
 
@@ -294,11 +300,14 @@ func (r *Reconciler) executeReorder() {
 
 	r.log.Infof("Executing batched reorder for %d commits", len(pending))
 
-	// Collect all unique peer IDs we need to fetch from
-	peerIDs := make(map[string]bool)
-	for _, ad := range pending {
-		peerIDs[ad.PeerID] = true
-	}
+	// Collect peer IDs deterministically.
+	//
+	// IMPORTANT: Using only the peers present in `pending` makes the replay set (and merge-base)
+	// depend on timing / arrival order, which can lead to different peers replaying different
+	// ranges and producing different commit hashes.
+	//
+	// Instead, include all currently known peers and iterate in a stable order.
+	peerIDs := r.collectPeerIDsForReorder(pending)
 
 	// Use a long timeout - we'll keep retrying until success or context cancellation
 	// The 120s timeout is for the overall reorder operation, not per-attempt
@@ -349,7 +358,7 @@ func (r *Reconciler) executeReorder() {
 		attempt++
 
 		// Fetch from all peers (re-fetch on retry to get latest)
-		for peerID := range peerIDs {
+		for _, peerID := range peerIDs {
 			// Ensure remote exists before fetch
 			if _, err := r.db.ensureRemoteExists(ctx, peerID); err != nil {
 				r.log.Warnf("Failed to ensure remote exists for %s: %v", peerID, err)
@@ -402,46 +411,91 @@ func (r *Reconciler) executeReorder() {
 	}
 }
 
-// findEarliestMergeBase finds the earliest common ancestor across all peer branches
-func (r *Reconciler) findEarliestMergeBase(ctx context.Context, peerIDs map[string]bool) (string, error) {
-	var earliestBase string
-	var earliestDate time.Time
-
-	for peerID := range peerIDs {
-		var mergeBase string
-		err := r.db.sqldb.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT DOLT_MERGE_BASE('%s/main', 'main');", peerID)).Scan(&mergeBase)
-		if err != nil {
-			continue
+func (r *Reconciler) collectPeerIDsForReorder(pending map[string]*CommitAd) []string {
+	unique := make(map[string]struct{})
+	for _, ad := range pending {
+		if ad.PeerID != "" {
+			unique[ad.PeerID] = struct{}{}
 		}
-
-		// Get date of merge base
-		var date time.Time
-		err = r.db.sqldb.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT date FROM dolt_log('%s', '-n', '1');", mergeBase)).Scan(&date)
-		if err != nil {
-			continue
-		}
-
-		if earliestBase == "" || date.Before(earliestDate) {
-			earliestBase = mergeBase
-			earliestDate = date
+	}
+	for peerID := range r.db.GetPeers() {
+		if peerID != "" {
+			unique[peerID] = struct{}{}
 		}
 	}
 
-	if earliestBase == "" {
+	peerIDs := make([]string, 0, len(unique))
+	for peerID := range unique {
+		peerIDs = append(peerIDs, peerID)
+	}
+	sort.Strings(peerIDs)
+	return peerIDs
+}
+
+// findEarliestMergeBase finds the earliest common ancestor across all peer branches
+func (r *Reconciler) findEarliestMergeBase(ctx context.Context, peerIDs []string) (string, error) {
+	// Deterministic selection: order merge bases by (metadata HLC if present else commit date),
+	// with a stable tie-breaker on the merge-base hash.
+	type candidate struct {
+		hash    string
+		orderTS HLCTimestamp
+	}
+
+	var best *candidate
+	for _, peerID := range peerIDs {
+		var mergeBase string
+		if err := r.db.sqldb.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT DOLT_MERGE_BASE('%s/main', 'main');", peerID),
+		).Scan(&mergeBase); err != nil {
+			continue
+		}
+
+		var msg string
+		var date time.Time
+		if err := r.db.sqldb.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT message, date FROM dolt_log('%s', '-n', '1');", mergeBase),
+		).Scan(&msg, &date); err != nil {
+			continue
+		}
+
+		orderTS := HLCTimestamp{Wall: date.UnixNano(), Logical: 0, PeerID: mergeBase}
+		if meta, err := ParseCommitMetadata(msg); err == nil && meta != nil {
+			orderTS = meta.HLC
+		}
+
+		c := candidate{hash: mergeBase, orderTS: orderTS}
+		if best == nil {
+			best = &c
+			continue
+		}
+		if c.orderTS.Less(best.orderTS) || (c.orderTS.Equal(best.orderTS) && c.hash < best.hash) {
+			*best = c
+		}
+	}
+
+	if best == nil || best.hash == "" {
 		return "", fmt.Errorf("could not find merge base")
 	}
-	return earliestBase, nil
+	return best.hash, nil
 }
 
 // cherryPickReorderSafe reorders commits using temp branch for crash safety.
 // expectedHead is the hash of main when the reorder attempt started; if main moves,
 // we abort with errMainAdvanced to let the caller retry from the new base.
 // Returns errMainAdvanced if main advanced during the operation (caller should retry)
-func (r *Reconciler) cherryPickReorderSafe(ctx context.Context, peerIDs map[string]bool, mergeBase string, expectedHead string) error {
+func (r *Reconciler) cherryPickReorderSafe(ctx context.Context, peerIDs []string, mergeBase string, expectedHead string) error {
+	// IMPORTANT: Dolt session state (checked-out branch) is connection-scoped.
+	// Use a dedicated connection for the entire reorder so DOLT_CHECKOUT / cherry-pick
+	// operations don't leak session state into the pool and so all statements operate
+	// on the intended branch.
+	conn, err := r.db.sqldb.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get sql connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
 	// Get commits from main since merge base
-	localCommits, err := r.getCommitsSince(ctx, "main", mergeBase)
+	localCommits, err := r.getCommitsSince(ctx, conn, "main", mergeBase)
 	if err != nil {
 		return fmt.Errorf("failed to get local commits: %w", err)
 	}
@@ -449,22 +503,23 @@ func (r *Reconciler) cherryPickReorderSafe(ctx context.Context, peerIDs map[stri
 	// Get commits from all peers since merge base
 	var allCommits []commitWithMeta
 	for _, c := range localCommits {
-		allCommits = append(allCommits, commitWithMeta{commit: c})
+		allCommits = append(allCommits, commitWithMeta{commit: c, sourceBranch: "main"})
 	}
 
-	for peerID := range peerIDs {
-		peerCommits, err := r.getCommitsSince(ctx, fmt.Sprintf("%s/main", peerID), mergeBase)
+	for _, peerID := range peerIDs {
+		branch := fmt.Sprintf("%s/main", peerID)
+		peerCommits, err := r.getCommitsSince(ctx, conn, branch, mergeBase)
 		if err != nil {
 			r.log.Warnf("Failed to get commits from %s: %v", peerID, err)
 			continue
 		}
 		for _, c := range peerCommits {
-			allCommits = append(allCommits, commitWithMeta{commit: c})
+			allCommits = append(allCommits, commitWithMeta{commit: c, sourceBranch: branch})
 		}
 	}
 
-	// Deduplicate by content hash
-	allCommits = deduplicateByContent(allCommits)
+	// Deduplicate by stable commit identity (HLC), picking a deterministic representative.
+	allCommits = deduplicateByHLC(allCommits, r.db.signer.GetID())
 
 	// Sort by HLC
 	sortCommitsByHLC(allCommits)
@@ -474,31 +529,31 @@ func (r *Reconciler) cherryPickReorderSafe(ctx context.Context, peerIDs map[stri
 	}
 
 	// Create temp branch at merge base (crash safety)
-	_, err = r.db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-f', 'replay_tmp', '%s');", mergeBase))
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-f', 'replay_tmp', '%s');", mergeBase))
 	if err != nil {
 		return fmt.Errorf("failed to create temp branch: %w", err)
 	}
 
 	// Ensure we clean up the temp branch
 	defer func() {
-		// Switch back to main first
-		_, _ = r.db.ExecContext(context.Background(), "CALL DOLT_CHECKOUT('main');")
-		_, _ = r.db.ExecContext(context.Background(), "CALL DOLT_BRANCH('-D', 'replay_tmp');")
+		// Switch back to main first (using the same conn that performed checkout)
+		_, _ = conn.ExecContext(context.Background(), "CALL DOLT_CHECKOUT('main');")
+		_, _ = conn.ExecContext(context.Background(), "CALL DOLT_BRANCH('-D', 'replay_tmp');")
 	}()
 
 	// Checkout temp branch
-	_, err = r.db.ExecContext(ctx, "CALL DOLT_CHECKOUT('replay_tmp');")
+	_, err = conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('replay_tmp');")
 	if err != nil {
 		return fmt.Errorf("failed to checkout temp branch: %w", err)
 	}
 
 	// Cherry-pick in HLC order with original metadata
 	for _, cwm := range allCommits {
-		err = r.cherryPickWithOriginalMetadata(ctx, cwm)
+		err = r.cherryPickWithOriginalMetadata(ctx, conn, cwm)
 		if err != nil {
 			if isConflictError(err) {
 				r.log.Warnf("Conflict cherry-picking %s - dropping (FWW)", cwm.commit.Hash)
-				_, _ = r.db.ExecContext(ctx, "CALL DOLT_CHERRY_PICK('--abort');")
+				_, _ = conn.ExecContext(ctx, "CALL DOLT_CHERRY_PICK('--abort');")
 
 				// CRITICAL: Mark rejected commit as applied to prevent livelock
 				meta, _ := ParseCommitMetadata(cwm.commit.Message)
@@ -524,7 +579,7 @@ func (r *Reconciler) cherryPickReorderSafe(ctx context.Context, peerIDs map[stri
 	}
 
 	// Fast-forward main to replay_tmp (atomic)
-	_, err = r.db.ExecContext(ctx, "CALL DOLT_CHECKOUT('main');")
+	_, err = conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main');")
 	if err != nil {
 		return fmt.Errorf("failed to checkout main: %w", err)
 	}
@@ -539,7 +594,7 @@ func (r *Reconciler) cherryPickReorderSafe(ctx context.Context, peerIDs map[stri
 	}
 
 	// Not necessarily a fast-forward if we inserted earlier commits.
-	_, err = r.db.ExecContext(ctx, "CALL DOLT_RESET('--hard', 'replay_tmp');")
+	_, err = conn.ExecContext(ctx, "CALL DOLT_RESET('--hard', 'replay_tmp');")
 	if err != nil {
 		return fmt.Errorf("failed to move main to replay_tmp: %w", err)
 	}
@@ -548,9 +603,9 @@ func (r *Reconciler) cherryPickReorderSafe(ctx context.Context, peerIDs map[stri
 }
 
 // cherryPickWithOriginalMetadata cherry-picks using original author/date for hash stability
-func (r *Reconciler) cherryPickWithOriginalMetadata(ctx context.Context, cwm commitWithMeta) error {
+func (r *Reconciler) cherryPickWithOriginalMetadata(ctx context.Context, q sqlRunner, cwm commitWithMeta) error {
 	// Always skip merge commits (Dolt cannot cherry-pick them)
-	isMerge, err := r.isMergeCommit(ctx, cwm.commit.Hash)
+	isMerge, err := r.isMergeCommit(ctx, q, cwm.commit.Hash)
 	if err != nil {
 		return err
 	}
@@ -563,7 +618,7 @@ func (r *Reconciler) cherryPickWithOriginalMetadata(ctx context.Context, cwm com
 	meta, err := ParseCommitMetadata(cwm.commit.Message)
 	if err != nil {
 		// Old commit without metadata, use regular cherry-pick
-		_, err = r.db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_CHERRY_PICK('%s');", cwm.commit.Hash))
+		_, err = q.ExecContext(ctx, fmt.Sprintf("CALL DOLT_CHERRY_PICK('%s');", cwm.commit.Hash))
 		if err != nil && isNoChangesError(err) {
 			r.log.Debugf("Skipping %s - no changes (already applied)", cwm.commit.Hash)
 			return nil
@@ -572,7 +627,7 @@ func (r *Reconciler) cherryPickWithOriginalMetadata(ctx context.Context, cwm com
 	}
 
 	// Cherry-pick normally (creates a commit)
-	_, err = r.db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_CHERRY_PICK('%s');", cwm.commit.Hash))
+	_, err = q.ExecContext(ctx, fmt.Sprintf("CALL DOLT_CHERRY_PICK('%s');", cwm.commit.Hash))
 	if err != nil {
 		// If no changes, the content is already present - skip
 		if isNoChangesError(err) {
@@ -583,7 +638,7 @@ func (r *Reconciler) cherryPickWithOriginalMetadata(ctx context.Context, cwm com
 	}
 
 	// Amend with original metadata for hash stability
-	_, err = r.db.ExecContext(ctx, fmt.Sprintf(
+	_, err = q.ExecContext(ctx, fmt.Sprintf(
 		"CALL DOLT_COMMIT('--amend', '-m', '%s', '--author', '%s <%s>', '--date', '%s');",
 		escapeSQL(cwm.commit.Message),
 		escapeSQL(meta.Author),
@@ -601,11 +656,11 @@ func isNoChangesError(err error) bool {
 }
 
 // isMergeCommit returns true if a commit has more than one parent
-func (r *Reconciler) isMergeCommit(ctx context.Context, hash string) (bool, error) {
+func (r *Reconciler) isMergeCommit(ctx context.Context, q sqlRunner, hash string) (bool, error) {
 	var parentCount int
 	// Use dolt_commit_ancestors table to count parents for this commit
 	query := "SELECT COUNT(*) FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index IS NOT NULL"
-	row, err := r.db.QueryContext(ctx, query, hash)
+	row, err := q.QueryContext(ctx, query, hash)
 	if err != nil {
 		// If the table doesn't exist or query fails, assume not a merge commit
 		// to allow cherry-pick to proceed (it will fail naturally if it is a merge)
@@ -622,14 +677,16 @@ func (r *Reconciler) isMergeCommit(ctx context.Context, hash string) (bool, erro
 }
 
 type commitWithMeta struct {
-	commit Commit
-	hlc    HLCTimestamp
+	commit       Commit
+	hlc          HLCTimestamp
+	originPeerID string
+	sourceBranch string
 }
 
 // getCommitsSince returns commits since a given base (excluding the base)
-func (r *Reconciler) getCommitsSince(ctx context.Context, branch string, base string) ([]Commit, error) {
+func (r *Reconciler) getCommitsSince(ctx context.Context, q sqlRunner, branch string, base string) ([]Commit, error) {
 	query := fmt.Sprintf("SELECT commit_hash, committer, email, date, message FROM dolt_log('%s..%s');", base, branch)
-	rows, err := r.db.QueryContext(ctx, query)
+	rows, err := q.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -646,30 +703,68 @@ func (r *Reconciler) getCommitsSince(ctx context.Context, branch string, base st
 	return commits, nil
 }
 
-// deduplicateByContent removes duplicate commits by content hash
-func deduplicateByContent(commits []commitWithMeta) []commitWithMeta {
-	seen := make(map[string]bool)
-	var result []commitWithMeta
+// deduplicateByHLC removes duplicate commits by HLC.
+//
+// NOTE: Using content_hash for dedup can be nondeterministic (it is not the commit identity) and
+// selection order can vary across peers. HLC is the stable identity in the linear pipeline.
+func deduplicateByHLC(commits []commitWithMeta, localPeerID string) []commitWithMeta {
+	byKey := make(map[string]commitWithMeta)
 
 	for _, cwm := range commits {
 		meta, err := ParseCommitMetadata(cwm.commit.Message)
-		if err != nil {
-			// No metadata, use commit hash as key
-			if !seen[cwm.commit.Hash] {
-				seen[cwm.commit.Hash] = true
-				result = append(result, cwm)
+		if err != nil || meta == nil {
+			// Old commit without metadata: dedup by hash (best effort).
+			key := "hash:" + cwm.commit.Hash
+			if _, ok := byKey[key]; !ok {
+				byKey[key] = cwm
 			}
 			continue
 		}
 
-		// Use content hash as dedup key
-		if !seen[meta.ContentHash] {
-			seen[meta.ContentHash] = true
-			cwm.hlc = meta.HLC
-			result = append(result, cwm)
+		cwm.hlc = meta.HLC
+		cwm.originPeerID = meta.HLC.PeerID
+		key := "hlc:" + meta.HLC.String()
+
+		existing, ok := byKey[key]
+		if !ok {
+			byKey[key] = cwm
+			continue
+		}
+
+		if preferReplaySource(cwm, existing, localPeerID) {
+			byKey[key] = cwm
 		}
 	}
+
+	result := make([]commitWithMeta, 0, len(byKey))
+	for _, v := range byKey {
+		result = append(result, v)
+	}
 	return result
+}
+
+func preferReplaySource(candidate commitWithMeta, current commitWithMeta, localPeerID string) bool {
+	candidateCanonical := isCanonicalReplaySource(candidate, localPeerID)
+	currentCanonical := isCanonicalReplaySource(current, localPeerID)
+	if candidateCanonical != currentCanonical {
+		return candidateCanonical
+	}
+	if candidate.sourceBranch != current.sourceBranch {
+		return candidate.sourceBranch < current.sourceBranch
+	}
+	return candidate.commit.Hash < current.commit.Hash
+}
+
+func isCanonicalReplaySource(cwm commitWithMeta, localPeerID string) bool {
+	// Prefer using the origin peer's branch as the source for the cherry-pick, so the delta
+	// we apply is the origin's commit delta (not a replayed copy from another peer).
+	if cwm.originPeerID == "" {
+		return false
+	}
+	if cwm.originPeerID == localPeerID && cwm.sourceBranch == "main" {
+		return true
+	}
+	return cwm.sourceBranch == fmt.Sprintf("%s/main", cwm.originPeerID)
 }
 
 // sortCommitsByHLC sorts commits by their HLC timestamp
