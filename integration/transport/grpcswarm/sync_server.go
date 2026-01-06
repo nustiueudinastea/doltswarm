@@ -3,6 +3,7 @@ package grpcswarm
 import (
 	"context"
 	"errors"
+	"time"
 
 	p2pgrpc "github.com/birros/go-libp2p-grpc"
 	"github.com/nustiueudinastea/doltswarm"
@@ -13,16 +14,22 @@ import (
 
 var _ proto.DBSyncerServer = (*ServerSyncer)(nil)
 
-func NewServerSyncer(logger *logrus.Entry, db SwarmDB) *ServerSyncer {
+type GossipSink interface {
+	OnCommitAd(from string, ad doltswarm.CommitAdV1)
+}
+
+func NewServerSyncer(logger *logrus.Entry, db SwarmDB, sink GossipSink) *ServerSyncer {
 	return &ServerSyncer{
-		db:  db,
-		log: logger.WithField("component", "syncer"),
+		db:   db,
+		log:  logger.WithField("component", "syncer"),
+		sink: sink,
 	}
 }
 
 type ServerSyncer struct {
-	db  SwarmDB
-	log *logrus.Entry
+	db   SwarmDB
+	log  *logrus.Entry
+	sink GossipSink
 }
 
 func (s *ServerSyncer) AdvertiseCommit(ctx context.Context, req *proto.AdvertiseCommitRequest) (*proto.AdvertiseCommitResponse, error) {
@@ -32,6 +39,28 @@ func (s *ServerSyncer) AdvertiseCommit(ctx context.Context, req *proto.Advertise
 	}
 
 	ad := commitAdFromProto(req)
+
+	if s.sink != nil && req != nil && req.Hlc != nil {
+		meta := doltswarm.CommitMetadata{
+			Version:     doltswarm.CommitMetadataVersion,
+			Message:     req.Message,
+			HLC:         ad.HLC,
+			ContentHash: req.ContentHash,
+			Author:      req.Author,
+			Email:       req.Email,
+			Date:        ad.Date,
+			Signature:   req.Signature,
+		}
+		if metaJSON, err := meta.Marshal(); err == nil {
+			s.sink.OnCommitAd(peer.String(), doltswarm.CommitAdV1{
+				Repo:         doltswarm.RepoID{Org: "", RepoName: ""}, // transport-level only; integration uses single repo
+				HLC:          ad.HLC,
+				MetadataJSON: []byte(metaJSON),
+				MetadataSig:  []byte(req.Signature),
+				ObservedAt:   time.Now(),
+			})
+		}
+	}
 
 	accepted, err := s.db.HandleAdvertiseCommit(ctx, peer.String(), ad)
 	if err != nil {

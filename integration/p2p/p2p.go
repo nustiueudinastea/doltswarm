@@ -71,6 +71,7 @@ type P2P struct {
 	externalDB     p2psrv.ExternalDB
 	prvKey         crypto.PrivKey
 	bootstrapPeers []string
+	swarmTransport *grpcswarm.SwarmTransport
 
 	// Connection stability
 	pendingRemovals cmap.ConcurrentMap // Peers pending removal (debounce)
@@ -543,6 +544,10 @@ func (p2p *P2P) GetID() string {
 	return p2p.host.ID().String()
 }
 
+func (p2p *P2P) GetSwarmTransport() *grpcswarm.SwarmTransport {
+	return p2p.swarmTransport
+}
+
 // StartServer starts listening for p2p connections
 func (p2p *P2P) StartServer() (func() error, error) {
 
@@ -555,7 +560,14 @@ func (p2p *P2P) StartServer() (func() error, error) {
 	p2pproto.RegisterTesterServer(p2p.grpcServer, srv)
 	if p2p.externalDB != nil && p2p.externalDB.Initialized() {
 		if swarmDB, ok := any(p2p.externalDB).(grpcswarm.SwarmDB); ok {
-			if err := grpcswarm.Register(p2p.grpcServer, swarmDB, p2p.log.WithField("context", "swarm")); err != nil {
+			// Optional: expose a gossip-first transport view that can be used by higher layers.
+			if src, ok := any(p2p.externalDB).(grpcswarm.DBPeerSource); ok {
+				p2p.swarmTransport = grpcswarm.NewSwarmTransport(p2p.log.WithField("context", "swarm_transport"), src)
+			}
+
+			if err := grpcswarm.RegisterWithOptions(p2p.grpcServer, swarmDB, p2p.log.WithField("context", "swarm"), grpcswarm.RegisterOptions{
+				GossipSink: p2p.swarmTransport,
+			}); err != nil {
 				return func() error { return nil }, err
 			}
 		}

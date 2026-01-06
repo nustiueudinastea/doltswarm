@@ -24,7 +24,23 @@ type SwarmDB interface {
 	HandleRequestCommitsSince(ctx context.Context, since doltswarm.HLCTimestamp) ([]*doltswarm.CommitAd, error)
 }
 
+// BundleProvider is an optional interface a DB can implement to expose commit bundles over gRPC.
+// The core library is transport-agnostic; integration uses gRPC as one possible transport.
+type BundleProvider interface {
+	BuildBundleSince(ctx context.Context, base doltswarm.Checkpoint, req doltswarm.BundleRequest) (doltswarm.CommitBundle, error)
+}
+
+type RegisterOptions struct {
+	// GossipSink is optional; when set, incoming AdvertiseCommit calls will also be emitted as
+	// gossip events (CommitAdV1) into the sink.
+	GossipSink GossipSink
+}
+
 func Register(server *grpc.Server, db SwarmDB, logger *logrus.Entry) error {
+	return RegisterWithOptions(server, db, logger, RegisterOptions{})
+}
+
+func RegisterWithOptions(server *grpc.Server, db SwarmDB, logger *logrus.Entry, opts RegisterOptions) error {
 	csAny, err := db.GetChunkStore()
 	if err != nil {
 		return fmt.Errorf("get chunk store: %w", err)
@@ -39,8 +55,13 @@ func Register(server *grpc.Server, db SwarmDB, logger *logrus.Entry) error {
 	proto.RegisterDownloaderServer(server, chunkStoreServer)
 	remotesapi.RegisterChunkStoreServiceServer(server, chunkStoreServer)
 
-	syncerServer := NewServerSyncer(logger, db)
+	syncerServer := NewServerSyncer(logger, db, opts.GossipSink)
 	proto.RegisterDBSyncerServer(server, syncerServer)
+
+	// BundleExchange is optional for now; it is registered when the DB supports bundle building.
+	if bundleDB, ok := any(db).(BundleProvider); ok {
+		proto.RegisterBundleExchangeServer(server, NewBundleExchangeServer(logger, bundleDB))
+	}
 
 	return nil
 }

@@ -823,15 +823,33 @@ func (r *Reconciler) periodicSyncLoop() {
 
 // requestMissingCommits requests commits from peers since our last known HLC
 func (r *Reconciler) requestMissingCommits() {
-	// Get our HEAD's HLC as baseline
-	myHead, err := r.db.GetLastCommit("main")
+	// NOTE: Using HEAD's HLC as the baseline cannot repair missed adverts whose HLC is <= HEAD.HLC,
+	// which can happen under concurrent writes or transient disconnects. Instead, periodically
+	// backfill a window of recent commits by HLC.
+	const repairBackfillCommits = 512
+
+	commits, err := r.db.GetAllCommits()
 	if err != nil {
 		return
 	}
 
-	meta, err := ParseCommitMetadata(myHead.Message)
-	if err != nil {
-		return // Old-style commits, skip
+	hlcs := make([]HLCTimestamp, 0, len(commits))
+	for _, c := range commits {
+		meta, err := ParseCommitMetadata(c.Message)
+		if err != nil || meta == nil {
+			continue
+		}
+		hlcs = append(hlcs, meta.HLC)
+	}
+	if len(hlcs) == 0 {
+		return
+	}
+
+	sort.Slice(hlcs, func(i, j int) bool { return hlcs[i].Less(hlcs[j]) })
+
+	var since HLCTimestamp
+	if len(hlcs) > repairBackfillCommits {
+		since = hlcs[len(hlcs)-repairBackfillCommits-1]
 	}
 
 	peers := r.db.GetPeers()
@@ -843,7 +861,7 @@ func (r *Reconciler) requestMissingCommits() {
 			// ensure remote exists before fetch
 			_, _ = r.db.ensureRemoteExists(ctx, p.ID())
 
-			resp, err := p.Sync().RequestCommitsSince(ctx, meta.HLC)
+			resp, err := p.Sync().RequestCommitsSince(ctx, since)
 			if err != nil {
 				// Silence error if the peer doesn't implement this RPC yet
 				if !strings.Contains(err.Error(), "Unimplemented") {

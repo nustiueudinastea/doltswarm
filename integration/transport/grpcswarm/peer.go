@@ -18,6 +18,7 @@ type Peer struct {
 	id string
 
 	syncer     proto.DBSyncerClient
+	bundles    proto.BundleExchangeClient
 	downloader proto.DownloaderClient
 	chunkStore remotesapi.ChunkStoreServiceClient
 }
@@ -31,6 +32,7 @@ func NewPeer(id string, conn grpc.ClientConnInterface) *Peer {
 	return &Peer{
 		id:         id,
 		syncer:     proto.NewDBSyncerClient(conn),
+		bundles:    proto.NewBundleExchangeClient(conn),
 		downloader: proto.NewDownloaderClient(conn),
 		chunkStore: remotesapi.NewChunkStoreServiceClient(conn),
 	}
@@ -69,6 +71,110 @@ func (p *Peer) RequestCommitsSince(ctx context.Context, since doltswarm.HLCTimes
 	out := make([]*doltswarm.CommitAd, 0, len(resp.Commits))
 	for _, c := range resp.Commits {
 		out = append(out, commitAdFromProto(c))
+	}
+	return out, nil
+}
+
+func (p *Peer) GetBundleSince(ctx context.Context, base doltswarm.Checkpoint, req doltswarm.BundleRequest) (doltswarm.CommitBundle, error) {
+	stream, err := p.bundles.GetBundleSince(ctx, &proto.GetBundleSinceRequest{
+		Base: &proto.Checkpoint{
+			Hlc: &proto.HLCTimestamp{
+				Wall:    base.HLC.Wall,
+				Logical: base.HLC.Logical,
+				PeerId:  base.HLC.PeerID,
+			},
+			CommitHash: base.CommitHash,
+		},
+		Req: &proto.BundleRequest{
+			MaxCommits:         int32(req.MaxCommits),
+			MaxBytes:           req.MaxBytes,
+			AllowPartial:       req.AllowPartial,
+			IncludeDiagnostics: req.IncludeDiagnostics,
+		},
+	}, grpc.WaitForReady(true))
+	if err != nil {
+		return doltswarm.CommitBundle{}, err
+	}
+
+	var out doltswarm.CommitBundle
+	headerSet := false
+
+	for {
+		msg, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return doltswarm.CommitBundle{}, err
+		}
+
+		switch it := msg.Item.(type) {
+		case *proto.GetBundleSinceChunk_Header:
+			h := it.Header
+			if h == nil || h.Base == nil || h.Base.Hlc == nil {
+				continue
+			}
+			headerSet = true
+			out.Header = doltswarm.BundleHeader{
+				Base: doltswarm.Checkpoint{
+					HLC: doltswarm.HLCTimestamp{
+						Wall:    h.Base.Hlc.Wall,
+						Logical: h.Base.Hlc.Logical,
+						PeerID:  h.Base.Hlc.PeerId,
+					},
+					CommitHash: h.Base.CommitHash,
+				},
+				ProviderHeadHLC: doltswarm.HLCTimestamp{
+					Wall:    h.ProviderHeadHlc.GetWall(),
+					Logical: h.ProviderHeadHlc.GetLogical(),
+					PeerID:  h.ProviderHeadHlc.GetPeerId(),
+				},
+				ProviderHeadHash: h.ProviderHeadHash,
+				BaseMismatch:     h.BaseMismatch,
+			}
+			for _, cp := range h.ProviderCheckpoints {
+				if cp == nil || cp.Hlc == nil {
+					continue
+				}
+				out.Header.ProviderCheckpoints = append(out.Header.ProviderCheckpoints, doltswarm.Checkpoint{
+					HLC: doltswarm.HLCTimestamp{
+						Wall:    cp.Hlc.Wall,
+						Logical: cp.Hlc.Logical,
+						PeerID:  cp.Hlc.PeerId,
+					},
+					CommitHash: cp.CommitHash,
+				})
+			}
+		case *proto.GetBundleSinceChunk_Commit:
+			c := it.Commit
+			if c == nil || c.Hlc == nil {
+				continue
+			}
+			out.Commits = append(out.Commits, doltswarm.BundledCommit{
+				HLC: doltswarm.HLCTimestamp{
+					Wall:    c.Hlc.Wall,
+					Logical: c.Hlc.Logical,
+					PeerID:  c.Hlc.PeerId,
+				},
+				CommitHash:   c.CommitHash,
+				MetadataJSON: c.MetadataJson,
+				MetadataSig:  c.MetadataSig,
+			})
+		case *proto.GetBundleSinceChunk_Chunk:
+			ch := it.Chunk
+			if ch == nil {
+				continue
+			}
+			out.Chunks = append(out.Chunks, doltswarm.BundledChunk{
+				Hash:  ch.Hash,
+				Data:  ch.Data,
+				Codec: doltswarm.ChunkCodec(ch.Codec),
+			})
+		}
+	}
+
+	if !headerSet {
+		// Best effort: return empty header; callers should treat this as an error.
 	}
 	return out, nil
 }
