@@ -1,4 +1,4 @@
-# PLAN2: Gossip-First DoltSwarm With Commit Bundles
+# PLAN2: Gossip-First DoltSwarm (Option B: Dolt-Native Fetch via `swarm://`)
 
 This document proposes a **breaking redesign** of DoltSwarm to assume a **gossip P2P architecture by default**, while preserving the core goals:
 
@@ -12,6 +12,53 @@ This document proposes a **breaking redesign** of DoltSwarm to assume a **gossip
 Key requirement for this redesign:
 
 - **Commits / chunks must be retrievable from any peers that have them.** The library must **not** mandate pulling from a specific peer ID, and must **not** expose “direct peer fetch” concepts in the public API. It should still work on full-mesh networks (full mesh becomes “a gossip overlay with high connectivity”).
+
+## Option B (Selected): Use Dolt’s optimized fetch pipeline
+
+The “old” approach (direct peer fetch using Dolt remotes) is dramatically more CPU/IO efficient because Dolt already has a highly optimized object transfer pipeline:
+
+- negotiation based on hashes / has-many
+- table-file aware transfer (bulk reads) instead of per-commit replay/import churn
+- reuse of existing Dolt storage primitives and caches
+
+**Option B** keeps the gossip control plane (ads/digests) but switches the data plane to “Dolt-native fetch”:
+
+- Every node maintains a single Dolt remote named `swarm`.
+- `CALL DOLT_FETCH('swarm')` is the only way we ingest remote objects.
+- The remote URL uses a new scheme: `swarm://<org>/<repo>` (or `swarm://<repo>`).
+- A `swarm://` dbfactory resolves that URL to **any currently-connected provider** via a provider picker (transport implementation detail).
+- Providers expose Dolt’s `remotesapi.ChunkStoreService` (read-only subset) plus a small non-HTTP `Downloader` stream for table files.
+
+This preserves “retrieve from any peer that has the data” without ever pinning to a specific peer in the public API.
+
+## Migration Plan (PR-sized, keep integration green) — Option B
+
+1) **PR1: `swarm://` dbfactory + provider registry (core)**
+   - Add `RegisterSwarmProviders(repo, ProviderPicker)` and a `swarm://` dbfactory that opens a Dolt remote backed by a provider-selected chunk store.
+   - Keep core protobuf-free; providers are Go interfaces.
+
+2) **PR2: Serve Dolt chunkstore over the existing libp2p-gRPC transport (integration)**
+   - Expose Dolt `remotesapi.ChunkStoreService` (read-only subset) over gRPC.
+   - Add a small `Downloader` streaming service for table files / compressed chunks (protobuf lives only in `integration/proto/`).
+
+3) **PR3: Switch Node sync to `DOLT_FETCH('swarm')`**
+   - Add `EnsureSwarmRemote`, `FetchSwarm`, `MergeBase`, `GetBranchHead` helpers.
+   - Update reconciler flow: fetch → merge-base → FF or deterministic replay on temp branch.
+
+4) **PR4: Turn off and delete direct-peer code paths**
+   - Delete peer-specific remotes / fetches.
+   - Keep gossip-only control plane + dolt-native fetch data plane.
+
+5) **PR5: Performance hardening**
+   - Debounce sync triggers (`SyncDebounce`).
+   - Avoid rewriting the `swarm` remote when URL is unchanged.
+   - Add light instrumentation for fetch duration / replay duration.
+
+---
+
+## Historical note: Commit-bundle design (Option A)
+
+The remainder of this document describes an earlier “commit bundle” approach (Option A). It’s kept for reference, but Option B is the current direction.
 
 ---
 
@@ -151,6 +198,118 @@ Each transport is responsible for defining its own wire format and encoding/deco
 
 For concreteness and interoperability, this section provides **suggested protobuf message shapes** that transports can adopt.
 In the integration demo, these should live under `integration/proto/` (and generated code should live under `integration/proto/` as well).
+
+---
+
+## Migration Plan (PR-sized, keep integration green)
+
+This is a concrete sequence of small PRs to migrate from the current **direct-peer / fetch remotes** architecture to **gossip + commit bundles**, while keeping `task integration:quick` green throughout.
+
+Important constraint: even when switching gossip transport away from gRPC, we can still keep **data defined in protobufs** by publishing **protobuf-encoded payloads** over libp2p GossipSub (or any other pubsub) as opaque bytes. The core library remains protobuf-free and sees only Go structs.
+
+### PR 1 — Bundle plumbing + correctness hardening (no behavior change)
+- Land `CommitBundle` / `Exchange` end-to-end without changing the existing sync pipeline.
+- Harden bundle correctness:
+  - Include local storage format in bundle header (`nbf_version`, `nbs_version`) and reject incompatible bundles on import.
+  - Ensure chunk closure traversal uses the correct NomsBinFormat derived from `ChunkStore.Version()`.
+  - Ensure exported bundle chunk bytes/hashes are copied (no stack-backed slices).
+  - Make import commit robust when `ChunkStore.Commit(...)` returns `ok=false` (rebase + retry).
+- Keep the current peer-based `AdvertiseCommit` + `DOLT_FETCH` reconciler logic active.
+
+### PR 2 — Add gossip transport (integration-only), still using old pipeline
+- Add a libp2p GossipSub-backed `doltswarm.Gossip` implementation in `integration/`.
+- Define gossip payloads in protobuf under `integration/proto/` and publish them as `proto.Marshal(...)` bytes over GossipSub topics.
+- Keep `Exchange` as the existing BundleExchange (gRPC) data plane for now.
+- Do not wire Node into ddolt yet; tests unchanged.
+
+### PR 3 — Run Node in ddolt, but keep DB’s old sync enabled
+- In `integration/main.go`, construct a `doltswarm.Node` and run `node.Run(ctx)` in a goroutine.
+- Keep `ExecSQL` using the existing DB write path; Node is “read-only” (observability only) to avoid changing heads.
+
+### PR 4 — Switch write path to Node (dual-publish temporarily)
+- Make integration `ExecSQL` call `node.ExecAndCommit(...)` so every commit produces a `CommitAdV1` for gossip.
+- Temporarily keep the old broadcast (`DB.AdvertiseCommit`) enabled as a safety net while bundle apply loop matures.
+
+### PR 5 — Enable bundle-based apply loop (still keep direct fetch enabled)
+- Implement `Node.Run()` to:
+  - Subscribe to gossip commit ads / digests
+  - Dedup + validate
+  - Request bundles via `Exchange.GetBundleSince(...)`
+  - Import bundles and drive deterministic replay/FF to advance `main`
+  - Publish periodic digests for anti-entropy repair
+- Keep old peer-fetch reconciler as a fallback (lower frequency).
+- Add an integration test that simulates missed gossip and validates digest/bundle repair.
+
+### PR 6 — Turn off direct-peer fetch in integration runtime (keep code behind flags)
+- Add a runtime flag/env to disable:
+  - `DOLT_REMOTE('add', ...)` peer remotes
+  - any `DOLT_FETCH('<peerID>', ...)` usage
+  - peer-based “broadcast to all peers” commit adverts
+- Integration tests run with the direct-peer path disabled and must still converge.
+
+### PR 7 — Remove direct-peer networking surface from core
+- Delete core interfaces and implementations that assume peer-targeted fetching:
+  - `peer.go`, `remotecs.go`, `tablefile.go`, `cscache.go`, plus any remaining `remotesapi` references
+  - DB peer membership/remotes (`AddPeer/RemovePeer/GetPeers/ensureRemoteExists`)
+  - reconciler peer-ID-based fetching and peer-branch assumptions
+
+### PR 8 — Remove legacy integration RPCs (DBSyncer + ChunkStoreService)
+- Delete integration-only RPC surfaces used by the direct-peer design:
+  - `integration/proto/dbsyncer.proto` and all downloader/chunkstore RPCs
+  - server/client implementations that exist solely for peer-targeted fetch
+- Keep only:
+  - GossipSub (protobuf payloads) for gossip messages
+  - BundleExchange (or replace it with a libp2p stream protocol if desired)
+
+### PR 9 — Replace “Closure Bundles” with “Dolt-Native Pull Semantics” (performance)
+
+Problem: the current `CommitBundle` implementation is a **server-side closure walk** that copies raw NBS chunks into a bundle per request.
+This scales poorly at N=20+ because:
+- provider repeats expensive closure traversal for each requester,
+- bundles duplicate chunks across requests,
+- CPU + disk I/O scale roughly with the number of sync attempts, not the number of *new chunks*.
+
+Why the *old direct-pull* approach was “way more effective”:
+- `DOLT_FETCH` / Dolt’s pull pipeline is **receiver-driven** and transfers **only missing chunks**, using batched `HasMany`/`GetMany` calls.
+- The provider mostly does **constant-time lookups by hash**, not closure traversal per client.
+- The algorithm benefits heavily from OS page cache and chunk-addressed deduplication.
+
+Goal: keep the **gossip-first** UX (no peer-targeting in the core API), but adopt the **same optimized patterns** as Dolt’s fetch.
+
+Design (breaking internal change, external UX stable):
+1) Split “bundle” into a light **commit inventory** plus a receiver-driven **chunk fetch**:
+   - Gossip still carries `CommitAdV1` and `DigestV1` for ordering + repair.
+   - Data-plane becomes “fetch by hash” rather than “ship closure”.
+2) Introduce a provider-agnostic “swarm remote” / “multi-source chunk store” behind the transport:
+   - Node never targets a peer; transport picks providers per request/batch.
+   - Receiver asks for missing chunks (batched) and imports them; replay/FF stays the same.
+
+Two viable implementation options:
+
+**Option A — Library-level puller (transport-agnostic, no Dolt remotes)**
+- Add an `ExchangeChunks` interface (integration can keep protobuf; core stays Go structs):
+  - `HasMany(repo, hashes) -> []bool`
+  - `GetMany(repo, hashes) -> []chunk`
+- Implement a receiver-side pull loop that:
+  - computes missing set via `HasMany`,
+  - downloads via `GetMany` with concurrency + byte budgets,
+  - writes to local chunk store,
+  - repeats until target commit roots exist locally.
+- Pros: transport-independent, stable API surface.
+- Cons: we re-implement some of Dolt’s tuning ourselves (but we can borrow patterns).
+
+**Option B — Reintroduce a `swarm://` Dolt remote factory (max reuse of Dolt optimizations)**
+- Provide a single Dolt remote like `swarm://doltswarmdemo` (no peer ID).
+- The factory internally uses a multi-source chunk fetcher (providers chosen by transport).
+- Node drives sync by calling `CALL DOLT_FETCH('swarm');` and then running replay/FF.
+- Pros: leverages Dolt’s highly optimized fetch/pull pipeline directly.
+- Cons: depends on Dolt internals (`dbfactory` hooks) and can be version-sensitive.
+
+PR-sized rollout suggestion (keep tests green):
+- PR 9a: Add `ExchangeChunks` RPCs in `integration/` (protobuf OK) and implement provider-agnostic chunk serving (read-only).
+- PR 9b: Implement receiver-side “pull missing chunks for commit hashes” and switch `Node.syncOnce()` to use it (still keep old `CommitBundle` as fallback).
+- PR 9c: Delete closure-walk bundling (`walkChunkClosure`) once N=20+ tests are stable.
+- (Optional) PR 9d: Try Option B (`swarm://` remote) and compare performance; keep Option A as fallback if Dolt internals change.
 
 ### 3.1 Repo identity
 

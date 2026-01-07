@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+option go_package = "./proto";
+
+package proto;
+
+import "proto/hlc.proto";
+
+message RepoId {
+  string org = 1;
+  string repo_name = 2;
+}
+
+// Checkpoint is a compact prefix summary entry (HLC + commit hash).
+message Checkpoint {
+  HLCTimestamp hlc = 1;
+  string commit_hash = 2;
+}
+
+// CommitAdV1 is the gossip payload for a commit advertisement.
+message CommitAdV1 {
+  RepoId repo = 1;
+  HLCTimestamp hlc = 2;
+  bytes metadata_json = 3;
+  bytes metadata_sig = 4;
+}
+
+// DigestV1 is a compact anti-entropy summary used to negotiate a shared base.
+message DigestV1 {
+  RepoId repo = 1;
+  HLCTimestamp head_hlc = 2;
+  string head_hash = 3;
+  repeated Checkpoint checkpoints = 4;
+}
+
+// GossipMessage is the envelope published on the gossip topic.
+message GossipMessage {
+  oneof msg {
+    CommitAdV1 commit_ad = 1;
+    DigestV1 digest = 2;
+  }
+}

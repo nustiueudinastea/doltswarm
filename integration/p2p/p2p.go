@@ -10,6 +10,7 @@ import (
 	"time"
 
 	p2pgrpc "github.com/birros/go-libp2p-grpc"
+	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -22,8 +23,10 @@ import (
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/martinlindhe/base36"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/nustiueudinastea/doltswarm"
 	p2psrv "github.com/nustiueudinastea/doltswarm/integration/p2p/server"
 	p2pproto "github.com/nustiueudinastea/doltswarm/integration/proto"
+	"github.com/nustiueudinastea/doltswarm/integration/transport/gossipsub"
 	"github.com/nustiueudinastea/doltswarm/integration/transport/grpcswarm"
 	cmap "github.com/orcaman/concurrent-map"
 	"github.com/sirupsen/logrus"
@@ -35,7 +38,7 @@ const (
 	protosRPCProtocol = protocol.ID("/protos/rpc/0.0.1")
 
 	// Connection stability settings
-	peerRemovalDelay   = 3 * time.Second  // Delay before removing a disconnected peer
+	peerRemovalDelay   = 30 * time.Second // Delay before removing a disconnected peer
 	connGracePeriod    = 30 * time.Second // Grace period for new connections
 	connManagerLowMark = 50               // Low watermark for connection manager
 	connManagerHiMark  = 200              // High watermark for connection manager
@@ -71,7 +74,7 @@ type P2P struct {
 	externalDB     p2psrv.ExternalDB
 	prvKey         crypto.PrivKey
 	bootstrapPeers []string
-	swarmTransport *grpcswarm.SwarmTransport
+	node           *doltswarm.Node
 
 	// Connection stability
 	pendingRemovals cmap.ConcurrentMap // Peers pending removal (debounce)
@@ -298,14 +301,6 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 
 				// Protect this peer's connection from being pruned by connection manager
 				p2p.protectPeer(peerInfo.ID)
-
-				if p2p.externalDB != nil {
-					p2p.log.Debugf("Adding DB remote for peer %s", peerIDStr)
-					err = p2p.externalDB.AddPeer(grpcswarm.NewPeer(peerIDStr, conn))
-					if err != nil {
-						p2p.log.Errorf("Failed to add DB remote for '%s': %v", peerIDStr, err)
-					}
-				}
 				peerMu.Unlock()
 				// Non-blocking send to avoid deadlock during shutdown
 				select {
@@ -419,13 +414,6 @@ func (p2p *P2P) setupIncomingPeer(peerID string) {
 
 	// Protect this peer's connection from being pruned by connection manager
 	p2p.protectPeer(peerIDParsed)
-
-	if p2p.externalDB != nil {
-		p2p.log.Debugf("Adding DB remote for incoming peer %s", peerID)
-		if err := p2p.externalDB.AddPeer(grpcswarm.NewPeer(peerID, grpcConn)); err != nil {
-			p2p.log.Errorf("Failed to add DB remote for incoming peer '%s': %v", peerID, err)
-		}
-	}
 	// Non-blocking send to avoid deadlock during shutdown
 	select {
 	case p2p.peerListChan <- p2p.host.Network().Peers():
@@ -526,13 +514,6 @@ func (p2p *P2P) closeConnectionHandler(netw network.Network, conn network.Conn) 
 
 		p2p.clients.Remove(peerIDStr)
 		p2p.log.Debugf("Removed P2P client for peer %s (remaining clients: %d)", peerIDStr, p2p.clients.Count())
-
-		if p2p.externalDB != nil {
-			p2p.log.Debugf("Removing DB remote for peer %s", peerIDStr)
-			if err := p2p.externalDB.RemovePeer(peerIDStr); err != nil {
-				p2p.log.Errorf("Failed to remove DB peer for '%s': %v", peerIDStr, err)
-			}
-		}
 	}()
 }
 
@@ -544,8 +525,31 @@ func (p2p *P2P) GetID() string {
 	return p2p.host.ID().String()
 }
 
-func (p2p *P2P) GetSwarmTransport() *grpcswarm.SwarmTransport {
-	return p2p.swarmTransport
+func (p2p *P2P) SetNode(n *doltswarm.Node) {
+	p2p.node = n
+}
+
+// SnapshotConns returns a snapshot of currently connected gRPC conns keyed by peer ID.
+// Used for provider-agnostic bundle exchange.
+func (p2p *P2P) SnapshotConns() map[string]grpc.ClientConnInterface {
+	out := make(map[string]grpc.ClientConnInterface)
+	if p2p == nil {
+		return out
+	}
+	for _, v := range p2p.clients.Items() {
+		c, ok := v.(*P2PClient)
+		if !ok || c == nil || c.conn == nil || c.id == "" {
+			continue
+		}
+		out[c.id] = c.conn
+	}
+	return out
+}
+
+// NewGossipSub constructs a GossipSub-backed doltswarm.Gossip implementation.
+// This does not change any runtime behavior unless called by the application.
+func (p2p *P2P) NewGossipSub(ctx context.Context, topic string) (*gossipsub.GossipSubGossip, error) {
+	return gossipsub.New(ctx, p2p.host, p2p.log.WithField("context", "gossip"), topic)
 }
 
 // StartServer starts listening for p2p connections
@@ -555,20 +559,17 @@ func (p2p *P2P) StartServer() (func() error, error) {
 	ctx := context.TODO()
 
 	// register internal grpc servers
-	srv := &p2psrv.Server{DB: p2p.externalDB}
+	srv := &p2psrv.Server{DB: p2p.externalDB, Node: p2p.node}
 	p2pproto.RegisterPingerServer(p2p.grpcServer, srv)
 	p2pproto.RegisterTesterServer(p2p.grpcServer, srv)
-	if p2p.externalDB != nil && p2p.externalDB.Initialized() {
-		if swarmDB, ok := any(p2p.externalDB).(grpcswarm.SwarmDB); ok {
-			// Optional: expose a gossip-first transport view that can be used by higher layers.
-			if src, ok := any(p2p.externalDB).(grpcswarm.DBPeerSource); ok {
-				p2p.swarmTransport = grpcswarm.NewSwarmTransport(p2p.log.WithField("context", "swarm_transport"), src)
-			}
-
-			if err := grpcswarm.RegisterWithOptions(p2p.grpcServer, swarmDB, p2p.log.WithField("context", "swarm"), grpcswarm.RegisterOptions{
-				GossipSink: p2p.swarmTransport,
-			}); err != nil {
-				return func() error { return nil }, err
+	if p2p.externalDB != nil {
+		if db, ok := any(p2p.externalDB).(*doltswarm.DB); ok {
+			csSrv, err := grpcswarm.NewChunkStoreServer(db, p2p.log.WithField("context", "chunkstore"))
+			if err == nil {
+				remotesapi.RegisterChunkStoreServiceServer(p2p.grpcServer, csSrv)
+				p2pproto.RegisterDownloaderServer(p2p.grpcServer, csSrv)
+			} else {
+				p2p.log.Warnf("Failed to init chunkstore server: %v", err)
 			}
 		}
 	}

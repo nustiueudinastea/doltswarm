@@ -2,17 +2,7 @@ package doltswarm
 
 import (
 	"errors"
-	"math/rand"
 	"os"
-
-	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
-	"github.com/dolthub/dolt/go/store/chunks"
-)
-
-const (
-	grpcRetries            = 5
-	MaxFetchSize           = 128 * 1024 * 1024
-	HedgeDownloadSizeLimit = 4 * 1024 * 1024
 )
 
 func ensureDir(dirName string) error {
@@ -31,46 +21,4 @@ func ensureDir(dirName string) error {
 		return nil
 	}
 	return err
-}
-
-func batchItr(elemCount, batchSize int, cb func(start, end int) (stop bool)) {
-	for st, end := 0, batchSize; st < elemCount; st, end = end, end+batchSize {
-		if end > elemCount {
-			end = elemCount
-		}
-
-		stop := cb(st, end)
-
-		if stop {
-			break
-		}
-	}
-}
-
-func buildTableFileInfo(tableList []chunks.TableFile) []*remotesapi.TableFileInfo {
-	tableFileInfo := make([]*remotesapi.TableFileInfo, 0)
-	for _, t := range tableList {
-		// FileId must remain the raw table file id (base32 hash). LocationPrefix/Suffix
-		// are used only to form the download URL.
-		fileID := t.FileID()
-		url := t.LocationPrefix() + fileID + t.LocationSuffix()
-
-		tableFileInfo = append(tableFileInfo, &remotesapi.TableFileInfo{
-			FileId:      fileID,
-			NumChunks:   uint32(t.NumChunks()),
-			Url:         url,
-			SplitOffset: t.SplitOffset(),
-		})
-	}
-	return tableFileInfo
-}
-
-var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-func randSeq(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
 }

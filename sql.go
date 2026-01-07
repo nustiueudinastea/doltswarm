@@ -139,13 +139,6 @@ func (db *DB) Commit(commitMsg string) (string, error) {
 	// Get HLC timestamp for our commit
 	hlc := db.reconciler.GetHLC().Now()
 
-	// Pull-first: apply any known earlier commits first
-	err := db.reconciler.PullEarlierCommits(hlc)
-	if err != nil {
-		db.log.Warnf("Failed to pull earlier commits: %v", err)
-		// Continue anyway
-	}
-
 	tx, err := db.BeginTx(db.ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to start transaction: %w", err)
@@ -180,22 +173,6 @@ func (db *DB) Commit(commitMsg string) (string, error) {
 		db.triggerTableChangeCallbacks(tableName)
 	}
 
-	// Mark our own commit as applied
-	db.reconciler.GetQueue().MarkApplied(&CommitAd{HLC: hlc})
-
-	// Advertise to peers with full metadata
-	db.AdvertiseCommit(&CommitAd{
-		PeerID:      metadata.Author,
-		HLC:         hlc,
-		ContentHash: metadata.ContentHash,
-		CommitHash:  commitHash,
-		Message:     commitMsg,
-		Author:      metadata.Author,
-		Email:       metadata.Email,
-		Date:        metadata.Date,
-		Signature:   metadata.Signature,
-	})
-
 	return commitHash, nil
 }
 
@@ -206,12 +183,6 @@ func (db *DB) ExecAndCommit(execFunc ExecFunc, commitMsg string) (string, error)
 
 	// Get HLC timestamp
 	hlc := db.reconciler.GetHLC().Now()
-
-	// Pull-first: apply any known earlier commits first
-	err := db.reconciler.PullEarlierCommits(hlc)
-	if err != nil {
-		db.log.Warnf("Failed to pull earlier commits: %v", err)
-	}
 
 	tx, err := db.BeginTx(db.ctx, nil)
 	if err != nil {
@@ -268,22 +239,6 @@ func (db *DB) ExecAndCommit(execFunc ExecFunc, commitMsg string) (string, error)
 	for _, tableName := range changedTables {
 		db.triggerTableChangeCallbacks(tableName)
 	}
-
-	// Mark applied
-	db.reconciler.GetQueue().MarkApplied(&CommitAd{HLC: hlc})
-
-	// Advertise with full metadata
-	db.AdvertiseCommit(&CommitAd{
-		PeerID:      author,
-		HLC:         hlc,
-		ContentHash: contentHash,
-		CommitHash:  commitHash,
-		Message:     commitMsg,
-		Author:      author,
-		Email:       email,
-		Date:        commitDate,
-		Signature:   metadata.Signature,
-	})
 
 	return commitHash, nil
 }

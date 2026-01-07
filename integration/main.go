@@ -14,6 +14,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/nustiueudinastea/doltswarm"
 	"github.com/nustiueudinastea/doltswarm/integration/p2p"
+	"github.com/nustiueudinastea/doltswarm/integration/transport/grpcswarm"
+	"github.com/nustiueudinastea/doltswarm/integration/transport/overlay"
 	"github.com/segmentio/ksuid"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
@@ -29,6 +31,8 @@ var p2pmgr *p2p.P2P
 var uiLog = &EventWriter{eventChan: make(chan []byte, 5000)}
 var dbName = "doltswarmdemo"
 var tableName = "testtable"
+var nodei *doltswarm.Node
+var signer doltswarm.Signer
 
 func catchSignals(sigs chan os.Signal, wg *sync.WaitGroup) {
 	sig := <-sigs
@@ -61,6 +65,40 @@ func p2pRun(noGUI bool, noCommits bool, commitInterval int) error {
 		return fmt.Errorf("db not initialized")
 	}
 
+	// Start gossip Node (PR3/PR4). This is best-effort; failures shouldn't prevent the demo/tests.
+	if nodei == nil && signer != nil {
+		gossip, err := p2pmgr.NewGossipSub(context.Background(), "doltswarmdemo-gossip-v1")
+		if err != nil {
+			log.Warnf("Failed to initialize GossipSub: %v", err)
+		} else {
+			providers := &grpcswarm.Providers{Src: p2pmgr}
+			tr := &overlay.Transport{G: gossip, P: providers}
+			nodei, err = doltswarm.OpenNode(doltswarm.NodeConfig{
+				Repo:      doltswarm.RepoID{RepoName: dbName},
+				Signer:    signer,
+				Transport: tr,
+				Log:       log.WithField("context", "node"),
+				DB:        dbi,
+			})
+			if err != nil {
+				log.Warnf("Failed to open Node: %v", err)
+				nodei = nil
+			} else {
+				// Make Node available to ExecSQL handler.
+				p2pmgr.SetNode(nodei)
+
+				nodeCtx, cancel := context.WithCancel(context.Background())
+				stoppers.Set("node", func() error {
+					cancel()
+					return nodei.Close()
+				})
+				go func() {
+					_ = nodei.Run(nodeCtx)
+				}()
+			}
+		}
+	}
+
 	logSystemTables("server-start")
 
 	// Handle OS signals
@@ -76,7 +114,7 @@ func p2pRun(noGUI bool, noCommits bool, commitInterval int) error {
 	}
 	stoppers.Set("p2p", p2pStopper)
 
-	updaterSopper := startCommitUpdater(noCommits, commitInterval)
+	updaterSopper := startCommitUpdater(noGUI, noCommits, commitInterval)
 	stoppers.Set("updater", updaterSopper)
 
 	if !noGUI {
@@ -154,31 +192,48 @@ func logSystemTables(tag string) {
 	}
 }
 
-func startCommitUpdater(noCommits bool, commitInterval int) func() error {
+func startCommitUpdater(noGUI bool, noCommits bool, commitInterval int) func() error {
 	log.Info("Starting commit updater")
-	updateTimer := time.NewTicker(1 * time.Second)
-	commitTimmer := time.NewTicker(time.Duration(commitInterval) * time.Second)
+	var (
+		updateTimer *time.Ticker
+		updateC     <-chan time.Time
+	)
+	if !noGUI {
+		updateTimer = time.NewTicker(1 * time.Second)
+		updateC = updateTimer.C
+	}
+
+	var (
+		commitTimmer *time.Ticker
+		commitC      <-chan time.Time
+	)
+	if !noCommits {
+		commitTimmer = time.NewTicker(time.Duration(commitInterval) * time.Second)
+		commitC = commitTimmer.C
+	}
 	stopSignal := make(chan struct{})
 	go func() {
 		for {
 			select {
-			case <-updateTimer.C:
+			case <-stopSignal:
+				log.Info("Stopping commit updater")
+				return
+			case <-updateC:
+				// GUI-only: poll commit list for display.
 				commits, err := dbi.GetAllCommits()
 				if err != nil {
 					log.Errorf("failed to retrieve all commits: %s", err.Error())
 					continue
 				}
 				commitListChan <- commits
-			case timer := <-commitTimmer.C:
-				if noCommits {
+			case timer := <-commitC:
+
+				uid, genErr := ksuid.NewRandom()
+				if genErr != nil {
+					log.Errorf("failed to create uid: %s", genErr.Error())
 					continue
 				}
 
-				uid, err := ksuid.NewRandom()
-				if err != nil {
-					log.Errorf("failed to create uid: %s", err.Error())
-					continue
-				}
 				queryString := fmt.Sprintf("INSERT INTO %s (id, name) VALUES ('%s', '%s');", tableName, uid.String(), p2pmgr.GetID()+" - "+timer.String())
 				execFunc := func(tx *sql.Tx) error {
 					_, err := tx.Exec(queryString)
@@ -188,19 +243,30 @@ func startCommitUpdater(noCommits bool, commitInterval int) func() error {
 					return nil
 				}
 
-				commitHash, err := dbi.ExecAndCommit(execFunc, "Periodic commit at "+timer.String())
+				var (
+					commitHash string
+					err        error
+				)
+				if nodei != nil {
+					commitHash, err = nodei.ExecAndCommit(execFunc, "Periodic commit at "+timer.String())
+				} else {
+					commitHash, err = dbi.ExecAndCommit(execFunc, "Periodic commit at "+timer.String())
+				}
 				if err != nil {
 					log.Errorf("Failed to insert time: %s", err.Error())
 					continue
 				}
 				log.Infof("Inserted time '%s' into db with commit '%s'", timer.String(), commitHash)
-			case <-stopSignal:
-				log.Info("Stopping commit updater")
-				return
 			}
 		}
 	}()
 	stopper := func() error {
+		if updateTimer != nil {
+			updateTimer.Stop()
+		}
+		if commitTimmer != nil {
+			commitTimmer.Stop()
+		}
 		stopSignal <- struct{}{}
 		return nil
 	}
@@ -246,16 +312,58 @@ func Init(localInit bool, peerInit string, port int) error {
 		var p2pStopper func() error
 		var err error
 
+		// Create a local DB environment first, then start P2P (so the chunkstore server can initialize).
+		if err := dbi.InitLocal(); err != nil {
+			return fmt.Errorf("failed to init local db for peer bootstrap: %w", err)
+		}
+
 		p2pStopper, err = p2pmgr.StartServer()
 		if err != nil {
 			panic(err)
 		}
 		defer p2pStopper() // Always stop P2P server on exit
 
-		err = dbi.InitFromPeer(peerInit)
-		if err != nil {
-			return fmt.Errorf("error initialising from peer: %w", err)
+		gossip, gErr := p2pmgr.NewGossipSub(context.Background(), "doltswarmdemo-gossip-v1")
+		if gErr != nil {
+			return fmt.Errorf("failed to init gossip: %w", gErr)
 		}
+		providers := &grpcswarm.Providers{Src: p2pmgr}
+		tr := &overlay.Transport{G: gossip, P: providers}
+		node, nErr := doltswarm.OpenNode(doltswarm.NodeConfig{
+			Repo:      doltswarm.RepoID{RepoName: dbName},
+			Signer:    signer,
+			Transport: tr,
+			Log:       log.WithField("context", "node-init"),
+			DB:        dbi,
+		})
+		if nErr != nil {
+			return fmt.Errorf("failed to open node: %w", nErr)
+		}
+		defer node.Close()
+
+		// Wait briefly for at least one provider connection (bootstrap peer).
+		waitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		for len(p2pmgr.SnapshotConns()) == 0 {
+			if waitCtx.Err() != nil {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		cancel()
+
+		syncCtx, cancelSync := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancelSync()
+		for {
+			changed, sErr := node.Sync(syncCtx)
+			if sErr != nil {
+				return fmt.Errorf("sync failed: %w", sErr)
+			}
+			if !changed {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+
 		logSystemTables("init-peer")
 
 		return nil
@@ -298,6 +406,7 @@ func main() {
 		if err != nil {
 			return fmt.Errorf("failed to create key: %v", err)
 		}
+		signer = p2pKey
 
 		dbi, err = doltswarm.Open(workDir, dbName, log.WithField("context", "db"), p2pKey)
 		if err != nil {

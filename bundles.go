@@ -7,6 +7,7 @@ import (
 
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/hash"
+	"github.com/dolthub/dolt/go/store/nbs"
 	"github.com/dolthub/dolt/go/store/types"
 )
 
@@ -72,9 +73,21 @@ func (db *DB) BuildBundleSince(ctx context.Context, base Checkpoint, req BundleR
 		headHLC = meta.HLC
 	}
 
+	csAny, err := db.GetChunkStore()
+	if err != nil {
+		return CommitBundle{}, err
+	}
+	cs, ok := csAny.(chunks.ChunkStore)
+	if !ok {
+		// db.GetChunkStore() returns chunks.ChunkStore today, but be defensive.
+		return CommitBundle{}, fmt.Errorf("GetChunkStore returned %T (expected chunks.ChunkStore)", csAny)
+	}
+
 	out := CommitBundle{
 		Header: BundleHeader{
 			Base:             base,
+			NbfVersion:       cs.Version(),
+			NbsVersion:       nbs.StorageVersion,
 			ProviderHeadHLC:  headHLC,
 			ProviderHeadHash: head.Hash,
 		},
@@ -105,16 +118,6 @@ func (db *DB) BuildBundleSince(ctx context.Context, base Checkpoint, req BundleR
 		})
 	}
 
-	csAny, err := db.GetChunkStore()
-	if err != nil {
-		return CommitBundle{}, err
-	}
-	cs, ok := csAny.(chunks.ChunkStore)
-	if !ok {
-		// db.GetChunkStore() returns chunks.ChunkStore today, but be defensive.
-		return CommitBundle{}, fmt.Errorf("GetChunkStore returned %T (expected chunks.ChunkStore)", csAny)
-	}
-
 	seed := make([]hash.Hash, 0, len(out.Commits)+1)
 	if base.CommitHash != "" {
 		if h, ok := hash.MaybeParse(base.CommitHash); ok {
@@ -127,7 +130,12 @@ func (db *DB) BuildBundleSince(ctx context.Context, base Checkpoint, req BundleR
 		}
 	}
 
-	chunksOut, err := walkChunkClosure(ctx, cs, seed, req.MaxBytes, req.AllowPartial)
+	nbf, err := types.GetFormatForVersionString(cs.Version())
+	if err != nil {
+		return CommitBundle{}, fmt.Errorf("unknown nbf version %q: %w", cs.Version(), err)
+	}
+
+	chunksOut, err := walkChunkClosure(ctx, cs, nbf, seed, req.MaxBytes, req.AllowPartial)
 	if err != nil {
 		return CommitBundle{}, err
 	}
@@ -136,7 +144,7 @@ func (db *DB) BuildBundleSince(ctx context.Context, base Checkpoint, req BundleR
 	return out, nil
 }
 
-func walkChunkClosure(ctx context.Context, cs chunks.ChunkStore, seeds []hash.Hash, maxBytes int64, allowPartial bool) ([]BundledChunk, error) {
+func walkChunkClosure(ctx context.Context, cs chunks.ChunkStore, nbf *types.NomsBinFormat, seeds []hash.Hash, maxBytes int64, allowPartial bool) ([]BundledChunk, error) {
 	visited := make(map[hash.Hash]struct{})
 	queue := make([]hash.Hash, 0, len(seeds))
 	queue = append(queue, seeds...)
@@ -169,19 +177,31 @@ func walkChunkClosure(ctx context.Context, cs chunks.ChunkStore, seeds []hash.Ha
 		}
 		total += int64(len(data))
 
+		// Copy hash/data out of store-owned memory.
+		hashBytes := make([]byte, hash.ByteLen)
+		copy(hashBytes, h[:])
+		dataBytes := make([]byte, len(data))
+		copy(dataBytes, data)
+
 		out = append(out, BundledChunk{
-			Hash:  h[:],
-			Data:  data,
+			Hash:  hashBytes,
+			Data:  dataBytes,
 			Codec: ChunkCodecRaw,
 		})
 
-		_ = types.SerialMessage(data).WalkAddrs(types.Format_Default, func(addr hash.Hash) error {
+		children := make(hash.HashSet)
+		_ = types.AddrsFromNomsValue(ch, nbf, children)
+		for addr := range children {
 			if _, ok := visited[addr]; ok {
-				return nil
+				continue
 			}
 			queue = append(queue, addr)
-			return nil
-		})
+		}
+	}
+
+	// Put requires child refs to exist; ensure chunks come first.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 
 	return out, nil
@@ -197,13 +217,27 @@ func (db *DB) ImportBundle(ctx context.Context, bundle CommitBundle) error {
 		return err
 	}
 
+	if bundle.Header.NbfVersion != "" && cs.Version() != bundle.Header.NbfVersion {
+		return fmt.Errorf("bundle nbf_version %q incompatible with local %q", bundle.Header.NbfVersion, cs.Version())
+	}
+	if bundle.Header.NbsVersion != "" && bundle.Header.NbsVersion != nbs.StorageVersion {
+		return fmt.Errorf("bundle nbs_version %q incompatible with local %q", bundle.Header.NbsVersion, nbs.StorageVersion)
+	}
+
 	root, err := cs.Root(ctx)
 	if err != nil {
 		return err
 	}
 
-	noopGetAddrs := func(_ chunks.Chunk) chunks.GetAddrsCb {
-		return func(context.Context, hash.HashSet, chunks.PendingRefExists) error { return nil }
+	nbf, err := types.GetFormatForVersionString(cs.Version())
+	if err != nil {
+		return fmt.Errorf("unknown nbf version %q: %w", cs.Version(), err)
+	}
+
+	getAddrs := func(c chunks.Chunk) chunks.GetAddrsCb {
+		return func(ctx context.Context, addrs hash.HashSet, _ chunks.PendingRefExists) error {
+			return types.AddrsFromNomsValue(c, nbf, addrs)
+		}
 	}
 
 	for _, bc := range bundle.Chunks {
@@ -224,12 +258,28 @@ func (db *DB) ImportBundle(ctx context.Context, bundle CommitBundle) error {
 			return fmt.Errorf("chunk hash mismatch for %s", h.String())
 		}
 
-		if err := cs.Put(ctx, chunks.NewChunkWithHash(h, data), noopGetAddrs); err != nil {
+		if err := cs.Put(ctx, chunks.NewChunkWithHash(h, data), getAddrs); err != nil {
 			return err
 		}
 	}
 
 	// Persist new chunks without changing root.
-	_, err = cs.Commit(ctx, root, root)
-	return err
+	const commitRetries = 3
+	for i := 0; i < commitRetries; i++ {
+		ok, err := cs.Commit(ctx, root, root)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if err := cs.Rebase(ctx); err != nil {
+			return err
+		}
+		root, err = cs.Root(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("failed to commit imported chunks (root changed concurrently)")
 }

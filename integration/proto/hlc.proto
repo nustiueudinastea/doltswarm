@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+option go_package = "./proto";
+
+package proto;
+
+// HLCTimestamp is the on-wire representation of doltswarm.HLCTimestamp.
+message HLCTimestamp {
+  int64 wall = 1;
+  int32 logical = 2;
+  string peer_id = 3;
+}
+

@@ -15,6 +15,7 @@ require (
 	github.com/dolthub/dolt/go v0.40.5-0.20250916084833-f121f4db6fdd
 	github.com/gdamore/tcell/v2 v2.13.4
 	github.com/libp2p/go-libp2p v0.46.0
+	github.com/libp2p/go-libp2p-pubsub v0.15.0
 	github.com/martinlindhe/base36 v1.1.1
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/nustiueudinastea/doltswarm v0.0.0-20251223121043-d02414c0ae2b
@@ -113,6 +114,7 @@ require (
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/gocraft/dbr/v2 v2.7.7 // indirect
 	github.com/gofrs/flock v0.13.0 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect

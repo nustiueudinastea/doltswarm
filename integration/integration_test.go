@@ -591,13 +591,6 @@ func countTrue(m map[string]bool) int {
 // testDB is a mock database for the test harness
 type testDB struct{}
 
-func (pr *testDB) AddPeer(peer doltswarm.Peer) error {
-	return nil
-}
-func (pr *testDB) RemovePeer(peerID string) error {
-	return nil
-}
-
 func (pr *testDB) GetAllCommits() ([]doltswarm.Commit, error) {
 	return []doltswarm.Commit{}, nil
 }
@@ -606,16 +599,8 @@ func (pr *testDB) ExecAndCommit(execFunc doltswarm.ExecFunc, commitMsg string) (
 	return "", nil
 }
 
-func (pr *testDB) InitFromPeer(peerID string) error {
-	return nil
-}
-
 func (pr *testDB) GetLastCommit(branch string) (doltswarm.Commit, error) {
 	return doltswarm.Commit{}, nil
-}
-
-func (pr *testDB) Initialized() bool {
-	return false
 }
 
 // dockerTestSetup holds Docker test infrastructure
@@ -1596,7 +1581,11 @@ func TestCommitOrderConsistency(t *testing.T) {
 
 	// Interleaved writes: each peer writes one commit in round-robin fashion
 	rounds := 3
-	allCommits := []string{}
+	startCommitsResp, err := clients[0].GetAllCommits(ctx, &p2pproto.GetAllCommitsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCount := len(startCommitsResp.Commits)
 
 	for round := 0; round < rounds; round++ {
 		roundStart := time.Now()
@@ -1614,7 +1603,6 @@ func TestCommitOrderConsistency(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			allCommits = append(allCommits, resp.Commit)
 			logger.Infof("Round %d, Peer %d (%s): commit %s", round, i, client.GetID()[:12], resp.Commit)
 
 			// Small delay between writes to allow propagation
@@ -1670,22 +1658,12 @@ func TestCommitOrderConsistency(t *testing.T) {
 		logger.Infof("Final history convergence: %d nodes have identical commit order with %d total commits in %v (total verification took %v)",
 			numNodes, len(refCommits), historyResult.Duration, time.Since(finalStart))
 
-		// Verify all our created commits are present
-		missingCommits := []string{}
-		for _, c := range allCommits {
-			found := false
-			for _, rc := range refCommits {
-				if c == rc {
-					found = true
-					break
-				}
-			}
-			if !found {
-				missingCommits = append(missingCommits, c)
-			}
-		}
-		if len(missingCommits) > 0 {
-			t.Errorf("missing %d commits from history: %v", len(missingCommits), missingCommits)
+		// Commit hashes may be rewritten during deterministic replay (parent changes), so we only
+		// assert that no commits were dropped: history length must increase by exactly rounds*numNodes.
+		expected := startCount + (rounds * numNodes)
+		if len(refCommits) != expected {
+			t.Errorf("unexpected commit count: got=%d expected=%d (start=%d rounds=%d nodes=%d)",
+				len(refCommits), expected, startCount, rounds, numNodes)
 		}
 	}
 }

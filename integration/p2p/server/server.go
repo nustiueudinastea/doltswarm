@@ -15,17 +15,17 @@ var _ proto.PingerServer = (*Server)(nil)
 var _ proto.TesterServer = (*Server)(nil)
 
 type ExternalDB interface {
-	AddPeer(peer doltswarm.Peer) error
-	RemovePeer(peerID string) error
 	GetAllCommits() ([]doltswarm.Commit, error)
 	ExecAndCommit(execFunc doltswarm.ExecFunc, commitMsg string) (string, error)
 	GetLastCommit(branch string) (doltswarm.Commit, error)
-	InitFromPeer(peerID string) error
-	Initialized() bool
 }
 
 type Server struct {
-	DB ExternalDB
+	proto.UnimplementedPingerServer
+	proto.UnimplementedTesterServer
+
+	DB   ExternalDB
+	Node *doltswarm.Node
 }
 
 func (s *Server) Ping(ctx context.Context, req *proto.PingRequest) (*proto.PingResponse, error) {
@@ -49,7 +49,15 @@ func (s *Server) ExecSQL(ctx context.Context, req *proto.ExecSQLRequest) (*proto
 		return nil
 	}
 
-	commit, err := s.DB.ExecAndCommit(execFunc, req.Msg)
+	var (
+		commit string
+		err    error
+	)
+	if s.Node != nil {
+		commit, err = s.Node.ExecAndCommit(execFunc, req.Msg)
+	} else {
+		commit, err = s.DB.ExecAndCommit(execFunc, req.Msg)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +65,15 @@ func (s *Server) ExecSQL(ctx context.Context, req *proto.ExecSQLRequest) (*proto
 }
 
 func (s *Server) GetAllCommits(context.Context, *proto.GetAllCommitsRequest) (*proto.GetAllCommitsResponse, error) {
-	commits, err := s.DB.GetAllCommits()
+	var (
+		commits []doltswarm.Commit
+		err     error
+	)
+	if s.Node != nil {
+		commits, err = s.Node.GetAllCommits()
+	} else {
+		commits, err = s.DB.GetAllCommits()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +87,15 @@ func (s *Server) GetAllCommits(context.Context, *proto.GetAllCommitsRequest) (*p
 }
 
 func (s *Server) GetHead(context.Context, *proto.GetHeadRequest) (*proto.GetHeadResponse, error) {
-	commit, err := s.DB.GetLastCommit("main")
+	var (
+		commit doltswarm.Commit
+		err    error
+	)
+	if s.Node != nil {
+		commit, err = s.Node.GetLastCommit("main")
+	} else {
+		commit, err = s.DB.GetLastCommit("main")
+	}
 	if err != nil {
 		return nil, err
 	}

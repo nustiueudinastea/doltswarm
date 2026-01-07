@@ -27,6 +27,14 @@ func NewMemoryCommitIndex() *MemoryCommitIndex {
 
 func (m *MemoryCommitIndex) Close() error { return nil }
 
+func (m *MemoryCommitIndex) resetForRebuild() {
+	m.entries = make(map[string]CommitIndexEntry)
+	m.headSet = false
+	m.headHLC = HLCTimestamp{}
+	m.headHash = ""
+	m.checkpoints = nil
+}
+
 func (m *MemoryCommitIndex) Upsert(_ context.Context, e CommitIndexEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -99,4 +107,3 @@ func (m *MemoryCommitIndex) AppendCheckpoint(_ context.Context, cp Checkpoint) e
 	m.checkpoints = append([]Checkpoint{cp}, m.checkpoints...)
 	return nil
 }
-

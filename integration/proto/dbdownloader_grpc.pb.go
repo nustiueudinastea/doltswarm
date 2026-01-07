@@ -78,14 +78,15 @@ func (c *downloaderClient) DownloadChunks(ctx context.Context, in *DownloadChunk
 type Downloader_DownloadChunksClient = grpc.ServerStreamingClient[DownloadChunksResponse]
 
 // DownloaderServer is the server API for Downloader service.
-// All implementations should embed UnimplementedDownloaderServer
+// All implementations must embed UnimplementedDownloaderServer
 // for forward compatibility.
 type DownloaderServer interface {
 	DownloadFile(*DownloadFileRequest, grpc.ServerStreamingServer[DownloadFileResponse]) error
 	DownloadChunks(*DownloadChunksRequest, grpc.ServerStreamingServer[DownloadChunksResponse]) error
+	mustEmbedUnimplementedDownloaderServer()
 }
 
-// UnimplementedDownloaderServer should be embedded to have
+// UnimplementedDownloaderServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
@@ -98,7 +99,8 @@ func (UnimplementedDownloaderServer) DownloadFile(*DownloadFileRequest, grpc.Ser
 func (UnimplementedDownloaderServer) DownloadChunks(*DownloadChunksRequest, grpc.ServerStreamingServer[DownloadChunksResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method DownloadChunks not implemented")
 }
-func (UnimplementedDownloaderServer) testEmbeddedByValue() {}
+func (UnimplementedDownloaderServer) mustEmbedUnimplementedDownloaderServer() {}
+func (UnimplementedDownloaderServer) testEmbeddedByValue()                    {}
 
 // UnsafeDownloaderServer may be embedded to opt out of forward compatibility for this service.
 // Use of this interface is not recommended, as added methods to DownloaderServer will

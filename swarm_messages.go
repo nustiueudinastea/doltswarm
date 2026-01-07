@@ -45,11 +45,21 @@ type BundleRequest struct {
 	MaxBytes           int64
 	AllowPartial       bool
 	IncludeDiagnostics bool
+
+	// WantHLC is an optional hint used by transport implementations for provider selection.
+	// If set, the Exchange should prefer providers that can supply a commit with this HLC.
+	//
+	// This field is intentionally transport-only: it does not need to be serialized on the wire.
+	WantHLC HLCTimestamp
 }
 
 type BundleHeader struct {
 	Repo RepoID
 	Base Checkpoint
+
+	// Storage format of the provider's bundle. Receivers must reject incompatible bundles.
+	NbfVersion string
+	NbsVersion string
 
 	ProviderHeadHLC  HLCTimestamp
 	ProviderHeadHash string
@@ -71,7 +81,7 @@ type BundledCommit struct {
 type ChunkCodec uint32
 
 const (
-	ChunkCodecRaw          ChunkCodec = 0
+	ChunkCodecRaw           ChunkCodec = 0
 	ChunkCodecNBSCompressed ChunkCodec = 1
 )
 
