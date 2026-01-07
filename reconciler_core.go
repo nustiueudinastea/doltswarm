@@ -42,19 +42,26 @@ type Reconciler struct {
 	db  *DB
 	hlc *HLC
 
-	queue *CommitQueue
-	log   *logrus.Entry
+	log *logrus.Entry
 
-	onCommitRejected CommitRejectedCallback
+	onCommitRejectedInternal CommitRejectedCallback
+	onCommitRejected         CommitRejectedCallback
 }
 
 func NewReconciler(db *DB, peerID string, log *logrus.Entry) *Reconciler {
 	return &Reconciler{
-		db:    db,
-		hlc:   NewHLC(peerID),
-		queue: NewCommitQueue(),
-		log:   log.WithField("component", "reconciler"),
+		db:  db,
+		hlc: NewHLC(peerID),
+		log: log.WithField("component", "reconciler"),
 	}
+}
+
+// setCommitRejectedInternalHook registers an internal callback invoked for rejected commits.
+// It is intended for the Node to keep its local CommitIndex consistent (e.g. mark conflict drops as handled).
+func (r *Reconciler) setCommitRejectedInternalHook(cb CommitRejectedCallback) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onCommitRejectedInternal = cb
 }
 
 func (r *Reconciler) SetCommitRejectedCallback(cb CommitRejectedCallback) {
@@ -66,8 +73,6 @@ func (r *Reconciler) SetCommitRejectedCallback(cb CommitRejectedCallback) {
 func (r *Reconciler) Stop() {}
 
 func (r *Reconciler) GetHLC() *HLC { return r.hlc }
-
-func (r *Reconciler) GetQueue() *CommitQueue { return r.queue }
 
 // ReplayImported replays main from mergeBase, incorporating the provided imported commits.
 //
@@ -176,8 +181,9 @@ func (r *Reconciler) replayToTempBranchThenUpdateMain(ctx context.Context, merge
 						HLC:        meta.HLC,
 						CommitHash: cwm.commit.Hash,
 					}
-					r.queue.MarkApplied(ad)
-					r.queue.Remove(ad)
+					if r.onCommitRejectedInternal != nil {
+						r.onCommitRejectedInternal(ad, RejectedConflict)
+					}
 					if r.onCommitRejected != nil {
 						r.onCommitRejected(ad, RejectedConflict)
 					}

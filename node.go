@@ -113,14 +113,27 @@ func OpenNode(cfg NodeConfig) (*Node, error) {
 	// This is idempotent and best-effort; failures will be surfaced during fetch.
 	_ = db.EnsureSwarmRemote(context.Background(), cfg.Repo)
 
-	return &Node{
+	n := &Node{
 		cfg:           cfg,
 		db:            db,
 		idx:           NewMemoryCommitIndex(),
 		ownsDB:        ownsDB,
 		hintProviders: make(map[HLCTimestamp]string),
 		peerHeads:     make(map[string]HLCTimestamp),
-	}, nil
+	}
+
+	n.installReconcilerHooks()
+
+	return n, nil
+}
+
+// SetCommitRejectedCallback registers a callback invoked when a commit is deterministically dropped
+// during reconciliation (e.g. due to a conflict under FWW).
+func (n *Node) SetCommitRejectedCallback(cb CommitRejectedCallback) {
+	if n == nil || n.db == nil {
+		return
+	}
+	n.db.SetCommitRejectedCallback(cb)
 }
 
 func (n *Node) Close() error {
@@ -132,6 +145,27 @@ func (n *Node) Close() error {
 		return nil
 	}
 	return n.db.Close()
+}
+
+func (n *Node) installReconcilerHooks() {
+	if n == nil || n.db == nil || n.db.reconciler == nil || n.idx == nil {
+		return
+	}
+
+	// Keep the Node's CommitIndex authoritative for "handled vs pending" state. The reconciler itself
+	// is local-only and does not track a durable queue of adverts.
+	n.db.reconciler.setCommitRejectedInternalHook(func(ad *CommitAd, reason RejectionReason) {
+		_ = reason
+		if ad == nil || ad.HLC.IsZero() {
+			return
+		}
+		_ = n.idx.Upsert(context.Background(), CommitIndexEntry{
+			HLC:        ad.HLC,
+			CommitHash: ad.CommitHash,
+			Status:     CommitStatusRejected,
+			UpdatedAt:  time.Now(),
+		})
+	})
 }
 
 func (n *Node) Commit(msg string) (string, error) {
@@ -454,6 +488,16 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 	if ad.Repo != n.cfg.Repo {
 		return
 	}
+
+	// If we've already decided an HLC is applied or rejected, ignore repeated adverts.
+	if n.idx != nil {
+		if e, ok, _ := n.idx.Get(ctx, ad.HLC); ok {
+			if e.Status == CommitStatusApplied || e.Status == CommitStatusRejected {
+				return
+			}
+		}
+	}
+
 	n.observeProvider(from, ad.HLC)
 	n.rememberHintProvider(ad.HLC, from)
 	// Ignore our own adverts; local commits are already present and indexed.
@@ -475,9 +519,19 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 		return
 	}
 	if !meta.HLC.Equal(ad.HLC) {
+		_ = n.idx.Upsert(ctx, CommitIndexEntry{
+			HLC:       ad.HLC,
+			Status:    CommitStatusRejected,
+			UpdatedAt: time.Now(),
+		})
 		return
 	}
 	if len(ad.MetadataSig) > 0 && meta.Signature != string(ad.MetadataSig) {
+		_ = n.idx.Upsert(ctx, CommitIndexEntry{
+			HLC:       ad.HLC,
+			Status:    CommitStatusRejected,
+			UpdatedAt: time.Now(),
+		})
 		return
 	}
 
@@ -539,7 +593,7 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 			continue
 		}
 		e, ok, _ := n.idx.Get(ctx, cp.HLC)
-		if !ok || e.Status != CommitStatusApplied || (e.CommitHash != "" && e.CommitHash != cp.CommitHash) {
+		if !ok || (e.Status != CommitStatusApplied && e.Status != CommitStatusRejected) || (e.CommitHash != "" && e.CommitHash != cp.CommitHash) {
 			requestSync(cp.HLC)
 		}
 	}
@@ -597,6 +651,18 @@ func (n *Node) initIndexFromDB(ctx context.Context) error {
 		return nil
 	}
 
+	// Preserve non-applied entries (e.g. rejected conflict drops) across rebuilds.
+	// initIndexFromDB is called after fetch/replay to refresh applied hashes, but it should not
+	// re-open already-settled "handled" decisions like rejections.
+	var preserved []CommitIndexEntry
+	if entries, err := n.idx.ListAfter(ctx, HLCTimestamp{}, 0); err == nil {
+		for _, e := range entries {
+			if e.Status != CommitStatusApplied && e.Status != CommitStatusUnknown {
+				preserved = append(preserved, e)
+			}
+		}
+	}
+
 	if mi, ok := n.idx.(*MemoryCommitIndex); ok {
 		mi.mu.Lock()
 		mi.resetForRebuild()
@@ -636,6 +702,15 @@ func (n *Node) initIndexFromDB(ctx context.Context) error {
 	head, headMeta, err := n.getHeadMeta(ctx)
 	if err == nil && headMeta != nil {
 		_ = n.idx.SetHead(ctx, headMeta.HLC, head.Hash)
+	}
+
+	// Re-apply preserved non-applied entries unless they became applied during rebuild.
+	for _, e := range preserved {
+		cur, ok, _ := n.idx.Get(ctx, e.HLC)
+		if ok && cur.Status == CommitStatusApplied {
+			continue
+		}
+		_ = n.idx.Upsert(ctx, e)
 	}
 
 	return nil
