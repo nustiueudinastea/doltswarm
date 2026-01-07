@@ -448,6 +448,9 @@ func (n *Node) publishDigestBestEffort() {
 }
 
 func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, requestSync func(HLCTimestamp)) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if ad.Repo != n.cfg.Repo {
 		return
 	}
@@ -478,7 +481,31 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 		return
 	}
 
-	// Best-effort: accept remote commits until key distribution is wired.
+	// Verify remote metadata signatures when an identity resolver is configured.
+	//
+	// Without an IdentityResolver, the node accepts remote adverts (best-effort) to avoid
+	// false rejections in deployments that haven't wired key distribution yet.
+	if n.cfg.Identity != nil {
+		pub, err := n.cfg.Identity.PublicKeyForPeerID(ctx, ad.HLC.PeerID)
+		if err != nil || len(pub) == 0 {
+			// Strict mode: when an identity resolver is configured, do not accept unverifiable adverts.
+			_ = n.idx.Upsert(ctx, CommitIndexEntry{
+				HLC:       ad.HLC,
+				Status:    CommitStatusRejected,
+				UpdatedAt: time.Now(),
+			})
+			return
+		}
+		if n.cfg.Signer == nil || meta.Verify(n.cfg.Signer, string(pub)) != nil {
+			_ = n.idx.Upsert(ctx, CommitIndexEntry{
+				HLC:       ad.HLC,
+				Status:    CommitStatusRejected,
+				UpdatedAt: time.Now(),
+			})
+			return
+		}
+	}
+
 	_ = n.idx.Upsert(ctx, CommitIndexEntry{
 		HLC:       ad.HLC,
 		Status:    CommitStatusPending,

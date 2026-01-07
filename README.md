@@ -37,7 +37,7 @@ Local write:
   → Publish CommitAd(repo, HLC, metadata_json, metadata_sig)
 
 Remote reception:
-  Receive CommitAd → validate basic invariants + skew guard (remote signature verification is TODO) → mark HLC as pending
+  Receive CommitAd → validate basic invariants + skew guard → verify metadata signature (when IdentityResolver is configured) → mark HLC as pending
   → trigger a sync pass (debounced)
 
 Sync pass:
@@ -101,7 +101,8 @@ Most consumers should use `Node` and treat transport as a plug-in.
 
 `NodeConfig` requires:
 - `Repo` (`RepoID{Org, RepoName}`): logical repo identity.
-- `Signer`: signs metadata for local commits. Remote metadata verification is planned via `IdentityResolver`, but not fully enforced yet.
+- `Signer`: signs metadata for local commits and provides `Verify` for remote signature checks.
+- `Identity` (optional): if set, incoming commit adverts are verified against peer public keys; unverifiable/invalid adverts are rejected.
 - `Transport`: provides (1) gossip message delivery and (2) a provider picker for the read-only data plane.
 
 ### Minimal usage (transport ignored)

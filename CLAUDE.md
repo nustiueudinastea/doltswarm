@@ -54,7 +54,7 @@ The core library does not “address peers”. Provider selection is an implemen
 - For `CommitAdV1`:
   - rejects adverts with future-skewed HLC wall time
   - checks metadata JSON parses and HLC matches
-  - **TODO**: verify remote metadata signatures via `NodeConfig.Identity`
+  - verifies metadata signatures when `NodeConfig.Identity` is configured (unverifiable/invalid adverts are rejected)
   - marks the HLC as pending in the local index and triggers a debounced sync pass
 - For `DigestV1`:
   - triggers sync if the remote head is ahead, or if checkpoints reveal a gap
@@ -77,7 +77,7 @@ The core library does not “address peers”. Provider selection is an implemen
 
 - Each commit message is JSON metadata (`CommitMetadata`) signed by the author.
 - Commit-hash tag signatures exist but are **secondary** (commit hashes can change during replay).
-- Remote signature verification is planned via `NodeConfig.Identity` and is not fully enforced yet.
+- Remote signature verification is enforced for commit adverts when `NodeConfig.Identity` is configured; otherwise adverts are accepted best-effort.
 
 ## Integration demo and tests
 
