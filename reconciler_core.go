@@ -23,8 +23,9 @@ const (
 	RejectedClockSkew
 )
 
-// errMainAdvanced indicates that main branch advanced during a replay operation.
-var errMainAdvanced = fmt.Errorf("main branch advanced during replay")
+// errMainAdvancedDuringReplay indicates that main branch advanced while we were building a replay result.
+// Callers should restart from the new merge base (never reset main back in time mid-replay).
+var errMainAdvancedDuringReplay = fmt.Errorf("main branch advanced during replay")
 
 type sqlRunner interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -101,7 +102,7 @@ func (r *Reconciler) ReplayImported(ctx context.Context, mergeBase string, impor
 		return nil
 	}
 
-	return r.cherryPickReplaySetSafe(ctx, mergeBase, head.Hash, allCommits)
+	return r.replayToTempBranchThenUpdateMain(ctx, mergeBase, head.Hash, allCommits)
 }
 
 func deduplicateByHLCDeterministic(commits []commitWithMeta) []commitWithMeta {
@@ -135,7 +136,12 @@ func deduplicateByHLCDeterministic(commits []commitWithMeta) []commitWithMeta {
 	return result
 }
 
-func (r *Reconciler) cherryPickReplaySetSafe(ctx context.Context, mergeBase string, expectedHead string, allCommits []commitWithMeta) error {
+// replayToTempBranchThenUpdateMain deterministically rebuilds the post-mergeBase history on a temp branch,
+// then updates `main` to match that temp branch if (and only if) `main` hasn't advanced concurrently.
+//
+// Important: this is a history-rewrite operation by design (linearization). The temp branch is based on
+// mergeBase, commits are cherry-picked in HLC order, and then `main` is moved to the rebuilt tip.
+func (r *Reconciler) replayToTempBranchThenUpdateMain(ctx context.Context, mergeBase string, mainHeadBefore string, allCommits []commitWithMeta) error {
 	conn, err := r.db.sqldb.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get sql connection: %w", err)
@@ -191,10 +197,14 @@ func (r *Reconciler) cherryPickReplaySetSafe(ctx context.Context, mergeBase stri
 	if err != nil {
 		return fmt.Errorf("failed to read main head: %w", err)
 	}
-	if curHead.Hash != expectedHead {
-		return errMainAdvanced
+	if curHead.Hash != mainHeadBefore {
+		return errMainAdvancedDuringReplay
 	}
 
+	// Atomically update `main` to the rebuilt history.
+	//
+	// This is intentionally performed as the last step, after `mainHeadBefore` validation, so crashes or
+	// errors during replay do not corrupt `main`.
 	_, err = conn.ExecContext(ctx, "CALL DOLT_RESET('--hard', 'replay_tmp');")
 	if err != nil {
 		return fmt.Errorf("failed to move main to replay_tmp: %w", err)
