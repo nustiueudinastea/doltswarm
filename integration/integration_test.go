@@ -184,6 +184,165 @@ type ConvergenceResult struct {
 	Duration          time.Duration
 }
 
+// WriteBatchTiming tracks timing from when writes start to when HEAD converges
+// This is the correct approach because commit hashes change during reconciliation
+type WriteBatchTiming struct {
+	Description       string        // e.g., "commit 0", "round 1", "concurrent batch"
+	CommitsCreated    int           // Number of commits in this batch
+	WriteStartedAt    time.Time     // When writes began
+	WriteCompletedAt  time.Time     // When all writes completed
+	ConvergedAt       time.Time     // When HEAD convergence was achieved
+	WriteDuration     time.Duration // Time to execute writes
+	ConvergenceDuration time.Duration // Time from write completion to convergence
+	TotalPropagation  time.Duration // Time from first write to convergence
+}
+
+// RoundMetrics tracks timing for a round of writes
+type RoundMetrics struct {
+	RoundNumber         int
+	WritesDuration      time.Duration // Time to execute all writes in the round
+	ConvergenceDuration time.Duration // Time for convergence check to succeed
+	TotalDuration       time.Duration // Total round time
+	CommitsCreated      int
+}
+
+// TestMetrics aggregates all timing metrics for a test
+type TestMetrics struct {
+	TestName           string
+	StartTime          time.Time
+	EndTime            time.Time
+	TotalDuration      time.Duration
+	NumPeers           int
+	TotalCommits       int
+	BatchTimings       []*WriteBatchTiming
+	RoundMetrics       []*RoundMetrics
+	HeadConvergence    *ConvergenceResult
+	HistoryConvergence *ConvergenceResult
+	// Computed stats
+	AvgPropagationTime time.Duration
+	MaxPropagationTime time.Duration
+	MinPropagationTime time.Duration
+	TotalWriteTime     time.Duration
+	TotalConvergenceTime time.Duration
+}
+
+// NewTestMetrics creates a new TestMetrics instance
+func NewTestMetrics(testName string, numPeers int) *TestMetrics {
+	return &TestMetrics{
+		TestName:     testName,
+		StartTime:    time.Now(),
+		NumPeers:     numPeers,
+		BatchTimings: make([]*WriteBatchTiming, 0),
+		RoundMetrics: make([]*RoundMetrics, 0),
+	}
+}
+
+// AddBatchTiming adds a batch timing record
+func (m *TestMetrics) AddBatchTiming(bt *WriteBatchTiming) {
+	m.BatchTimings = append(m.BatchTimings, bt)
+	m.TotalCommits += bt.CommitsCreated
+}
+
+// AddRoundMetrics adds round metrics
+func (m *TestMetrics) AddRoundMetrics(rm *RoundMetrics) {
+	m.RoundMetrics = append(m.RoundMetrics, rm)
+}
+
+// Finalize computes aggregate statistics and marks test end
+func (m *TestMetrics) Finalize() {
+	m.EndTime = time.Now()
+	m.TotalDuration = m.EndTime.Sub(m.StartTime)
+
+	if len(m.BatchTimings) == 0 {
+		return
+	}
+
+	// Compute propagation stats from batch timings
+	var totalPropTime time.Duration
+	m.MinPropagationTime = time.Hour // Start high
+
+	for _, bt := range m.BatchTimings {
+		m.TotalWriteTime += bt.WriteDuration
+		m.TotalConvergenceTime += bt.ConvergenceDuration
+
+		if bt.TotalPropagation > 0 {
+			totalPropTime += bt.TotalPropagation
+			if bt.TotalPropagation > m.MaxPropagationTime {
+				m.MaxPropagationTime = bt.TotalPropagation
+			}
+			if bt.TotalPropagation < m.MinPropagationTime {
+				m.MinPropagationTime = bt.TotalPropagation
+			}
+		}
+	}
+
+	numBatches := len(m.BatchTimings)
+	if numBatches > 0 {
+		m.AvgPropagationTime = totalPropTime / time.Duration(numBatches)
+	}
+
+	// Reset min if no valid measurements
+	if m.MinPropagationTime == time.Hour {
+		m.MinPropagationTime = 0
+	}
+}
+
+// PrintSummary prints a comprehensive summary of test metrics
+func (m *TestMetrics) PrintSummary() {
+	logger.Info("═══════════════════════════════════════════════════════════════")
+	logger.Infof("  TEST SUMMARY: %s", m.TestName)
+	logger.Info("═══════════════════════════════════════════════════════════════")
+	logger.Infof("  Peers:                %d", m.NumPeers)
+	logger.Infof("  Total test duration:  %v", m.TotalDuration.Round(time.Millisecond))
+	logger.Info("───────────────────────────────────────────────────────────────")
+
+	if len(m.BatchTimings) > 0 {
+		logger.Info("  PROPAGATION TIMING (write start → HEAD convergence)")
+		logger.Infof("    Batches/commits:      %d batches, %d total commits", len(m.BatchTimings), m.TotalCommits)
+		logger.Infof("    Total write time:     %v", m.TotalWriteTime.Round(time.Millisecond))
+		logger.Infof("    Total convergence:    %v", m.TotalConvergenceTime.Round(time.Millisecond))
+		logger.Infof("    Avg propagation:      %v (per batch)", m.AvgPropagationTime.Round(time.Millisecond))
+		logger.Infof("    Min propagation:      %v", m.MinPropagationTime.Round(time.Millisecond))
+		logger.Infof("    Max propagation:      %v", m.MaxPropagationTime.Round(time.Millisecond))
+		logger.Info("───────────────────────────────────────────────────────────────")
+
+		// Show per-batch details
+		logger.Info("  PER-BATCH BREAKDOWN")
+		for _, bt := range m.BatchTimings {
+			logger.Infof("    %s: write=%v conv=%v total=%v",
+				bt.Description,
+				bt.WriteDuration.Round(time.Millisecond),
+				bt.ConvergenceDuration.Round(time.Millisecond),
+				bt.TotalPropagation.Round(time.Millisecond))
+		}
+		logger.Info("───────────────────────────────────────────────────────────────")
+	}
+
+	if len(m.RoundMetrics) > 0 {
+		logger.Info("  ROUND-BY-ROUND BREAKDOWN")
+		for _, rm := range m.RoundMetrics {
+			logger.Infof("    Round %d: writes=%v convergence=%v total=%v (%d commits)",
+				rm.RoundNumber,
+				rm.WritesDuration.Round(time.Millisecond),
+				rm.ConvergenceDuration.Round(time.Millisecond),
+				rm.TotalDuration.Round(time.Millisecond),
+				rm.CommitsCreated)
+		}
+		logger.Info("───────────────────────────────────────────────────────────────")
+	}
+
+	if m.HeadConvergence != nil {
+		logger.Info("  FINAL CONVERGENCE")
+		logger.Infof("    Head convergence:    %v (converged=%v)",
+			m.HeadConvergence.Duration.Round(time.Millisecond), m.HeadConvergence.Converged)
+	}
+	if m.HistoryConvergence != nil {
+		logger.Infof("    History convergence: %v (converged=%v)",
+			m.HistoryConvergence.Duration.Round(time.Millisecond), m.HistoryConvergence.Converged)
+	}
+	logger.Info("═══════════════════════════════════════════════════════════════")
+}
+
 // commitListsEqual compares two commit lists for equality (same commits in same order)
 func commitListsEqual(list1, list2 []string) bool {
 	if len(list1) != len(list2) {
@@ -484,6 +643,9 @@ func logHistoryConvergenceStatus(result *ConvergenceResult, clients []*p2p.P2PCl
 }
 
 // waitForCommitOnAllPeers waits for a specific commit to appear on all peers
+// NOTE: Due to DoltSwarm's deterministic replay, commit hashes can change during reconciliation.
+// This function is only reliable for sequential single-writer scenarios.
+// For concurrent writes, use waitForHeadConvergence instead.
 func waitForCommitOnAllPeers(
 	ctx context.Context,
 	clients []*p2p.P2PClient,
@@ -1420,48 +1582,66 @@ func TestLateJoiner(t *testing.T) {
 // TestSequentialWritesPropagation tests that sequential writes from one peer propagate to all others
 func TestSequentialWritesPropagation(t *testing.T) {
 	clients := getClients(t)
+	ctx := context.Background()
 
 	logger.Info("==== Starting TestSequentialWritesPropagation ====")
 
+	// Initialize metrics tracking
+	metrics := NewTestMetrics("TestSequentialWritesPropagation", len(clients))
+
 	// Pick first client as the writer
 	writer := clients[0]
-	commitHashes := []string{}
 
-	// Write 5 commits sequentially from one peer
-	for i := 0; i < 5; i++ {
+	// Write 5 commits sequentially from one peer, waiting for HEAD convergence after each
+	numCommits := 5
+	for i := 0; i < numCommits; i++ {
 		uid, err := ksuid.NewRandom()
 		if err != nil {
 			t.Fatal(err)
 		}
 		queryString := fmt.Sprintf("INSERT INTO %s (id, name) VALUES ('%s', 'seq write %d');", tableName, uid.String(), i)
-		resp, err := writer.ExecSQL(context.Background(), &p2pproto.ExecSQLRequest{
+
+		// Record commit creation time
+		batchTiming := &WriteBatchTiming{
+			Description:    fmt.Sprintf("commit %d", i),
+			CommitsCreated: 1,
+			WriteStartedAt: time.Now(),
+		}
+
+		resp, err := writer.ExecSQL(ctx, &p2pproto.ExecSQLRequest{
 			Statement: queryString,
 			Msg:       fmt.Sprintf("sequential write %d", i),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		commitHashes = append(commitHashes, resp.Commit)
-		logger.Infof("Created commit %d: %s", i, resp.Commit)
-	}
+		batchTiming.WriteCompletedAt = time.Now()
+		batchTiming.WriteDuration = batchTiming.WriteCompletedAt.Sub(batchTiming.WriteStartedAt)
 
-	// Verify each commit propagates to all peers
-	ctx := context.Background()
-	for i, commit := range commitHashes {
-		peerStatus, err := waitForCommitOnAllPeers(ctx, clients, commit, defaultConvergenceTimeout, defaultPollInterval)
+		shortCommit := resp.Commit
+		if len(shortCommit) > 12 {
+			shortCommit = shortCommit[:12]
+		}
+		logger.Infof("Created commit %d: %s (write took %v)", i, shortCommit, batchTiming.WriteDuration.Round(time.Millisecond))
+
+		// Wait for HEAD convergence (not specific commit hash - hashes can change during replay)
+		headResult, err := waitForHeadConvergence(ctx, clients, defaultConvergenceTimeout, defaultPollInterval)
 		if err != nil {
 			t.Fatal(err)
 		}
-		allHaveCommit := true
-		for peerID, hasCommit := range peerStatus {
-			if !hasCommit {
-				allHaveCommit = false
-				t.Errorf("peer %s missing commit %d: %s", peerID[:12], i, commit)
-			}
+
+		batchTiming.ConvergedAt = time.Now()
+		batchTiming.ConvergenceDuration = batchTiming.ConvergedAt.Sub(batchTiming.WriteCompletedAt)
+		batchTiming.TotalPropagation = batchTiming.ConvergedAt.Sub(batchTiming.WriteStartedAt)
+
+		if !headResult.Converged {
+			t.Errorf("commit %d: HEAD convergence failed: %v", i, headResult.AllHeads)
+		} else {
+			logger.Infof("Commit %d: HEAD converged in %v (total propagation: %v)",
+				i, headResult.Duration.Round(time.Millisecond), batchTiming.TotalPropagation.Round(time.Millisecond))
 		}
-		if allHaveCommit {
-			logger.Infof("Commit %d propagated to all peers", i)
-		}
+
+		metrics.AddBatchTiming(batchTiming)
 	}
 
 	// Final convergence check
@@ -1469,6 +1649,7 @@ func TestSequentialWritesPropagation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	metrics.HeadConvergence = headResult
 	if !headResult.Converged {
 		t.Errorf("final head convergence failed: %v", headResult.AllHeads)
 	} else {
@@ -1480,21 +1661,36 @@ func TestSequentialWritesPropagation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	metrics.HistoryConvergence = historyResult
 	if !historyResult.Converged {
 		t.Error("commit histories do not match")
 		for peerID, commits := range historyResult.AllCommitLists {
 			t.Logf("Peer %s: %v", peerID[:12], commits)
 		}
 	}
+
+	// Print comprehensive summary
+	metrics.Finalize()
+	metrics.PrintSummary()
 }
 
 // TestConcurrentWrites tests that concurrent writes from multiple peers converge deterministically
 func TestConcurrentWrites(t *testing.T) {
 	clients := getClients(t)
+	ctx := context.Background()
 	t.Logf("Docker concurrent test with %d clients", len(clients))
 
 	logger.Info("==== Starting TestConcurrentWrites ====")
-	t.Log("Starting concurrent writes")
+
+	// Initialize metrics tracking
+	metrics := NewTestMetrics("TestConcurrentWrites", len(clients))
+
+	// Create batch timing for the concurrent writes
+	batchTiming := &WriteBatchTiming{
+		Description:    "concurrent batch",
+		CommitsCreated: len(clients),
+		WriteStartedAt: time.Now(),
+	}
 
 	// Execute writes concurrently from all peers
 	var wg sync.WaitGroup
@@ -1516,7 +1712,7 @@ func TestConcurrentWrites(t *testing.T) {
 			}
 			queryString := fmt.Sprintf("INSERT INTO %s (id, name) VALUES ('%s', 'concurrent write from %s');",
 				tableName, uid.String(), c.GetID())
-			resp, err := c.ExecSQL(context.Background(), &p2pproto.ExecSQLRequest{
+			resp, err := c.ExecSQL(ctx, &p2pproto.ExecSQLRequest{
 				Statement: queryString,
 				Msg:       fmt.Sprintf("concurrent write from %s", c.GetID()),
 			})
@@ -1530,29 +1726,51 @@ func TestConcurrentWrites(t *testing.T) {
 	wg.Wait()
 	close(resultsChan)
 
-	// Collect results
-	commits := make(map[string]string)
+	batchTiming.WriteCompletedAt = time.Now()
+	batchTiming.WriteDuration = batchTiming.WriteCompletedAt.Sub(batchTiming.WriteStartedAt)
+
+	// Collect and log results
+	successCount := 0
 	for res := range resultsChan {
+		shortID := res.peerID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
 		if res.err != nil {
-			t.Errorf("peer %s failed to commit: %v", res.peerID[:12], res.err)
+			t.Errorf("peer %s failed to commit: %v", shortID, res.err)
 			continue
 		}
-		commits[res.peerID] = res.commit
-		logger.Infof("Peer %s created commit: %s", res.peerID[:12], res.commit[:12])
+		successCount++
+		shortCommit := res.commit
+		if len(shortCommit) > 12 {
+			shortCommit = shortCommit[:12]
+		}
+		logger.Infof("Peer %s created commit: %s", shortID, shortCommit)
 	}
+	batchTiming.CommitsCreated = successCount
 
-	// Wait for convergence
-	ctx := context.Background()
-	logger.Info("Waiting for head convergence after concurrent writes")
+	logger.Infof("All %d concurrent writes completed in %v", successCount, batchTiming.WriteDuration.Round(time.Millisecond))
 
+	// Wait for HEAD convergence - this is the correct way to measure propagation
+	// because commit hashes can change during deterministic replay/reconciliation
+	logger.Info("Waiting for HEAD convergence after concurrent writes...")
 	headResult, err := waitForHeadConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	batchTiming.ConvergedAt = time.Now()
+	batchTiming.ConvergenceDuration = batchTiming.ConvergedAt.Sub(batchTiming.WriteCompletedAt)
+	batchTiming.TotalPropagation = batchTiming.ConvergedAt.Sub(batchTiming.WriteStartedAt)
+
+	metrics.AddBatchTiming(batchTiming)
+	metrics.HeadConvergence = headResult
+
 	if !headResult.Converged {
 		t.Errorf("concurrent writes did not converge: %v", headResult.AllHeads)
 	} else {
-		logger.Infof("Head convergence achieved in %v", headResult.Duration)
+		logger.Infof("HEAD convergence achieved in %v (total propagation: %v)",
+			headResult.Duration, batchTiming.TotalPropagation.Round(time.Millisecond))
 	}
 
 	// Verify deterministic merge - all peers should have same commit order
@@ -1561,6 +1779,7 @@ func TestConcurrentWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	metrics.HistoryConvergence = historyResult
 	if !historyResult.Converged {
 		t.Error("deterministic merge failed - commit histories differ")
 		for peerID, peerCommits := range historyResult.AllCommitLists {
@@ -1569,6 +1788,10 @@ func TestConcurrentWrites(t *testing.T) {
 	} else {
 		logger.Infof("All peers have identical commit history with %d commits", len(historyResult.AllCommitLists[clients[0].GetID()]))
 	}
+
+	// Print comprehensive summary
+	metrics.Finalize()
+	metrics.PrintSummary()
 }
 
 // TestCommitOrderConsistency tests that commits from different peers maintain consistent ordering
@@ -1578,6 +1801,9 @@ func TestCommitOrderConsistency(t *testing.T) {
 	ctx := context.Background()
 
 	logger.Infof("==== Starting TestCommitOrderConsistency (%d nodes) ====", numNodes)
+
+	// Initialize metrics tracking
+	metrics := NewTestMetrics("TestCommitOrderConsistency", numNodes)
 
 	// Interleaved writes: each peer writes one commit in round-robin fashion
 	rounds := 3
@@ -1589,6 +1815,12 @@ func TestCommitOrderConsistency(t *testing.T) {
 
 	for round := 0; round < rounds; round++ {
 		roundStart := time.Now()
+		roundMetrics := &RoundMetrics{
+			RoundNumber: round,
+		}
+
+		writesStart := time.Now()
+		commitsCreated := 0
 		for i, client := range clients {
 			uid, err := ksuid.NewRandom()
 			if err != nil {
@@ -1596,41 +1828,79 @@ func TestCommitOrderConsistency(t *testing.T) {
 			}
 			queryString := fmt.Sprintf("INSERT INTO %s (id, name) VALUES ('%s', 'round %d peer %d');",
 				tableName, uid.String(), round, i)
-			resp, err := client.ExecSQL(context.Background(), &p2pproto.ExecSQLRequest{
+
+			commitStart := time.Now()
+			resp, err := client.ExecSQL(ctx, &p2pproto.ExecSQLRequest{
 				Statement: queryString,
 				Msg:       fmt.Sprintf("round %d peer %d", round, i),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			logger.Infof("Round %d, Peer %d (%s): commit %s", round, i, client.GetID()[:12], resp.Commit)
+			writeDuration := time.Since(commitStart)
+			commitsCreated++
+
+			shortID := client.GetID()
+			shortCommit := resp.Commit
+			if len(shortID) > 12 {
+				shortID = shortID[:12]
+			}
+			if len(shortCommit) > 12 {
+				shortCommit = shortCommit[:12]
+			}
+			logger.Infof("Round %d, Peer %d (%s): commit %s (write: %v)",
+				round, i, shortID, shortCommit, writeDuration.Round(time.Millisecond))
 
 			// Small delay between writes to allow propagation
 			time.Sleep(200 * time.Millisecond)
 		}
+		roundMetrics.WritesDuration = time.Since(writesStart)
+		roundMetrics.CommitsCreated = commitsCreated
 
-		// Wait for convergence after each round
+		// Wait for HEAD convergence after each round
+		// Note: We don't track individual commit hashes because they can change during reconciliation
 		logger.Infof("Round %d complete, waiting for convergence across %d nodes...", round, numNodes)
+		convergenceStart := time.Now()
 		roundResult, err := waitForHeadConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 		if err != nil {
 			t.Fatal(err)
 		}
+		roundMetrics.ConvergenceDuration = time.Since(convergenceStart)
+		roundMetrics.TotalDuration = time.Since(roundStart)
+
 		if !roundResult.Converged {
 			t.Errorf("Round %d: convergence failed after interleaved writes: %v", round, roundResult.AllHeads)
 		} else {
-			logger.Infof("Round %d: %d nodes converged in %v (round took %v)",
-				round, numNodes, roundResult.Duration, time.Since(roundStart))
+			logger.Infof("Round %d: %d nodes converged (writes: %v, convergence: %v, total: %v)",
+				round, numNodes,
+				roundMetrics.WritesDuration.Round(time.Millisecond),
+				roundMetrics.ConvergenceDuration.Round(time.Millisecond),
+				roundMetrics.TotalDuration.Round(time.Millisecond))
 		}
+
+		// Add batch timing for this round
+		batchTiming := &WriteBatchTiming{
+			Description:       fmt.Sprintf("round %d", round),
+			CommitsCreated:    commitsCreated,
+			WriteStartedAt:    writesStart,
+			WriteCompletedAt:  writesStart.Add(roundMetrics.WritesDuration),
+			ConvergedAt:       time.Now(),
+			WriteDuration:     roundMetrics.WritesDuration,
+			ConvergenceDuration: roundMetrics.ConvergenceDuration,
+			TotalPropagation:  roundMetrics.TotalDuration,
+		}
+		metrics.AddBatchTiming(batchTiming)
+		metrics.AddRoundMetrics(roundMetrics)
 	}
 
 	// Final convergence check
 	logger.Infof("All %d rounds complete, verifying final convergence across %d nodes...", rounds, numNodes)
-	finalStart := time.Now()
 
 	headResult, err := waitForHeadConvergence(ctx, clients, 2*time.Minute, defaultPollInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
+	metrics.HeadConvergence = headResult
 	if !headResult.Converged {
 		t.Errorf("Final head convergence failed after interleaved writes: %v", headResult.AllHeads)
 	} else {
@@ -1643,6 +1913,7 @@ func TestCommitOrderConsistency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	metrics.HistoryConvergence = historyResult
 	if !historyResult.Converged {
 		t.Error("commit order inconsistent across peers")
 		for peerID, commits := range historyResult.AllCommitLists {
@@ -1655,8 +1926,8 @@ func TestCommitOrderConsistency(t *testing.T) {
 			refCommits = commits
 			break
 		}
-		logger.Infof("Final history convergence: %d nodes have identical commit order with %d total commits in %v (total verification took %v)",
-			numNodes, len(refCommits), historyResult.Duration, time.Since(finalStart))
+		logger.Infof("Final history convergence: %d nodes have identical commit order with %d total commits in %v",
+			numNodes, len(refCommits), historyResult.Duration)
 
 		// Commit hashes may be rewritten during deterministic replay (parent changes), so we only
 		// assert that no commits were dropped: history length must increase by exactly rounds*numNodes.
@@ -1666,6 +1937,10 @@ func TestCommitOrderConsistency(t *testing.T) {
 				len(refCommits), expected, startCount, rounds, numNodes)
 		}
 	}
+
+	// Print comprehensive summary
+	metrics.Finalize()
+	metrics.PrintSummary()
 }
 
 // insertOnePerClient performs a single insert from each client with unique values
