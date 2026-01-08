@@ -20,14 +20,42 @@ At a high level there are two planes:
 - **Control plane (gossip)**: small messages that advertise “there is a commit with HLC X” and periodically summarize history.
 - **Data plane (Dolt-native fetch)**: bulk object transfer is done through Dolt’s existing fetch pipeline, using a read-only `swarm://` remote.
 
+## Code Structure
+
+This repo is organized into small packages so the “what” (protocol), “how” (core engine), and “I/O boundary” (transport) are separated.
+The top-level `doltswarm` package remains the public import path and re-exports the main API for convenience.
+
+- `doltswarm.go`: public facade (type aliases + wrapper functions) so consumers can keep importing `github.com/nustiueudinastea/doltswarm`.
+- `protocol/`: wire- and identity-level types used across the system:
+  - HLC (`protocol/hlc.go`), repo identity (`protocol/repo_id.go`)
+  - commit metadata format + signing (`protocol/metadata.go`, `protocol/signer.go`)
+  - gossip payload structs (`protocol/messages.go`)
+- `transport/`: the pluggable networking boundary (no Dolt logic here):
+  - control plane interfaces (`transport/transport.go`)
+  - data plane provider interfaces (`transport/provider.go`)
+  - best-effort provider hint via context (`transport/provider_hint.go`)
+- `core/`: the synchronization engine and Dolt integration:
+  - `core/node.go`: `Node` (gossip loop, debounce, fetch+reconcile orchestration)
+  - `core/reconciler_core.go`: deterministic linearizer (temp-branch replay + conflict drops)
+  - `core/db.go` / `core/sql.go`: Dolt SQL driver wrapper + commit helpers (`DOLT_COMMIT`, `DOLT_FETCH`, merge-base helpers)
+  - `core/swarm_dbfactory.go` / `core/swarm_registry.go`: `swarm://` dbfactory registration + provider picker registry
+  - `core/remote_chunk_store.go` / `core/remote_table_file.go`: read-only chunk store/table-file adapters used by Dolt’s fetch pipeline
+  - `core/index.go` / `core/index_mem.go`: local-only commit index used for pending/applied/rejected HLC tracking and digest checkpoints
+  - `core/bundles.go`: (reference/experimental) commit-bundle builder/importer; current pipeline primarily uses Dolt-native fetch
+- `integration/`: demo + docker-based integration tests and transport implementations (libp2p gossip + gRPC chunkstore):
+  - `integration/main.go`: `ddolt` demo CLI used by tests
+  - `integration/integration_test.go`: container-per-peer test harness
+  - `integration/transport/`: sample transports (`gossipsub`, `grpcswarm`, `overlay`)
+
 ### Key Components
 
-- `Node` (`node.go`): the sync engine you embed; runs gossip loops, performs fetch/reconcile, and exposes `Commit` / `ExecAndCommit`.
-- `DB` (`db.go`, `sql.go`): thin wrapper around the Dolt SQL driver; creates signed metadata commits; provides helpers like `FetchSwarm`, `MergeBase`.
-- `Reconciler` (`reconciler_core.go`): deterministic linearizer (no networking). Given local+imported commits after a merge base, it produces a linear `main`.
-- `CommitMetadata` (`metadata.go`): JSON stored in the Dolt commit message, including `(HLC, author, date, content_hash)` plus a signature.
-- `swarm://` dbfactory (`swarm_dbfactory.go`, `swarm_registry.go`, `remote_chunk_store.go`): a process-global hook that lets Dolt treat “the swarm” as a remote by selecting any live provider and serving chunks/table files read-only.
-- Local “anti-entropy” index (`index.go`, `index_mem.go`): tracks which HLCs are pending/applied and publishes checkpoints in digests.
+- `Node` (`core/node.go`): the sync engine you embed; runs gossip loops, performs fetch/reconcile, and exposes `Commit` / `ExecAndCommit`.
+- `DB` (`core/db.go`, `core/sql.go`): thin wrapper around the Dolt SQL driver; creates signed metadata commits; provides helpers like `FetchSwarm`, `MergeBase`.
+- `Reconciler` (`core/reconciler_core.go`): deterministic linearizer (no networking). Given local+imported commits after a merge base, it produces a linear `main`.
+- `CommitMetadata` (`protocol/metadata.go`): JSON stored in the Dolt commit message, including `(HLC, author, date, content_hash)` plus a signature.
+- `swarm://` dbfactory (`core/swarm_dbfactory.go`, `core/swarm_registry.go`, `core/remote_chunk_store.go`): a process-global hook that lets Dolt treat “the swarm” as a remote by selecting any live provider and serving chunks/table files read-only.
+- Transport boundary (`transport/`): `Transport`/`Gossip` control plane and provider interfaces for the read-only data plane.
+- Local “anti-entropy” index (`core/index.go`, `core/index_mem.go`): tracks which HLCs are pending/applied/rejected and publishes checkpoints in digests.
 
 ### Data Flow
 
@@ -46,6 +74,8 @@ Sync pass:
   try fast-forward main to remote head (ff-only merge)
   else replay deterministically on a temp branch in HLC order
 ```
+
+Provider hints are best-effort: the node remembers which peer mentioned a given HLC for a short TTL and consumes that hint when choosing a fetch provider.
 
 ## Commit Dissemination, Concurrency, and Reconciliation
 
@@ -79,7 +109,7 @@ After a fetch, if `main` cannot be fast-forwarded to the fetched remote head, th
 ### Conflict resolution: First Write Wins (FWW)
 
 If a cherry-pick encounters a conflict, the reconciler **drops the later commit** (the one being applied when the conflict occurs).
-Dropped commits never become part of the canonical `main`, so they won’t appear in future digests/checkpoints after peers converge. An optional callback can be invoked (`CommitRejectedCallback`).
+Dropped commits are recorded locally as **rejected** (handled) to avoid livelock via repeated adverts/checkpoints. An optional callback can be invoked (`CommitRejectedCallback`).
 
 ### Anti-entropy repair (missed adverts)
 

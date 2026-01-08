@@ -1,8 +1,6 @@
-package doltswarm
+package transport
 
-import (
-	"context"
-)
+import "context"
 
 // Transport is the only network dependency the core library has.
 //

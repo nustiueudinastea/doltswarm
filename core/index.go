@@ -1,4 +1,4 @@
-package doltswarm
+package core
 
 import (
 	"context"

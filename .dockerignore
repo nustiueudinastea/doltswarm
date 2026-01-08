@@ -1,0 +1,5 @@
+.git
+.cache
+integration/ddolt
+integration/temp
+integration/logs

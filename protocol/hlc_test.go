@@ -1,4 +1,4 @@
-package doltswarm
+package protocol
 
 import (
 	"testing"

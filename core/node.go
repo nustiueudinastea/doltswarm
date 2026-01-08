@@ -1,4 +1,4 @@
-package doltswarm
+package core
 
 import (
 	"context"
@@ -38,7 +38,20 @@ type NodeConfig struct {
 	// Zero uses a conservative default.
 	PullFirstPasses int
 
+	// HintProviderTTL controls how long the node remembers "which peer mentioned a given HLC".
+	// This is used to prefer a provider likely to have the objects for a hinted commit.
+	// Zero uses a conservative default.
+	HintProviderTTL time.Duration
+	// MaxHintProviders bounds the hint map to prevent unbounded growth in long-running nodes.
+	// Zero uses a conservative default.
+	MaxHintProviders int
+
 	Identity IdentityResolver
+}
+
+type hintProviderEntry struct {
+	from      string
+	expiresAt time.Time
 }
 
 type Node struct {
@@ -51,7 +64,7 @@ type Node struct {
 	mu sync.Mutex
 
 	providerMu    sync.Mutex
-	hintProviders map[HLCTimestamp]string
+	hintProviders map[HLCTimestamp]hintProviderEntry
 	peerHeads     map[string]HLCTimestamp
 	lastProvider  string
 }
@@ -87,6 +100,12 @@ func OpenNode(cfg NodeConfig) (*Node, error) {
 	if cfg.PullFirstPasses == 0 {
 		cfg.PullFirstPasses = 2
 	}
+	if cfg.HintProviderTTL == 0 {
+		cfg.HintProviderTTL = 2 * time.Minute
+	}
+	if cfg.MaxHintProviders == 0 {
+		cfg.MaxHintProviders = 4096
+	}
 
 	var (
 		db     *DB
@@ -118,7 +137,7 @@ func OpenNode(cfg NodeConfig) (*Node, error) {
 		db:            db,
 		idx:           NewMemoryCommitIndex(),
 		ownsDB:        ownsDB,
-		hintProviders: make(map[HLCTimestamp]string),
+		hintProviders: make(map[HLCTimestamp]hintProviderEntry),
 		peerHeads:     make(map[string]HLCTimestamp),
 	}
 
@@ -617,7 +636,23 @@ func (n *Node) rememberHintProvider(hlc HLCTimestamp, from string) {
 	}
 	n.providerMu.Lock()
 	defer n.providerMu.Unlock()
-	n.hintProviders[hlc] = from
+
+	now := time.Now()
+	if n.cfg.MaxHintProviders > 0 && len(n.hintProviders) >= n.cfg.MaxHintProviders {
+		n.cleanupHintProvidersLocked(now)
+		// If we still exceed the bound, drop arbitrary entries.
+		for len(n.hintProviders) >= n.cfg.MaxHintProviders {
+			for k := range n.hintProviders {
+				delete(n.hintProviders, k)
+				break
+			}
+		}
+	}
+
+	n.hintProviders[hlc] = hintProviderEntry{
+		from:      from,
+		expiresAt: now.Add(n.cfg.HintProviderTTL),
+	}
 }
 
 func (n *Node) popHintProvider(hlc HLCTimestamp) string {
@@ -626,7 +661,26 @@ func (n *Node) popHintProvider(hlc HLCTimestamp) string {
 	}
 	n.providerMu.Lock()
 	defer n.providerMu.Unlock()
-	return n.hintProviders[hlc]
+	e, ok := n.hintProviders[hlc]
+	if !ok {
+		return ""
+	}
+	delete(n.hintProviders, hlc)
+	if !e.expiresAt.IsZero() && time.Now().After(e.expiresAt) {
+		return ""
+	}
+	return e.from
+}
+
+func (n *Node) cleanupHintProvidersLocked(now time.Time) {
+	if n == nil {
+		return
+	}
+	for k, v := range n.hintProviders {
+		if !v.expiresAt.IsZero() && now.After(v.expiresAt) {
+			delete(n.hintProviders, k)
+		}
+	}
 }
 
 func (n *Node) bestProvider() string {

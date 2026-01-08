@@ -1,4 +1,4 @@
-package doltswarm
+package protocol
 
 // RepoID identifies a Dolt repository for synchronization purposes.
 //

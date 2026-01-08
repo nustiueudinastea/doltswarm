@@ -1,4 +1,4 @@
-package doltswarm
+package core
 
 import (
 	"context"
@@ -36,13 +36,6 @@ type Database struct {
 
 type DoltMREnvRetriever interface {
 	GetMultiRepoEnv() *env.MultiRepoEnv
-}
-
-type Signer interface {
-	Sign(commit string) (string, error)
-	Verify(commit string, signature string, publicKey string) error
-	PublicKey() string
-	GetID() string
 }
 
 type Notifier interface {
