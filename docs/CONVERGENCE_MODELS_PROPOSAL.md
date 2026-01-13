@@ -2,418 +2,531 @@
 
 This document analyzes the current linear convergence model and proposes alternative approaches that could converge faster while remaining leaderless and minimizing peer communication.
 
+## Understanding the Core Problem
+
+### Dolt's Commit Model
+
+Dolt is Git-like: commits form a DAG where each commit's hash depends on:
+
+```
+commit_hash = hash(tree_hash, parent_hash(es), author, date, message)
+```
+
+**Critical constraint**: If the parent changes, the commit hash changes.
+
+This means for all peers to have **identical commit histories**, they must:
+1. Apply the same set of commits
+2. In the **exact same order** (determining parent relationships)
+3. With identical metadata
+
+### Why Ordering Matters
+
+```
+Scenario: Peers A and B both commit concurrently from base B0
+
+Peer A's local view:          Peer B's local view:
+  B0 → CA                       B0 → CB
+
+After sync, both need the same linear history. Two options:
+
+Option 1: B0 → CA → CB'        (CA is parent of CB')
+Option 2: B0 → CB → CA'        (CB is parent of CA')
+
+The ' indicates the commit hash changed because the parent changed.
+```
+
+All peers must pick the **same option** deterministically. The current system uses HLC ordering: lower HLC wins, so if `HLC(CA) < HLC(CB)`, everyone picks Option 1.
+
+### What "Convergence" Means
+
+**Convergence** = all peers have:
+- Same `main` branch HEAD commit hash
+- Same commit ancestry (parent chain)
+- Same tree content at HEAD
+
+The current model achieves this via **deterministic replay**: cherry-pick all commits in HLC order onto a temp branch, then move `main` to the result.
+
+---
+
 ## Current Model Analysis
 
-### How It Works
+### The HLC-Ordered Linear Replay
 
-The current model uses **HLC-ordered linear replay**:
+```
+1. Receive commit advertisement via gossip
+2. Fetch objects from swarm:// remote (Prolly tree chunks)
+3. Find merge base between local main and remote main
+4. Collect all commits since merge base (local + remote)
+5. Deduplicate by HLC (smallest commit hash breaks ties)
+6. Sort by HLC: (wall_time, logical_counter, peer_id)
+7. Cherry-pick each commit in order onto temp branch
+8. Amend each cherry-pick to preserve original metadata
+9. Move main to temp branch result
+```
 
-1. **Total Ordering via HLC**: Every commit gets a Hybrid Logical Clock timestamp `(Wall, Logical, PeerID)` that provides deterministic total ordering across all peers.
+### Why It's Slow
 
-2. **Sync Flow**:
-   - Receive commit advertisement via gossip
-   - Fetch objects from swarm remote
-   - Find merge base between local `main` and `remotes/swarm/main`
-   - Collect all commits since merge base from both branches
-   - Deduplicate by HLC (smallest hash wins ties)
-   - Cherry-pick all commits in HLC order onto temp branch
-   - Reset `main` to temp branch if it hasn't advanced
+| Operation | Cost | Why Expensive |
+|-----------|------|---------------|
+| Cherry-pick | O(M) sequential | Each cherry-pick: read tree, apply diff, write new tree, create commit |
+| Metadata amend | O(M) sequential | Each amend: rewrite commit with original author/date/message |
+| Index rebuild | O(N) | Scan entire commit history, parse JSON metadata for each |
+| Restart on race | Full replay | If local commit happens during replay, restart from scratch |
 
-3. **Conflict Resolution**: First-Write-Wins (FWW) - conflicts drop the later commit deterministically.
+For M concurrent commits on a history of N total commits:
+- **Best case (fast-forward)**: ~500ms
+- **Typical (replay)**: 5-15s for M=10-50
+- **Worst case**: 30s+ with conflicts/retries
 
-### Performance Bottlenecks
+### The Fundamental Bottleneck
 
-| Bottleneck | Impact | Cost |
-|------------|--------|------|
-| Sequential cherry-pick | Each commit = DB operation | O(M) for M concurrent commits |
-| Full index rebuild | Scans entire history after every sync | O(N) where N = total commits |
-| History rewriting | Every sync rewrites post-merge-base | O(M) commits rewritten |
-| Debounce latency | 250ms minimum before sync starts | Fixed overhead per sync |
-| Restart on main advance | Replay aborts if local commit races | Full restart penalty |
+The bottleneck is **not** reaching agreement on ordering (gossip is fast). It's **executing the replay**:
 
-### Convergence Time Estimate
+```
+For each of M commits:
+  1. DOLT_CHERRY_PICK(hash)           -- applies diff to Prolly tree
+  2. DOLT_COMMIT('--amend', ...)      -- rewrites commit metadata
+```
 
-For N peers with M concurrent commits:
-- **Best case** (fast-forward): ~500ms-1s
-- **Typical case** (replay): 5-15s for M=10-50 commits
-- **Worst case** (conflicts + retries): 30s+
+Each operation involves Prolly tree traversal and modification. With Dolt's storage model, this is inherently sequential because each commit's tree depends on the previous commit's tree.
 
 ---
 
-## Alternative Model 1: DAG Multi-Head with Lazy Linearization
+## Alternative Convergence Models
 
-### Concept
+### Model 1: Deterministic N-Way Merge Instead of Linear Replay
 
-Instead of maintaining a single linear `main`, keep the commit DAG as-is with multiple heads (like a merge-pending state). Linearization happens:
-- **On read** (query time) for consistency-sensitive reads
-- **Periodically** in background for compaction
-- **Never** for append-only/audit-log patterns
+#### Concept
 
-### How It Works
+Instead of cherry-picking M commits sequentially to create M new commits, create a **single merge commit** that combines all concurrent commits.
 
 ```
-Peer A commits C1 ─┐
-                   ├─► DAG has heads [C1, C2]
-Peer B commits C2 ─┘
+Current approach (M=3):
+  B0 → C1' → C2' → C3'     (3 cherry-picks, 3 new commits)
 
-Sync: Just fetch + store objects. No replay needed.
-
-Query: SELECT * FROM t
-  → Materialize from virtual merge of [C1, C2]
-  → Or pick "read head" using deterministic rule
+Merge approach:
+  B0 → C1 ─┐
+  B0 → C2 ─┼─► M           (1 merge commit with 3 parents)
+  B0 → C3 ─┘
 ```
 
-### Trade-offs
+#### How It Would Work
+
+```
+1. Collect all commits since merge base (same as now)
+2. Sort by HLC to get deterministic parent order
+3. Create single merge commit:
+   - Parents: [merge_base, C1, C2, C3, ...] in HLC order
+   - Tree: result of deterministic N-way merge
+   - Message: canonical metadata with combined info
+4. Move main to merge commit
+```
+
+#### Dolt Considerations
+
+- Dolt supports merge commits with multiple parents
+- The tree content must be computed deterministically (same merge algorithm everywhere)
+- **Key question**: Is Dolt's N-way merge deterministic? If `DOLT_MERGE` produces the same tree given the same inputs, this works.
+
+#### Trade-offs
 
 | Pros | Cons |
 |------|------|
-| Instant convergence (fetch = done) | Complex query layer |
-| No history rewriting | Storage overhead (DAG never compacts) |
-| No cherry-pick cascade | Read latency increases with head count |
-| Preserves all history | Harder to reason about "current state" |
+| O(1) commits instead of O(M) | Complex merge tree computation |
+| Preserves original commit hashes as parents | Dolt merge may not be N-way deterministic |
+| Single Prolly tree write | Merge conflicts harder to handle |
+| History shows true concurrency | Non-linear history (some tools struggle) |
 
-### Communication
+#### Communication
 
-**Minimal change**: Same gossip (commit ads) + same data plane (Dolt fetch). No additional messages needed.
-
-### Suitability
-
-Best for: Audit logs, event sourcing, low-conflict workloads.
-Poor for: High-conflict tables, simple query patterns, SQL compatibility.
+**No change**: Same gossip + data plane.
 
 ---
 
-## Alternative Model 2: Epoch-Based Batching
+### Model 2: Stable Commit Identity with Deferred Parent Assignment
 
-### Concept
+#### Concept
 
-Divide time into fixed epochs (e.g., 5-second windows). All commits within an epoch are processed as a single batch at epoch boundaries.
-
-### How It Works
+Separate the **stable identity** (content + HLC) from the **transient identity** (commit hash with parent).
 
 ```
-Epoch 0 (T=0-5s):
-  Peer A: C1 @ T=1s
-  Peer B: C2 @ T=2s
-  Peer C: C3 @ T=4s
+Commit = {
+  stable_id:   hash(content_tree, hlc, author, message)  // Never changes
+  commit_hash: hash(tree, parent, metadata)              // Changes during replay
+}
+```
+
+Peers track commits by `stable_id`. The actual commit hash is a local implementation detail that converges once everyone has applied the same commits in the same order.
+
+#### How It Would Work
+
+```
+1. When committing locally:
+   - Compute stable_id from content
+   - Create local commit (commit_hash depends on local parent)
+   - Gossip: advertise stable_id
+
+2. When syncing:
+   - Fetch commits by stable_id
+   - Have all stable_ids I need? Yes → ready to finalize
+   - Sort by HLC, replay to get final commit_hash
+   - Index tracks stable_id → commit_hash mapping
+
+3. Fast path optimization:
+   - If my local history already has all stable_ids in correct HLC order
+   - AND parent relationships match expected order
+   - THEN no replay needed (already converged)
+```
+
+#### Dolt Considerations
+
+The `stable_id` could be:
+- `hash(tree_hash, hlc)` - content + logical time
+- Already exists as `ContentHash` in current metadata
+
+This doesn't reduce replay work, but enables **detecting when replay is unnecessary**.
+
+#### Trade-offs
+
+| Pros | Cons |
+|------|------|
+| Clear separation of concerns | Still requires replay |
+| Enables fast convergence detection | Additional tracking overhead |
+| Works with current Dolt primitives | Complexity in index management |
+
+---
+
+### Model 3: Epoch-Based Batch Commits
+
+#### Concept
+
+Divide time into epochs. All commits within an epoch are combined into a **single epoch commit** at the epoch boundary.
+
+```
+Epoch 0 [T=0s to T=5s]:
+  Peer A: op1 @ T=1s
+  Peer B: op2 @ T=3s
+  Peer C: op3 @ T=4s
 
 Epoch boundary (T=5s):
-  All peers wait for stragglers (grace period)
-  Sort [C1, C2, C3] by HLC
-  Single batch cherry-pick
-  Advance to epoch 1
+  All peers create: E0 = commit(merge(op1, op2, op3))
+  Parent: previous epoch commit or genesis
 ```
 
-### Trade-offs
+#### How It Would Work
+
+```
+1. Within epoch: accumulate operations locally (don't commit yet)
+2. At epoch boundary:
+   - Gossip: exchange operation lists
+   - Wait for grace period (handle stragglers)
+   - Deterministic merge: sort operations by HLC
+   - Create single epoch commit
+   - All peers create identical commit (same tree, same parent)
+
+3. Reads during epoch:
+   - Option A: Read from last epoch commit (stale)
+   - Option B: Apply pending ops speculatively (may rollback)
+```
+
+#### Dolt Considerations
+
+- Reduces commit count: O(M) operations → 1 commit per epoch
+- Prolly tree writes batched: single tree update per epoch
+- **Requires operation-level tracking** rather than commit-level
+
+This is a significant model change: instead of "commits sync between peers", it's "operations sync, then everyone commits identically".
+
+#### Trade-offs
 
 | Pros | Cons |
 |------|------|
-| Single reconciliation per epoch | Fixed latency floor (epoch duration) |
-| Batches cherry-picks efficiently | Requires loose time synchronization |
-| Predictable convergence time | Grace period adds delay |
-| Reduces sync frequency | Late commits may miss epoch |
+| O(1) commits per epoch regardless of M | Fixed latency floor (epoch duration) |
+| All peers create identical commits | Requires operation log |
+| No replay needed | Grace period for stragglers |
+| Batched Prolly tree updates | Changes commit granularity |
 
-### Communication
+#### Communication
 
-**New message**: `EpochBoundary { epoch_id, commit_list, head_hash }` for checkpoint agreement at epoch end. Adds ~1 message per peer per epoch.
-
-### Suitability
-
-Best for: Batch workloads, systems with NTP sync, predictable latency requirements.
-Poor for: Real-time/low-latency needs, highly async environments.
+**New message**: Operation advertisement instead of (or in addition to) commit advertisement.
 
 ---
 
-## Alternative Model 3: Content-Based Conflict Detection
+### Model 4: Prolly Tree Delta Shipping
 
-### Concept
+#### Concept
 
-Use lightweight conflict detection **before** cherry-picking:
-- Compute "change set" (affected tables/rows) for each commit
-- Batch commits with non-overlapping change sets
-- Only serialize truly conflicting commits
-
-### How It Works
+Instead of replaying commits (which recomputes Prolly tree changes), ship the **computed deltas** directly.
 
 ```
-Incoming commits:
-  C1: UPDATE users SET name='X' WHERE id=1
-  C2: UPDATE users SET name='Y' WHERE id=2
-  C3: UPDATE orders SET status='done' WHERE id=5
+Current:
+  Peer A computes: tree(B0) + diff(C1) → tree(C1)
+  Peer B fetches C1, recomputes: tree(B0) + diff(C1) → tree(C1')
 
-Change sets:
-  C1: {users:1}
-  C2: {users:2}
-  C3: {orders:5}
+  If parents differ, trees may differ even with same diff.
 
-Conflict check: No overlaps!
-  → Apply all in parallel (or single batch)
-  → No sequential cherry-pick needed
-
-If C4 arrives: UPDATE users SET name='Z' WHERE id=1
-  C4: {users:1} conflicts with C1
-  → Only C1 and C4 need ordering
+Delta shipping:
+  Peer A computes tree for canonical order
+  Peer A ships: "after commit X, tree_hash = Y, chunks = [...]"
+  Peer B receives and validates, adopts tree directly
 ```
 
-### Trade-offs
+#### How It Would Work
+
+```
+1. Designated "fast peer" (first to complete replay) computes canonical tree
+2. Gossips: TreeAnnouncement { hlc_tip, tree_hash, chunk_manifest }
+3. Other peers:
+   - Fetch chunks if needed
+   - Validate: replay first K commits, check intermediate tree matches
+   - If valid, adopt tree (skip remaining replay)
+   - Create commit pointing to validated tree
+```
+
+#### Dolt Considerations
+
+- Prolly trees are content-addressed: same tree_hash = same content
+- Chunks are already shipped via data plane
+- This is essentially "trust but verify" for tree computation
+
+**Risk**: A malicious peer could ship wrong tree. Mitigations:
+- Spot-check validation (replay random commits)
+- Signature over tree_hash from commit author
+- Eventual full validation in background
+
+#### Trade-offs
 
 | Pros | Cons |
 |------|------|
-| Parallel apply for non-conflicts | Requires change set extraction |
-| Only orders what must be ordered | Bloom filter false positives |
-| Preserves HLC semantics for conflicts | Additional metadata per commit |
-| Major speedup for partitioned data | Complex for schema changes |
+| Skip replay for followers | Requires validation strategy |
+| Leverages Prolly tree properties | First peer still does full replay |
+| Works with existing chunk shipping | Trust model changes |
 
-### Communication
+#### Communication
 
-**Extended commit ad**: Add bloom filter or compact change set to `CommitAdV1`. Adds ~200-500 bytes per commit.
-
-### Suitability
-
-Best for: Multi-tenant DBs, partitioned data, row-level changes.
-Poor for: Schema changes, full-table operations, small tables.
+**New message**: TreeAnnouncement with tree hash and chunk manifest.
 
 ---
 
-## Alternative Model 4: Causal+ Consistency with Vector Clocks
+### Model 5: Causal Ordering with Lazy Linearization
 
-### Concept
+#### Concept
 
-Replace HLC with vector clocks. Only order commits that have causal relationships. Concurrent independent commits don't need ordering.
-
-### How It Works
+Don't require linear history. Allow concurrent commits to coexist as multiple heads. Linearize only when necessary.
 
 ```
-Vector clock: map[peerID]→counter
+Traditional (forces linear):
+  B0 → C1 → C2 → C3
 
-Peer A commits C1: VC={A:1}
-Peer B commits C2: VC={B:1}
+Causal (allows DAG):
+  B0 → C1 (from A)
+   └→ C2 (from B, concurrent with C1)
+   └→ C3 (from C, concurrent with C1 and C2)
 
-C1 and C2 are concurrent (neither happened-before the other)
-  → Both are equally valid "current state"
-  → No replay needed
-
-Peer A sees C2, commits C3: VC={A:2, B:1}
-  → C3 causally follows both C1 and C2
-  → C3 is the new head
+All three are valid "current state" until someone needs a single answer.
 ```
 
-### Trade-offs
+#### How It Would Work
+
+```
+1. Commits include causality info:
+   - seen_heads: [commit hashes this commit has "seen"]
+   - If C2.seen_heads doesn't include C1, they're concurrent
+
+2. Sync:
+   - Fetch all commits (as now)
+   - No replay needed - just store in DAG
+   - Track multiple heads
+
+3. Query time:
+   - Option A: Pick deterministic head (max HLC)
+   - Option B: Merge heads on-the-fly for query
+   - Option C: Require explicit linearization point
+
+4. Periodic compaction:
+   - Background: linearize old concurrent commits
+   - Recent: keep as DAG for fast sync
+```
+
+#### Dolt Considerations
+
+- Dolt's branch model already supports multiple heads
+- Could use branches internally: `main` (linearized), `pending/*` (unlinearized)
+- Queries against `main` give consistent view
+- Sync updates `pending/*` branches instantly
+
+#### Trade-offs
 
 | Pros | Cons |
 |------|------|
-| No ordering of independent commits | Vector clocks grow with peer count |
-| Minimal replay (only causal chains) | More complex merge semantics |
-| Preserves concurrency naturally | Harder to explain to users |
-| Well-studied (Dynamo, Riak) | Conflict resolution still needed |
+| Instant sync (no replay) | Complex query layer |
+| Preserves true concurrency | Multiple "current states" |
+| Background linearization | Storage overhead |
+| Scales with write rate | Harder to reason about |
 
-### Communication
+#### Communication
 
-**Modified commit ad**: Replace HLC with vector clock (O(N) bytes for N peers). For small clusters (N<100), acceptable.
-
-### Suitability
-
-Best for: Geo-distributed systems, eventually consistent reads OK.
-Poor for: Strong consistency requirements, large peer counts.
+**Extended commit ad**: Include `seen_heads` for causality tracking.
 
 ---
 
-## Alternative Model 5: Optimistic Accept + Background Linearization
+### Model 6: Optimistic Locking with Rollback
 
-### Concept
+#### Concept
 
-Accept all incoming commits immediately into an append-only log. Linearization runs as a separate background process.
-
-### How It Works
+Apply commits optimistically without replay. If conflict detected later, rollback and replay correctly.
 
 ```
-Receive commit C1 → Append to local log (instant)
-Receive commit C2 → Append to local log (instant)
-...
-
-Background process (every 5s or N commits):
-  - Take snapshot of log
-  - Sort by HLC
-  - Cherry-pick to canonical main
-  - Mark processed commits as "linearized"
-
-Queries:
-  - Hot path: Read from linearized main (consistent)
-  - Best-effort: Read from tip of log (eventually consistent)
+1. Receive commit C2 while at C1
+2. Optimistic: append C2 as child of C1 (assume compatible)
+3. Later: discover C0 should come between C1 and C2
+4. Rollback: reset to C1
+5. Replay: C1 → C0' → C2'
 ```
 
-### Trade-offs
+#### How It Would Work
+
+```
+1. On commit receive:
+   - Fast path: if HLC > all known HLCs, just append (likely correct)
+   - Store speculative commit chain
+
+2. On discovering older commit:
+   - Mark speculation as invalid
+   - Trigger replay from last known-good point
+
+3. Convergence:
+   - Eventually all commits discovered
+   - All peers replay to same final state
+   - Speculation useful during "hot" period
+```
+
+#### Dolt Considerations
+
+- Requires cheap rollback (Dolt branches provide this)
+- Could use: `main` (speculative), `canonical` (known-good)
+- Queries default to `main` (fast, possibly wrong)
+- Critical queries use `canonical` (slow, guaranteed correct)
+
+#### Trade-offs
 
 | Pros | Cons |
 |------|------|
-| Instant "soft" convergence | Two consistency levels |
-| Background process can batch | Reads may lag writes |
-| No blocking on sync | Log storage grows unbounded |
-| Handles bursts well | Complex query routing |
-
-### Communication
-
-**No change**: Same gossip + data plane. Internal optimization only.
-
-### Suitability
-
-Best for: Write-heavy workloads, analytics (read lag OK).
-Poor for: Real-time consistency needs, OLTP patterns.
+| Fast path for in-order commits | Rollback cost when wrong |
+| Good for mostly-ordered workloads | Two consistency levels |
+| Progressive convergence | Wasted work on rollback |
 
 ---
 
-## Alternative Model 6: Probabilistic Quorum Reads
+## Comparison Matrix (Dolt-Aware)
 
-### Concept
-
-Instead of linearizing at write time, use quorum reads to establish consistency. Read from multiple peers and merge results.
-
-### How It Works
-
-```
-Write: Local commit only + gossip (no sync)
-
-Read: Query K peers (K < N)
-  - Collect responses
-  - Merge using deterministic rule (HLC max, LWW, etc.)
-  - Return merged result
-
-Consistency levels:
-  - Eventual: K=1 (any peer)
-  - Strong: K=N (all peers)
-  - Quorum: K=N/2+1 (majority)
-```
-
-### Trade-offs
-
-| Pros | Cons |
-|------|------|
-| No write-time linearization | Read amplification (K queries) |
-| Tunable consistency | Requires peer-to-peer reads |
-| Instant write convergence | Merge logic complexity |
-| Well-known pattern (Cassandra) | Not pure "pull-only" model |
-
-### Communication
-
-**New capability**: Direct peer-to-peer read queries. Significant change to data plane.
-
-### Suitability
-
-Best for: Read-heavy workloads, tunable consistency needs.
-Poor for: Complex queries, current pull-only architecture.
+| Model | Replay Cost | Commit Identity | Communication | Dolt Changes |
+|-------|-------------|-----------------|---------------|--------------|
+| Current (Linear) | O(M) cherry-picks | Hash changes | Low | None |
+| N-Way Merge | O(1) merge | Originals preserved | Low | Merge algorithm |
+| Stable ID | O(M) but skippable | Separate stable/hash | Low | Index changes |
+| Epoch Batching | O(1) per epoch | New model | Medium | Operation log |
+| Delta Shipping | O(1) for followers | Hash from leader | Medium | Trust model |
+| Causal DAG | O(1) sync | Multiple heads | Low | Query layer |
+| Optimistic | O(M) on rollback | Speculative | Low | Dual branch |
 
 ---
 
-## Alternative Model 7: Operation-Log with Semantic Merge
+## Recommendations for Dolt-Based System
 
-### Concept
+### Understanding the Constraints
 
-Store operations (SQL statements) rather than states. Replay operations with semantic understanding to merge intelligently.
+1. **Commit hashes must match** for true convergence
+2. **Parent determines hash** so ordering is mandatory
+3. **Prolly tree writes are expensive** (the real bottleneck)
+4. **Content-addressed chunks** can be shared (already optimized)
 
-### How It Works
+### Most Promising Approaches
 
+#### 1. N-Way Merge (if Dolt supports deterministic N-way)
+
+**Why**: Reduces O(M) sequential cherry-picks to O(1) merge operation. The Prolly tree is written once, not M times.
+
+**Investigation needed**: Does `DOLT_MERGE` with multiple branches produce deterministic output? If yes, this is the fastest path.
+
+**Estimated improvement**: M concurrent commits → single merge instead of M cherry-picks. 10x+ speedup for M=10.
+
+#### 2. Epoch Batching (architectural change)
+
+**Why**: Changes the model from "sync commits" to "sync operations, then commit identically". All peers create the same commit with the same parent and same tree.
+
+**Trade-off**: Adds latency floor (epoch duration) but guarantees O(1) commits per epoch.
+
+**Estimated improvement**: Predictable convergence time (epoch duration + grace period), regardless of M.
+
+#### 3. Delta Shipping (trust-but-verify)
+
+**Why**: First peer to complete replay computes the canonical tree. Others adopt it directly, skipping replay entirely.
+
+**Trade-off**: Requires validation strategy to prevent malicious tree injection.
+
+**Estimated improvement**: Only 1 peer does full replay. Others converge in O(fetch time).
+
+### Quick Wins (No Architecture Change)
+
+#### A. Detect Fast-Forward Earlier
+
+Current code tries fast-forward after computing merge base. If HLCs are totally ordered (no true concurrency), fast-forward always works.
+
+```go
+// Before fetching, check if all pending HLCs are > local head HLC
+// If yes, guaranteed fast-forward - skip replay setup
 ```
-Commit = { op: "INSERT INTO users VALUES (1, 'Alice')", hlc: ... }
 
-Merge rules:
-  - INSERT + INSERT same key → Keep first (FWW)
-  - UPDATE + UPDATE same row → Merge fields or LWW
-  - DELETE + UPDATE → DELETE wins (or configurable)
-  - Non-overlapping ops → Commutative, order doesn't matter
+#### B. Batch Cherry-Picks
 
-Semantic analysis enables:
-  - Parallel apply of non-conflicting ops
-  - Automatic conflict resolution
-  - Operation compression (10 UPDATEs → 1)
+If Dolt supports applying multiple diffs before committing:
+
+```go
+// Instead of:
+for commit := range commits {
+    DOLT_CHERRY_PICK(commit)  // writes tree
+    DOLT_COMMIT('--amend')    // writes commit
+}
+
+// Try:
+DOLT_CHECKOUT('replay_tmp')
+for commit := range commits {
+    DOLT_CHERRY_PICK('--no-commit', commit)  // stage changes only
+}
+DOLT_COMMIT(...)  // single tree write, single commit
 ```
 
-### Trade-offs
+**Investigation needed**: Does Dolt support `--no-commit` for cherry-pick?
 
-| Pros | Cons |
-|------|------|
-| Operations are naturally mergeable | Schema changes are hard |
-| Can compress operation logs | Requires SQL parsing |
-| Semantic conflict resolution | Complex implementation |
-| Works with existing Dolt | Operation storage overhead |
+#### C. Parallel Fetch + Speculative Replay
 
-### Communication
+Start replay while still fetching:
 
-**Extended metadata**: Store SQL operation in commit metadata (already exists as content hash, could be expanded).
-
-### Suitability
-
-Best for: Known operation patterns, insert-heavy workloads.
-Poor for: Arbitrary SQL, schema evolution, complex transactions.
-
----
-
-## Comparison Matrix
-
-| Model | Convergence Time | Communication | Complexity | Best For |
-|-------|------------------|---------------|------------|----------|
-| Current (HLC Replay) | 5-30s | Low | Medium | General purpose |
-| DAG Multi-Head | ~0s (fetch only) | Low | High | Audit/append-only |
-| Epoch Batching | Epoch duration | Medium | Low | Batch workloads |
-| Content-Based | 1-5s | Low-Medium | Medium | Partitioned data |
-| Vector Clocks | 1-5s | Medium | High | Geo-distributed |
-| Optimistic Accept | ~0s soft, 5s hard | Low | Medium | Write-heavy |
-| Quorum Reads | Write: 0s, Read: varies | High | High | Read-heavy |
-| Operation Log | 1-5s | Low | High | Known patterns |
-
----
-
-## Recommendations
-
-### Quick Wins (Low effort, High impact)
-
-1. **Incremental Index Updates**: Instead of full rebuild, track only new commits since last sync.
-   - Impact: O(N) → O(M) where M << N
-   - Effort: Modify `initIndexFromDB` to accept "since" parameter
-
-2. **Parallel Change Set Check**: Before cherry-pick, compute change sets and batch non-conflicts.
-   - Impact: O(M) sequential → O(1) + O(conflicts) sequential
-   - Effort: Add change set extraction from Dolt diff
-
-3. **Skip Metadata Rewrite for Local Commits**: Local commits already have correct metadata.
-   - Impact: Saves one `DOLT_COMMIT --amend` per local commit in replay
-   - Effort: Track which commits were local vs imported
-
-### Medium-Term (Moderate effort)
-
-4. **Epoch-Based Batching**: If latency floor is acceptable (e.g., 5s epochs).
-   - Impact: Predictable convergence, batched operations
-   - Effort: Add epoch tracking, gossip protocol changes
-
-5. **Content-Based Conflict Detection**: For partitioned/multi-tenant use cases.
-   - Impact: Major speedup for non-conflicting concurrent writes
-   - Effort: Change set extraction, bloom filter in commit ads
-
-### Long-Term (Architecture change)
-
-6. **DAG Multi-Head**: If eventual consistency is acceptable.
-   - Impact: Instant convergence for all cases
-   - Effort: Major query layer changes
-
-7. **Vector Clocks**: For true causal consistency.
-   - Impact: Only orders what must be ordered
-   - Effort: Replace HLC, change commit metadata schema
+```go
+go fetch(remaining_commits)
+replay(already_fetched_commits)  // may need adjustment later
+```
 
 ---
 
 ## Conclusion
 
-The current HLC-ordered linear replay model prioritizes **correctness and simplicity** at the cost of **convergence speed**. For many use cases, this trade-off is acceptable.
+The fundamental challenge is that **Dolt's commit hash depends on parent hash**, forcing sequential ordering for convergence. The current HLC-ordered replay is correct but slow.
 
-For faster convergence while remaining leaderless and minimizing communication, the most promising approaches are:
+The most impactful improvements, in order of feasibility:
 
-1. **Content-Based Conflict Detection** - Biggest bang for buck. Most concurrent writes don't actually conflict, so detecting this early avoids expensive sequential cherry-picks.
+1. **Investigate N-way merge** - If deterministic, provides O(M)→O(1) improvement with minimal changes
 
-2. **Incremental Index Updates** - Pure optimization, no semantic changes. Should be done regardless of other changes.
+2. **Delta shipping** - Let one peer do the work, others adopt the result. Requires trust/validation model.
 
-3. **Epoch Batching** - If predictable latency is more important than minimum latency. Simple to implement, well-understood trade-offs.
+3. **Epoch batching** - Architectural change that guarantees bounded convergence time.
 
-The choice depends on workload characteristics:
-- High-conflict, real-time: Stick with current model + optimizations
-- Partitioned data, low-conflict: Content-Based Detection
-- Batch/analytics: Epoch Batching
-- Audit/append-only: DAG Multi-Head
+4. **Causal DAG** - Most flexible but requires significant query layer changes.
+
+The choice depends on:
+- **Latency requirements**: Need sub-second? Avoid epoch batching.
+- **Trust model**: Can peers trust each other's trees? Enables delta shipping.
+- **Write patterns**: Mostly ordered? Optimistic locking helps. Highly concurrent? N-way merge or epochs.
+
+For a leaderless system with minimal communication, **N-way merge** (if feasible in Dolt) or **epoch batching** offer the best convergence/communication trade-off.
