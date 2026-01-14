@@ -16,6 +16,17 @@ const MaxClockSkew = protocol.MaxClockSkew
 
 type CommitMetadata = protocol.CommitMetadata
 type CommitMetadataForSigning = protocol.CommitMetadataForSigning
+type OriginEnvelope = protocol.OriginEnvelope
+
+// Re-export commit kind constants
+const (
+	CommitKindNormal       = protocol.CommitKindNormal
+	CommitKindResubmission = protocol.CommitKindResubmission
+)
+
+// Re-export metadata helper functions
+var ComputeOriginEventID = protocol.ComputeOriginEventID
+var NewResubmissionMetadata = protocol.NewResubmissionMetadata
 
 type CommitAdV1 = protocol.CommitAdV1
 type Checkpoint = protocol.Checkpoint

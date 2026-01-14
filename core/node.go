@@ -47,6 +47,20 @@ type NodeConfig struct {
 	MaxHintProviders int
 
 	Identity IdentityResolver
+
+	// Watermark configuration for finalization
+	// MinPeersForWatermark is the minimum number of active peers required to compute a watermark.
+	// Zero uses the default (2).
+	MinPeersForWatermark int
+	// WatermarkSlack is the buffer subtracted from min(heads) for conservative finalization.
+	// Zero uses the default (30s).
+	WatermarkSlack time.Duration
+	// PeerActivityTTL is how long before a peer is considered inactive.
+	// Zero uses the default (5m).
+	PeerActivityTTL time.Duration
+	// EnableResubmission controls whether offline commits are automatically resubmitted.
+	// Defaults to true when not explicitly set.
+	EnableResubmission *bool
 }
 
 type hintProviderEntry struct {
@@ -67,6 +81,10 @@ type Node struct {
 	hintProviders map[HLCTimestamp]hintProviderEntry
 	peerHeads     map[string]HLCTimestamp
 	lastProvider  string
+
+	// Peer activity tracking for watermark computation
+	peerActivityMu sync.RWMutex
+	peerActivity   map[string]PeerActivity
 }
 
 func OpenNode(cfg NodeConfig) (*Node, error) {
@@ -107,6 +125,21 @@ func OpenNode(cfg NodeConfig) (*Node, error) {
 		cfg.MaxHintProviders = 4096
 	}
 
+	// Watermark configuration defaults
+	if cfg.MinPeersForWatermark == 0 {
+		cfg.MinPeersForWatermark = 2
+	}
+	if cfg.WatermarkSlack == 0 {
+		cfg.WatermarkSlack = 30 * time.Second
+	}
+	if cfg.PeerActivityTTL == 0 {
+		cfg.PeerActivityTTL = 5 * time.Minute
+	}
+	if cfg.EnableResubmission == nil {
+		t := true
+		cfg.EnableResubmission = &t
+	}
+
 	var (
 		db     *DB
 		ownsDB bool
@@ -139,6 +172,7 @@ func OpenNode(cfg NodeConfig) (*Node, error) {
 		ownsDB:        ownsDB,
 		hintProviders: make(map[HLCTimestamp]hintProviderEntry),
 		peerHeads:     make(map[string]HLCTimestamp),
+		peerActivity:  make(map[string]PeerActivity),
 	}
 
 	n.installReconcilerHooks()
@@ -189,21 +223,35 @@ func (n *Node) installReconcilerHooks() {
 
 func (n *Node) Commit(msg string) (string, error) {
 	n.pullFirstBestEffort()
+
+	// Check for and resubmit any offline commits that need resubmission
+	ctx := context.Background()
+	n.resubmitOfflineCommits(ctx)
+
 	commitHash, err := n.db.Commit(msg)
 	if err != nil {
 		return "", err
 	}
 	n.publishLocalCommitAd(commitHash)
+	// Publish digest immediately after commit to repair missed ads without waiting for RepairInterval
+	n.publishDigestBestEffort()
 	return commitHash, nil
 }
 
 func (n *Node) ExecAndCommit(exec ExecFunc, msg string) (string, error) {
 	n.pullFirstBestEffort()
+
+	// Check for and resubmit any offline commits that need resubmission
+	ctx := context.Background()
+	n.resubmitOfflineCommits(ctx)
+
 	commitHash, err := n.db.ExecAndCommit(exec, msg)
 	if err != nil {
 		return "", err
 	}
 	n.publishLocalCommitAd(commitHash)
+	// Publish digest immediately after commit to repair missed ads without waiting for RepairInterval
+	n.publishDigestBestEffort()
 	return commitHash, nil
 }
 
@@ -314,13 +362,15 @@ func (n *Node) publishLocalCommitAd(commitHash string) {
 	_ = n.idx.SetHead(ctx, meta.HLC, head.Hash)
 	_ = n.idx.AppendCheckpoint(ctx, Checkpoint{HLC: meta.HLC, CommitHash: head.Hash})
 
-	if err := n.cfg.Transport.Gossip().PublishCommitAd(ctx, CommitAdV1{
+	ad := CommitAdV1{
 		Repo:         n.cfg.Repo,
 		HLC:          meta.HLC,
 		MetadataJSON: []byte(head.Message),
 		MetadataSig:  []byte(meta.Signature),
 		ObservedAt:   time.Now(),
-	}); err != nil {
+	}
+	n.cfg.Log.Debugf("[publish] CommitAd hlc=%s repo=%s/%s", ad.HLC, ad.Repo.Org, ad.Repo.RepoName)
+	if err := n.cfg.Transport.Gossip().PublishCommitAd(ctx, ad); err != nil {
 		n.cfg.Log.Debugf("PublishCommitAd failed: %v", err)
 	}
 }
@@ -408,15 +458,22 @@ func (n *Node) Run(ctx context.Context) error {
 				hintMin = HLCTimestamp{}
 				hintMax = HLCTimestamp{}
 				hintMu.Unlock()
-				if err := n.syncOnce(ctx, minH); err != nil {
+				n.cfg.Log.Debugf("[sync] Starting syncOnce (hint min=%s max=%s)", minH, maxH)
+				syncStart := time.Now()
+				syncErr := n.syncOnce(ctx, minH)
+				syncDur := time.Since(syncStart).Round(time.Millisecond)
+				if syncErr != nil {
 					// This is the primary "why aren't we converging?" signal in integration runs,
 					// which usually run at info level (debug is suppressed).
 					if ctx.Err() == nil {
-						n.cfg.Log.Warnf("syncOnce failed: %v", err)
+						n.cfg.Log.Warnf("syncOnce failed after %v: %v", syncDur, syncErr)
 					} else {
-						n.cfg.Log.Debugf("syncOnce failed (ctx done): %v", err)
+						n.cfg.Log.Debugf("syncOnce failed (ctx done) after %v: %v", syncDur, syncErr)
 					}
-				} else if !maxH.IsZero() {
+				} else {
+					n.cfg.Log.Debugf("[sync] syncOnce completed in %v", syncDur)
+				}
+				if !maxH.IsZero() {
 					// If we were triggered by specific adverts/digests and we're still behind the newest one,
 					// schedule another pass soon (avoids waiting for RepairInterval when the first fetch hit a
 					// provider that didn't yet have the objects).
@@ -462,6 +519,7 @@ func (n *Node) Run(ctx context.Context) error {
 		case err := <-syncLoopErr:
 			return err
 		case <-digestTicker.C:
+			n.cfg.Log.Debugf("[repair] RepairInterval tick - publishing digest and requesting sync")
 			n.publishDigestBestEffort()
 			// Anti-entropy: periodically attempt a sync even if we missed commit adverts.
 			requestSync(HLCTimestamp{})
@@ -508,10 +566,21 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 		return
 	}
 
+	shortFrom := from
+	if len(shortFrom) > 12 {
+		shortFrom = shortFrom[:12]
+	}
+	shortPeerID := ad.HLC.PeerID
+	if len(shortPeerID) > 12 {
+		shortPeerID = shortPeerID[:12]
+	}
+
 	// If we've already decided an HLC is applied or rejected, ignore repeated adverts.
 	if n.idx != nil {
 		if e, ok, _ := n.idx.Get(ctx, ad.HLC); ok {
 			if e.Status == CommitStatusApplied || e.Status == CommitStatusRejected {
+				n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s (peer=%s) - already %v, ignoring",
+					shortFrom, ad.HLC, shortPeerID, e.Status)
 				return
 			}
 		}
@@ -521,10 +590,12 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 	n.rememberHintProvider(ad.HLC, from)
 	// Ignore our own adverts; local commits are already present and indexed.
 	if n.cfg.Signer != nil && ad.HLC.PeerID == n.cfg.Signer.GetID() {
+		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - own advert, ignoring", shortFrom, ad.HLC)
 		return
 	}
 	now := time.Now().UnixNano()
 	if n.cfg.MaxClockSkew > 0 && ad.HLC.Wall > now+int64(n.cfg.MaxClockSkew) {
+		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - clock skew rejected", shortFrom, ad.HLC)
 		_ = n.idx.Upsert(ctx, CommitIndexEntry{
 			HLC:       ad.HLC,
 			Status:    CommitStatusRejected,
@@ -535,9 +606,11 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 
 	meta, err := ParseCommitMetadata(string(ad.MetadataJSON))
 	if err != nil || meta == nil {
+		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - metadata parse failed: %v", shortFrom, ad.HLC, err)
 		return
 	}
 	if !meta.HLC.Equal(ad.HLC) {
+		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - HLC mismatch (meta=%s)", shortFrom, ad.HLC, meta.HLC)
 		_ = n.idx.Upsert(ctx, CommitIndexEntry{
 			HLC:       ad.HLC,
 			Status:    CommitStatusRejected,
@@ -546,6 +619,7 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 		return
 	}
 	if len(ad.MetadataSig) > 0 && meta.Signature != string(ad.MetadataSig) {
+		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - signature mismatch", shortFrom, ad.HLC)
 		_ = n.idx.Upsert(ctx, CommitIndexEntry{
 			HLC:       ad.HLC,
 			Status:    CommitStatusRejected,
@@ -562,6 +636,7 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 		pub, err := n.cfg.Identity.PublicKeyForPeerID(ctx, ad.HLC.PeerID)
 		if err != nil || len(pub) == 0 {
 			// Strict mode: when an identity resolver is configured, do not accept unverifiable adverts.
+			n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - identity lookup failed: %v", shortFrom, ad.HLC, err)
 			_ = n.idx.Upsert(ctx, CommitIndexEntry{
 				HLC:       ad.HLC,
 				Status:    CommitStatusRejected,
@@ -570,6 +645,7 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 			return
 		}
 		if n.cfg.Signer == nil || meta.Verify(n.cfg.Signer, string(pub)) != nil {
+			n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - signature verification failed", shortFrom, ad.HLC)
 			_ = n.idx.Upsert(ctx, CommitIndexEntry{
 				HLC:       ad.HLC,
 				Status:    CommitStatusRejected,
@@ -579,12 +655,20 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 		}
 	}
 
+	// Update local HLC from remote timestamp to reduce clock drift and replay churn.
+	// This is a key part of HLC hygiene: observing remote timestamps helps clocks converge.
+	if rec := n.db.GetReconciler(); rec != nil {
+		rec.GetHLC().Update(ad.HLC)
+	}
+
 	_ = n.idx.Upsert(ctx, CommitIndexEntry{
 		HLC:       ad.HLC,
 		Status:    CommitStatusPending,
 		UpdatedAt: time.Now(),
 	})
 
+	n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s (peer=%s) - accepted, requesting sync",
+		shortFrom, ad.HLC, shortPeerID)
 	requestSync(ad.HLC)
 }
 
@@ -592,16 +676,32 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 	if d.Repo != n.cfg.Repo {
 		return
 	}
-	n.observeProvider(from, d.HeadHLC)
+
+	shortFrom := from
+	if len(shortFrom) > 12 {
+		shortFrom = shortFrom[:12]
+	}
+
+	// Observe provider with checkpoints for safe watermark computation
+	n.observeProviderWithCheckpoints(from, d.HeadHLC, d.Checkpoints)
 	if !d.HeadHLC.IsZero() {
 		n.rememberHintProvider(d.HeadHLC, from)
+
+		// Update local HLC from remote head to reduce clock drift and replay churn.
+		if rec := n.db.GetReconciler(); rec != nil {
+			rec.GetHLC().Update(d.HeadHLC)
+		}
 	}
 	head, headMeta, err := n.getHeadMeta(ctx)
 	if err != nil || headMeta == nil || head.Hash == "" {
+		n.cfg.Log.Debugf("[gossip] Digest from=%s headHLC=%s - no local head, requesting sync",
+			shortFrom, d.HeadHLC)
 		requestSync(d.HeadHLC)
 		return
 	}
 	if headMeta.HLC.Less(d.HeadHLC) {
+		n.cfg.Log.Debugf("[gossip] Digest from=%s headHLC=%s - remote ahead (local=%s), requesting sync",
+			shortFrom, d.HeadHLC, headMeta.HLC)
 		requestSync(d.HeadHLC)
 	}
 
@@ -613,6 +713,8 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 		}
 		e, ok, _ := n.idx.Get(ctx, cp.HLC)
 		if !ok || (e.Status != CommitStatusApplied && e.Status != CommitStatusRejected) || (e.CommitHash != "" && e.CommitHash != cp.CommitHash) {
+			n.cfg.Log.Debugf("[gossip] Digest from=%s - missing checkpoint hlc=%s, requesting sync",
+				shortFrom, cp.HLC)
 			requestSync(cp.HLC)
 		}
 	}
@@ -623,11 +725,56 @@ func (n *Node) observeProvider(from string, hlc HLCTimestamp) {
 		return
 	}
 	n.providerMu.Lock()
-	defer n.providerMu.Unlock()
 	n.lastProvider = from
 	if cur, ok := n.peerHeads[from]; !ok || cur.Less(hlc) {
 		n.peerHeads[from] = hlc
 	}
+	n.providerMu.Unlock()
+
+	// Also track peer activity for watermark computation (without checkpoints)
+	n.observePeerActivityInternal(from, hlc, nil)
+}
+
+// observeProviderWithCheckpoints tracks provider with checkpoints from digest
+func (n *Node) observeProviderWithCheckpoints(from string, hlc HLCTimestamp, checkpoints []Checkpoint) {
+	if n == nil || from == "" {
+		return
+	}
+	n.providerMu.Lock()
+	n.lastProvider = from
+	if !hlc.IsZero() {
+		if cur, ok := n.peerHeads[from]; !ok || cur.Less(hlc) {
+			n.peerHeads[from] = hlc
+		}
+	}
+	n.providerMu.Unlock()
+
+	// Track peer activity with checkpoints for safe watermark computation
+	n.observePeerActivityInternal(from, hlc, checkpoints)
+}
+
+// observePeerActivityInternal tracks peer activity for watermark computation
+func (n *Node) observePeerActivityInternal(peerID string, hlc HLCTimestamp, checkpoints []Checkpoint) {
+	if n == nil || peerID == "" {
+		return
+	}
+	n.peerActivityMu.Lock()
+	defer n.peerActivityMu.Unlock()
+
+	now := time.Now()
+	activity, ok := n.peerActivity[peerID]
+	if !ok {
+		activity = PeerActivity{PeerID: peerID}
+	}
+	activity.LastSeenAt = now
+	if !hlc.IsZero() && (activity.HeadHLC.IsZero() || activity.HeadHLC.Less(hlc)) {
+		activity.HeadHLC = hlc
+	}
+	// Update checkpoints if provided (from digest)
+	if len(checkpoints) > 0 {
+		activity.Checkpoints = checkpoints
+	}
+	n.peerActivity[peerID] = activity
 }
 
 func (n *Node) rememberHintProvider(hlc HLCTimestamp, from string) {
@@ -698,6 +845,286 @@ func (n *Node) bestProvider() string {
 		}
 	}
 	return best
+}
+
+// computeCurrentWatermark computes the finalization watermark from observed peer activity
+func (n *Node) computeCurrentWatermark() (HLCTimestamp, bool) {
+	if n == nil {
+		return HLCTimestamp{}, false
+	}
+
+	n.peerActivityMu.RLock()
+	activities := make([]PeerActivity, 0, len(n.peerActivity))
+	for _, a := range n.peerActivity {
+		activities = append(activities, a)
+	}
+	n.peerActivityMu.RUnlock()
+
+	cfg := WatermarkConfig{
+		MinPeersForWatermark: n.cfg.MinPeersForWatermark,
+		SlackDuration:        n.cfg.WatermarkSlack,
+		ActivityTTL:          n.cfg.PeerActivityTTL,
+	}
+	return ComputeWatermark(activities, cfg)
+}
+
+// computeCurrentWatermarkWithCheckpoint computes the watermark and returns the checkpoint to finalize
+func (n *Node) computeCurrentWatermarkWithCheckpoint() (WatermarkResult, bool) {
+	if n == nil {
+		return WatermarkResult{}, false
+	}
+
+	n.peerActivityMu.RLock()
+	activities := make([]PeerActivity, 0, len(n.peerActivity))
+	for _, a := range n.peerActivity {
+		activities = append(activities, a)
+	}
+	n.peerActivityMu.RUnlock()
+
+	cfg := WatermarkConfig{
+		MinPeersForWatermark: n.cfg.MinPeersForWatermark,
+		SlackDuration:        n.cfg.WatermarkSlack,
+		ActivityTTL:          n.cfg.PeerActivityTTL,
+	}
+	return ComputeWatermarkWithCheckpoint(activities, cfg)
+}
+
+// tryAdvanceFinalizedBase attempts to advance the finalized base based on current watermark.
+// SAFETY: Only finalizes commonly-known checkpoints, never arbitrary local commits.
+// This prevents accidentally finalizing local-only offline commits during quiet intervals.
+func (n *Node) tryAdvanceFinalizedBase(ctx context.Context) {
+	if n == nil || n.db == nil || n.idx == nil {
+		return
+	}
+
+	result, ok := n.computeCurrentWatermarkWithCheckpoint()
+	if !ok {
+		return // Not enough peers
+	}
+
+	// SAFETY: Only finalize from commonly-known checkpoints
+	if result.FinalizeCheckpoint.HLC.IsZero() {
+		return // No commonly-known checkpoint at or before watermark
+	}
+
+	currentBase, hasBase, _ := n.idx.FinalizedBase(ctx)
+	if hasBase && !currentBase.HLC.Less(result.FinalizeCheckpoint.HLC) {
+		return // Checkpoint hasn't advanced past current base
+	}
+
+	// The checkpoint HLC is the key; commit hash may vary across peers due to replays.
+	// CRITICAL: We must ALWAYS look up the local commit by HLC to get the correct local hash.
+	// The checkpoint's CommitHash comes from a remote peer's digest and may be different
+	// from our local hash for the same HLC due to replay/reconciliation.
+	var localHash string
+	commits, err := n.db.GetAllCommits()
+	if err == nil {
+		for _, c := range commits {
+			meta, err := ParseCommitMetadata(c.Message)
+			if err == nil && meta.HLC.Equal(result.FinalizeCheckpoint.HLC) {
+				localHash = c.Hash
+				break
+			}
+		}
+	}
+
+	if localHash == "" {
+		// We don't have this checkpoint locally yet; wait for sync
+		return
+	}
+
+	_ = n.idx.SetFinalizedBase(ctx, FinalizedBase{
+		HLC:        result.FinalizeCheckpoint.HLC,
+		CommitHash: localHash,
+		UpdatedAt:  time.Now(),
+	})
+
+	n.cfg.Log.Debugf("Advanced finalized base to commonly-known checkpoint HLC=%s hash=%s",
+		result.FinalizeCheckpoint.HLC, localHash[:min(8, len(localHash))])
+}
+
+// resubmitOfflineCommits checks for local commits that need to be resubmitted
+// because their original HLC is at or before the watermark (late offline commits).
+func (n *Node) resubmitOfflineCommits(ctx context.Context) {
+	if n == nil || n.db == nil || n.idx == nil {
+		return
+	}
+	if n.cfg.EnableResubmission == nil || !*n.cfg.EnableResubmission {
+		return
+	}
+
+	watermark, ok := n.computeCurrentWatermark()
+	if !ok {
+		return // Not enough peers to determine watermark
+	}
+
+	finalizedBase, hasBase, _ := n.idx.FinalizedBase(ctx)
+	if !hasBase {
+		return // No finalized base yet
+	}
+
+	// Get all local commits
+	commits, err := n.db.GetAllCommits()
+	if err != nil {
+		return
+	}
+
+	// Find commits that need resubmission:
+	// - HLC is after finalized base (not yet finalized)
+	// - HLC is at or before watermark (would be finalized by now if canonical)
+	// - Not already in the canonical history via normal sync
+	for _, c := range commits {
+		meta, err := ParseCommitMetadata(c.Message)
+		if err != nil || meta == nil {
+			continue
+		}
+
+		// Skip if already finalized
+		if !IsAfterFinalizedBase(meta.HLC, &finalizedBase) {
+			continue
+		}
+
+		// Skip if after watermark (will be handled normally)
+		if watermark.Less(meta.HLC) {
+			continue
+		}
+
+		// Skip if this is already a resubmission
+		if meta.IsResubmission() {
+			continue
+		}
+
+		// This commit needs resubmission
+		n.resubmitCommit(ctx, c, meta)
+	}
+}
+
+// resubmitCommit creates an actual resubmission commit by cherry-picking
+// the original commit onto current main with resubmission metadata.
+func (n *Node) resubmitCommit(ctx context.Context, original Commit, originalMeta *CommitMetadata) {
+	if n == nil || n.db == nil || n.cfg.Signer == nil {
+		return
+	}
+
+	// Compute origin event ID for idempotency
+	originJSON, err := originalMeta.Marshal()
+	if err != nil {
+		return
+	}
+	originEventID := ComputeOriginEventID(originJSON)
+
+	// Check if already resubmitted (idempotency)
+	if _, found, _ := n.idx.GetOriginEventIDMapping(ctx, originEventID); found {
+		return // Already resubmitted
+	}
+
+	// Lock reconciler to prevent concurrent mutations
+	n.db.reconciler.mu.Lock()
+	defer n.db.reconciler.mu.Unlock()
+
+	// Create resubmission with fresh HLC
+	freshHLC := n.db.reconciler.GetHLC().Now()
+
+	// Get a connection for the cherry-pick operation
+	conn, err := n.db.sqldb.Conn(ctx)
+	if err != nil {
+		n.cfg.Log.Warnf("Failed to get connection for resubmission: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Ensure we're on main
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main');"); err != nil {
+		n.cfg.Log.Warnf("Failed to checkout main for resubmission: %v", err)
+		return
+	}
+
+	// Cherry-pick the original commit onto current main
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_CHERRY_PICK('%s');", original.Hash))
+	if err != nil {
+		// Check if it's a conflict - if so, abort and mark as rejected
+		if isConflictError(err) {
+			n.cfg.Log.Warnf("Conflict resubmitting %s - dropping (FWW)", original.Hash[:8])
+			_, _ = conn.ExecContext(ctx, "CALL DOLT_CHERRY_PICK('--abort');")
+			// Still record the mapping to prevent retry
+			_ = n.idx.SetOriginEventIDMapping(ctx, originEventID, HLCTimestamp{})
+			return
+		}
+		// Check if no changes (already applied)
+		if isNoChangesError(err) {
+			n.cfg.Log.Debugf("No changes to resubmit for %s - already applied", original.Hash[:8])
+			_ = n.idx.SetOriginEventIDMapping(ctx, originEventID, HLCTimestamp{})
+			return
+		}
+		n.cfg.Log.Warnf("Failed to cherry-pick for resubmission: %v", err)
+		return
+	}
+
+	// Create resubmission metadata
+	resubMeta, err := NewResubmissionMetadata(
+		originalMeta.Message,
+		freshHLC,
+		originalMeta.ContentHash,
+		n.cfg.Signer.GetID(),
+		fmt.Sprintf("%s@doltswarm", n.cfg.Signer.GetID()),
+		time.Now(),
+		originalMeta,
+		original.Hash,
+	)
+	if err != nil {
+		n.cfg.Log.Warnf("Failed to create resubmission metadata: %v", err)
+		return
+	}
+
+	if err := resubMeta.Sign(n.cfg.Signer); err != nil {
+		n.cfg.Log.Warnf("Failed to sign resubmission: %v", err)
+		return
+	}
+
+	metaJSON, err := resubMeta.Marshal()
+	if err != nil {
+		n.cfg.Log.Warnf("Failed to marshal resubmission metadata: %v", err)
+		return
+	}
+
+	// Amend the cherry-picked commit with resubmission metadata
+	_, err = conn.ExecContext(ctx, fmt.Sprintf(
+		"CALL DOLT_COMMIT('--amend', '-m', '%s', '--author', '%s <%s>', '--date', '%s');",
+		escapeSQL(metaJSON),
+		escapeSQL(n.cfg.Signer.GetID()),
+		escapeSQL(fmt.Sprintf("%s@doltswarm", n.cfg.Signer.GetID())),
+		time.Now().Format(time.RFC3339Nano),
+	))
+	if err != nil {
+		n.cfg.Log.Warnf("Failed to amend resubmission commit: %v", err)
+		return
+	}
+
+	// Get the new commit hash
+	var newCommitHash string
+	if err := conn.QueryRowContext(ctx, "SELECT HASHOF('HEAD');").Scan(&newCommitHash); err != nil {
+		n.cfg.Log.Warnf("Failed to get resubmission commit hash: %v", err)
+		return
+	}
+
+	// Record idempotency mapping
+	_ = n.idx.SetOriginEventIDMapping(ctx, originEventID, freshHLC)
+
+	// Publish resubmission ad (now there's an actual commit to fetch)
+	if n.cfg.Transport != nil && n.cfg.Transport.Gossip() != nil {
+		if err := n.cfg.Transport.Gossip().PublishCommitAd(ctx, CommitAdV1{
+			Repo:         n.cfg.Repo,
+			HLC:          freshHLC,
+			MetadataJSON: []byte(metaJSON),
+			MetadataSig:  []byte(resubMeta.Signature),
+			ObservedAt:   time.Now(),
+		}); err != nil {
+			n.cfg.Log.Debugf("Failed to publish resubmission ad: %v", err)
+		}
+	}
+
+	n.cfg.Log.Infof("Resubmitted offline commit %s as %s with origin HLC=%s, new HLC=%s",
+		original.Hash[:8], newCommitHash[:8], originalMeta.HLC, freshHLC)
 }
 
 func (n *Node) initIndexFromDB(ctx context.Context) error {
@@ -793,6 +1220,24 @@ func (n *Node) syncOnce(ctx context.Context, hint HLCTimestamp) error {
 		ctx = WithPreferredProvider(ctx, from)
 	}
 
+	// Do the actual sync (with mutex held), track if we should resubmit after
+	shouldResubmit, err := n.syncOnceInner(ctx, hint)
+	if err != nil {
+		return err
+	}
+
+	// Resubmit late offline commits AFTER releasing reconciler mutex to avoid deadlock.
+	// resubmitCommit also takes the reconciler mutex internally.
+	if shouldResubmit {
+		n.resubmitOfflineCommits(ctx)
+	}
+
+	return nil
+}
+
+// syncOnceInner performs the actual sync with mutexes held.
+// Returns true if resubmission should be attempted after releasing mutexes.
+func (n *Node) syncOnceInner(ctx context.Context, hint HLCTimestamp) (shouldResubmit bool, err error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -808,55 +1253,63 @@ func (n *Node) syncOnce(ctx context.Context, hint HLCTimestamp) error {
 	defer cancel()
 
 	if err := n.db.EnsureSwarmRemote(innerCtx, n.cfg.Repo); err != nil {
-		return err
+		return false, err
 	}
 	if err := n.db.FetchSwarm(innerCtx); err != nil {
-		return err
+		return false, err
 	}
 
 	remoteRef := "remotes/swarm/main"
 	remoteHead, ok, err := n.db.GetBranchHead(innerCtx, remoteRef)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !ok {
 		// Nothing fetched yet (no remote branch).
-		return nil
+		return false, nil
 	}
 
 	mergeBase, err := n.db.MergeBase(innerCtx, "main", remoteRef)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if mergeBase == "" {
 		// Bootstrap: no shared history. Force main to the remote head and rebuild.
 		if err := n.forceResetMainTo(innerCtx, remoteHead); err != nil {
-			return err
+			return false, err
 		}
 		_ = n.initIndexFromDB(innerCtx)
-		return nil
+		return false, nil
 	}
 
 	imported, err := n.db.reconciler.getCommitsSince(innerCtx, n.db.sqldb, remoteRef, mergeBase)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(imported) == 0 {
-		return nil
+		return false, nil
+	}
+
+	// Get finalized base for tail-only linearization
+	var fb *FinalizedBase
+	if base, ok, _ := n.idx.FinalizedBase(innerCtx); ok {
+		fb = &base
 	}
 
 	// Try the cheap path first.
 	if ok, err := n.tryFastForward(innerCtx, remoteHead); err == nil && ok {
 		_ = n.initIndexFromDB(innerCtx)
-		return nil
+		n.tryAdvanceFinalizedBase(innerCtx)
+		return true, nil // Signal to resubmit after releasing mutex
 	}
 
-	if err := n.db.reconciler.ReplayImported(innerCtx, mergeBase, imported); err != nil {
-		return err
+	if err := n.db.reconciler.ReplayImported(innerCtx, mergeBase, imported, fb); err != nil {
+		return false, err
 	}
 
 	_ = n.initIndexFromDB(innerCtx)
-	return nil
+	n.tryAdvanceFinalizedBase(innerCtx)
+	return true, nil // Signal to resubmit after releasing mutex
 }
 
 func (n *Node) updateHeadIndexBestEffort(ctx context.Context) {

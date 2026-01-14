@@ -78,7 +78,13 @@ func (r *Reconciler) GetHLC() *HLC { return r.hlc }
 //
 // Imported commits are expected to be present in the local object store (e.g. via ImportBundle),
 // so they can be cherry-picked by hash.
-func (r *Reconciler) ReplayImported(ctx context.Context, mergeBase string, imported []Commit) error {
+//
+// If finalizedBase is non-nil, commits at or before the finalized HLC are filtered out
+// (tail-only linearization). This ensures the finalized prefix is never rewritten.
+//
+// SAFETY: When finalizedBase is set, the effective base for replay is the finalized base
+// commit hash, not the merge base. This ensures we never rewrite finalized history.
+func (r *Reconciler) ReplayImported(ctx context.Context, mergeBase string, imported []Commit, finalizedBase *FinalizedBase) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -88,26 +94,64 @@ func (r *Reconciler) ReplayImported(ctx context.Context, mergeBase string, impor
 		return err
 	}
 
-	localCommits, err := r.getCommitsSince(ctx, r.db.sqldb, "main", mergeBase)
+	// Determine effective base:
+	// - If finalizedBase is set, use it as the base (never replay finalized commits)
+	// - Otherwise, use the merge base
+	effectiveBase := mergeBase
+	if finalizedBase != nil && finalizedBase.CommitHash != "" {
+		// Use finalized base if it's on our history and after merge base
+		// This ensures we never rewrite the finalized prefix
+		effectiveBase = finalizedBase.CommitHash
+		r.log.Debugf("Using finalized base %s (HLC=%s) as effective base instead of merge base %s",
+			finalizedBase.CommitHash[:8], finalizedBase.HLC, mergeBase[:8])
+	}
+
+	localCommits, err := r.getCommitsSince(ctx, r.db.sqldb, "main", effectiveBase)
 	if err != nil {
 		return fmt.Errorf("failed to get local commits: %w", err)
 	}
 
-	allCommits := make([]commitWithMeta, 0, len(localCommits)+len(imported))
+	// For imported commits, also filter starting from effective base
+	var filteredImported []Commit
+	for _, c := range imported {
+		meta, err := ParseCommitMetadata(c.Message)
+		if err != nil || meta == nil {
+			filteredImported = append(filteredImported, c)
+			continue
+		}
+		// Only include commits after finalized base
+		if finalizedBase == nil || finalizedBase.HLC.IsZero() || finalizedBase.HLC.Less(meta.HLC) {
+			filteredImported = append(filteredImported, c)
+		}
+	}
+
+	allCommits := make([]commitWithMeta, 0, len(localCommits)+len(filteredImported))
 	for _, c := range localCommits {
 		allCommits = append(allCommits, commitWithMeta{commit: c, sourceBranch: "main"})
 	}
-	for _, c := range imported {
+	for _, c := range filteredImported {
 		allCommits = append(allCommits, commitWithMeta{commit: c, sourceBranch: "import"})
 	}
 
 	allCommits = deduplicateByHLCDeterministic(allCommits)
 	sortCommitsByHLC(allCommits)
+
+	// Additional safety filter: ensure no commits at or before finalized base slip through
+	if finalizedBase != nil && !finalizedBase.HLC.IsZero() {
+		filtered := make([]commitWithMeta, 0, len(allCommits))
+		for _, cwm := range allCommits {
+			if IsAfterFinalizedBase(cwm.hlc, finalizedBase) {
+				filtered = append(filtered, cwm)
+			}
+		}
+		allCommits = filtered
+	}
+
 	if len(allCommits) == 0 {
 		return nil
 	}
 
-	return r.replayToTempBranchThenUpdateMain(ctx, mergeBase, head.Hash, allCommits)
+	return r.replayToTempBranchThenUpdateMain(ctx, effectiveBase, head.Hash, allCommits)
 }
 
 func deduplicateByHLCDeterministic(commits []commitWithMeta) []commitWithMeta {

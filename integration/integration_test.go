@@ -187,14 +187,14 @@ type ConvergenceResult struct {
 // WriteBatchTiming tracks timing from when writes start to when HEAD converges
 // This is the correct approach because commit hashes change during reconciliation
 type WriteBatchTiming struct {
-	Description       string        // e.g., "commit 0", "round 1", "concurrent batch"
-	CommitsCreated    int           // Number of commits in this batch
-	WriteStartedAt    time.Time     // When writes began
-	WriteCompletedAt  time.Time     // When all writes completed
-	ConvergedAt       time.Time     // When HEAD convergence was achieved
-	WriteDuration     time.Duration // Time to execute writes
+	Description         string        // e.g., "commit 0", "round 1", "concurrent batch"
+	CommitsCreated      int           // Number of commits in this batch
+	WriteStartedAt      time.Time     // When writes began
+	WriteCompletedAt    time.Time     // When all writes completed
+	ConvergedAt         time.Time     // When HEAD convergence was achieved
+	WriteDuration       time.Duration // Time to execute writes
 	ConvergenceDuration time.Duration // Time from write completion to convergence
-	TotalPropagation  time.Duration // Time from first write to convergence
+	TotalPropagation    time.Duration // Time from first write to convergence
 }
 
 // RoundMetrics tracks timing for a round of writes
@@ -219,10 +219,10 @@ type TestMetrics struct {
 	HeadConvergence    *ConvergenceResult
 	HistoryConvergence *ConvergenceResult
 	// Computed stats
-	AvgPropagationTime time.Duration
-	MaxPropagationTime time.Duration
-	MinPropagationTime time.Duration
-	TotalWriteTime     time.Duration
+	AvgPropagationTime   time.Duration
+	MaxPropagationTime   time.Duration
+	MinPropagationTime   time.Duration
+	TotalWriteTime       time.Duration
 	TotalConvergenceTime time.Duration
 }
 
@@ -1880,14 +1880,14 @@ func TestCommitOrderConsistency(t *testing.T) {
 
 		// Add batch timing for this round
 		batchTiming := &WriteBatchTiming{
-			Description:       fmt.Sprintf("round %d", round),
-			CommitsCreated:    commitsCreated,
-			WriteStartedAt:    writesStart,
-			WriteCompletedAt:  writesStart.Add(roundMetrics.WritesDuration),
-			ConvergedAt:       time.Now(),
-			WriteDuration:     roundMetrics.WritesDuration,
+			Description:         fmt.Sprintf("round %d", round),
+			CommitsCreated:      commitsCreated,
+			WriteStartedAt:      writesStart,
+			WriteCompletedAt:    writesStart.Add(roundMetrics.WritesDuration),
+			ConvergedAt:         time.Now(),
+			WriteDuration:       roundMetrics.WritesDuration,
 			ConvergenceDuration: roundMetrics.ConvergenceDuration,
-			TotalPropagation:  roundMetrics.TotalDuration,
+			TotalPropagation:    roundMetrics.TotalDuration,
 		}
 		metrics.AddBatchTiming(batchTiming)
 		metrics.AddRoundMetrics(roundMetrics)

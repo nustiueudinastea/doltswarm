@@ -17,11 +17,16 @@ type MemoryCommitIndex struct {
 	headHash string
 
 	checkpoints []Checkpoint // newest->oldest
+
+	// Finalization state
+	finalizedBase    *FinalizedBase
+	originEventIDMap map[string]HLCTimestamp // origin_event_id -> resubmission HLC
 }
 
 func NewMemoryCommitIndex() *MemoryCommitIndex {
 	return &MemoryCommitIndex{
-		entries: make(map[string]CommitIndexEntry),
+		entries:          make(map[string]CommitIndexEntry),
+		originEventIDMap: make(map[string]HLCTimestamp),
 	}
 }
 
@@ -33,6 +38,8 @@ func (m *MemoryCommitIndex) resetForRebuild() {
 	m.headHLC = HLCTimestamp{}
 	m.headHash = ""
 	m.checkpoints = nil
+	// Note: finalizedBase and originEventIDMap are intentionally preserved across rebuilds
+	// as they represent durable finalization state that should not be lost.
 }
 
 func (m *MemoryCommitIndex) Upsert(_ context.Context, e CommitIndexEntry) error {
@@ -105,5 +112,53 @@ func (m *MemoryCommitIndex) AppendCheckpoint(_ context.Context, cp Checkpoint) e
 	defer m.mu.Unlock()
 	// Prepend newest; keep simple and allow duplicates for now.
 	m.checkpoints = append([]Checkpoint{cp}, m.checkpoints...)
+	return nil
+}
+
+// FinalizedBase returns the current finalized base
+func (m *MemoryCommitIndex) FinalizedBase(_ context.Context) (FinalizedBase, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.finalizedBase == nil {
+		return FinalizedBase{}, false, nil
+	}
+	return *m.finalizedBase, true, nil
+}
+
+// SetFinalizedBase updates the finalized base with monotonic advancement
+func (m *MemoryCommitIndex) SetFinalizedBase(_ context.Context, fb FinalizedBase) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Only advance if the new base is strictly after the current one
+	if m.finalizedBase != nil {
+		if fb.HLC.Less(m.finalizedBase.HLC) || fb.HLC.Equal(m.finalizedBase.HLC) {
+			return nil // Ignore non-advancing updates
+		}
+	}
+
+	if fb.UpdatedAt.IsZero() {
+		fb.UpdatedAt = time.Now()
+	}
+	m.finalizedBase = &fb
+	return nil
+}
+
+// GetOriginEventIDMapping checks if an origin_event_id has been resubmitted
+func (m *MemoryCommitIndex) GetOriginEventIDMapping(_ context.Context, originEventID string) (HLCTimestamp, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	hlc, ok := m.originEventIDMap[originEventID]
+	return hlc, ok, nil
+}
+
+// SetOriginEventIDMapping records a resubmission for idempotency
+func (m *MemoryCommitIndex) SetOriginEventIDMapping(_ context.Context, originEventID string, newHLC HLCTimestamp) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.originEventIDMap == nil {
+		m.originEventIDMap = make(map[string]HLCTimestamp)
+	}
+	m.originEventIDMap[originEventID] = newHLC
 	return nil
 }

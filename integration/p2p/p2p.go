@@ -81,6 +81,11 @@ type P2P struct {
 	peerMu          cmap.ConcurrentMap // Per-peer mutex to prevent races
 	shuttingDown    bool               // Flag to prevent new removals during shutdown
 	shutdownMu      sync.Mutex         // Mutex for shutdown flag
+
+	// Dolt-capable peers: peers that were discovered through bootstrap or mDNS
+	// (as opposed to incoming connections from non-Dolt clients like test orchestrators).
+	// Only these peers should be used for Dolt chunk sync operations.
+	doltCapablePeers cmap.ConcurrentMap
 }
 
 type P2PKey struct {
@@ -297,7 +302,10 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 
 				p2p.log.Infof("Connected to %s", peerIDStr)
 				p2p.clients.Set(peerIDStr, client)
-				p2p.log.Debugf("Added P2P client for peer %s (total clients: %d)", peerIDStr, p2p.clients.Count())
+				// Mark as Dolt-capable since this peer was discovered through bootstrap/mDNS
+				p2p.doltCapablePeers.Set(peerIDStr, true)
+				p2p.log.Debugf("Added P2P client for peer %s (total clients: %d, dolt-capable: %d)",
+					peerIDStr, p2p.clients.Count(), p2p.doltCapablePeers.Count())
 
 				// Protect this peer's connection from being pruned by connection manager
 				p2p.protectPeer(peerInfo.ID)
@@ -513,7 +521,9 @@ func (p2p *P2P) closeConnectionHandler(netw network.Network, conn network.Conn) 
 		}
 
 		p2p.clients.Remove(peerIDStr)
-		p2p.log.Debugf("Removed P2P client for peer %s (remaining clients: %d)", peerIDStr, p2p.clients.Count())
+		p2p.doltCapablePeers.Remove(peerIDStr)
+		p2p.log.Debugf("Removed P2P client for peer %s (remaining clients: %d, dolt-capable: %d)",
+			peerIDStr, p2p.clients.Count(), p2p.doltCapablePeers.Count())
 	}()
 }
 
@@ -530,6 +540,8 @@ func (p2p *P2P) SetNode(n *doltswarm.Node) {
 }
 
 // SnapshotConns returns a snapshot of currently connected gRPC conns keyed by peer ID.
+// Only returns Dolt-capable peers (those discovered through bootstrap/mDNS), filtering out
+// incoming connections from non-Dolt clients (like test orchestrators).
 // Used for provider-agnostic bundle exchange.
 func (p2p *P2P) SnapshotConns() map[string]grpc.ClientConnInterface {
 	out := make(map[string]grpc.ClientConnInterface)
@@ -539,6 +551,11 @@ func (p2p *P2P) SnapshotConns() map[string]grpc.ClientConnInterface {
 	for _, v := range p2p.clients.Items() {
 		c, ok := v.(*P2PClient)
 		if !ok || c == nil || c.conn == nil || c.id == "" {
+			continue
+		}
+		// Only include Dolt-capable peers (discovered through bootstrap/mDNS)
+		// This filters out incoming connections from non-Dolt clients like test orchestrators
+		if _, isDoltCapable := p2p.doltCapablePeers.Get(c.id); !isDoltCapable {
 			continue
 		}
 		out[c.id] = c.conn
@@ -769,16 +786,17 @@ func NewManagerWithConfig(cfg P2PConfig) (*P2P, error) {
 	}
 
 	p2p := &P2P{
-		PeerChan:        make(chan peer.AddrInfo),
-		peerListChan:    cfg.PeerListChan,
-		clients:         cmap.New(),
-		log:             cfg.Logger,
-		grpcServer:      grpc.NewServer(p2pgrpc.WithP2PCredentials()),
-		externalDB:      cfg.ExternalDB,
-		prvKey:          cfg.Key.PrivateKey(),
-		bootstrapPeers:  cfg.BootstrapPeers,
-		pendingRemovals: cmap.New(),
-		peerMu:          cmap.New(),
+		PeerChan:         make(chan peer.AddrInfo),
+		peerListChan:     cfg.PeerListChan,
+		clients:          cmap.New(),
+		log:              cfg.Logger,
+		grpcServer:       grpc.NewServer(p2pgrpc.WithP2PCredentials()),
+		externalDB:       cfg.ExternalDB,
+		prvKey:           cfg.Key.PrivateKey(),
+		bootstrapPeers:   cfg.BootstrapPeers,
+		pendingRemovals:  cmap.New(),
+		peerMu:           cmap.New(),
+		doltCapablePeers: cmap.New(),
 	}
 
 	// Connection manager with grace period to avoid premature connection pruning
