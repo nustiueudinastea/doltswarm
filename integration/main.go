@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -33,6 +35,24 @@ var dbName = "doltswarmdemo"
 var tableName = "testtable"
 var nodei *doltswarm.Node
 var signer doltswarm.Signer
+
+func envBool(name string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+func envIntDefault(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Warnf("Invalid %s=%q; using default %d", name, v, def)
+		return def
+	}
+	return n
+}
 
 func catchSignals(sigs chan os.Signal, wg *sync.WaitGroup) {
 	sig := <-sigs
@@ -72,7 +92,7 @@ func p2pRun(noGUI bool, noCommits bool, commitInterval int) error {
 			log.Warnf("Failed to initialize GossipSub: %v", err)
 		} else {
 			providers := &grpcswarm.Providers{Src: p2pmgr}
-			tr := &overlay.Transport{G: gossip, P: providers, C: p2pmgr}
+			tr := &overlay.Transport{G: gossip, P: providers, C: p2pmgr, K: p2pmgr}
 			nodei, err = doltswarm.OpenNode(doltswarm.NodeConfig{
 				Repo:      doltswarm.RepoID{RepoName: dbName},
 				Signer:    signer,
@@ -331,7 +351,7 @@ func Init(localInit bool, peerInit string, port int) error {
 			return fmt.Errorf("failed to init gossip: %w", gErr)
 		}
 		providers := &grpcswarm.Providers{Src: p2pmgr}
-		tr := &overlay.Transport{G: gossip, P: providers, C: p2pmgr}
+		tr := &overlay.Transport{G: gossip, P: providers, C: p2pmgr, K: p2pmgr}
 		node, nErr := doltswarm.OpenNode(doltswarm.NodeConfig{
 			Repo:      doltswarm.RepoID{RepoName: dbName},
 			Signer:    signer,
@@ -426,6 +446,12 @@ func main() {
 			Logger:         log,
 			ExternalDB:     dbi,
 			BootstrapPeers: bootstrapPeers.Value(),
+			MaxPeers:       envIntDefault("MAX_PEERS", 0),
+			MinPeers:       envIntDefault("MIN_PEERS", 0),
+			AllowlistedPeers: strings.FieldsFunc(os.Getenv("ALLOWLIST_PEERS"), func(r rune) bool {
+				return r == ',' || r == ' ' || r == '\n' || r == '\t'
+			}),
+			UnlimitedStart: envBool("UNLIMITED_START"),
 		})
 		if err != nil {
 			return fmt.Errorf("failed to create p2p manager: %v", err)

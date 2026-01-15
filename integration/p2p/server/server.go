@@ -20,12 +20,22 @@ type ExternalDB interface {
 	GetLastCommit(branch string) (doltswarm.Commit, error)
 }
 
+type PeerLimiter interface {
+	SetPeerLimits(maxPeers, minPeers int)
+}
+
+type PeerStats interface {
+	PeerCounts() (hostPeers, grpcPeers, gossipPeers int)
+}
+
 type Server struct {
 	proto.UnimplementedPingerServer
 	proto.UnimplementedTesterServer
 
-	DB   ExternalDB
-	Node *doltswarm.Node
+	DB      ExternalDB
+	Node    *doltswarm.Node
+	Limiter PeerLimiter
+	Stats   PeerStats
 }
 
 func (s *Server) Ping(ctx context.Context, req *proto.PingRequest) (*proto.PingResponse, error) {
@@ -100,4 +110,24 @@ func (s *Server) GetHead(context.Context, *proto.GetHeadRequest) (*proto.GetHead
 		return nil, err
 	}
 	return &proto.GetHeadResponse{Commit: commit.Hash}, nil
+}
+
+func (s *Server) SetPeerLimits(ctx context.Context, req *proto.SetPeerLimitsRequest) (*proto.SetPeerLimitsResponse, error) {
+	if s.Limiter != nil {
+		s.Limiter.SetPeerLimits(int(req.GetMax()), int(req.GetMin()))
+		return &proto.SetPeerLimitsResponse{}, nil
+	}
+	return &proto.SetPeerLimitsResponse{Err: "peer limiter not configured"}, nil
+}
+
+func (s *Server) GetPeerCounts(ctx context.Context, req *proto.GetPeerCountsRequest) (*proto.GetPeerCountsResponse, error) {
+	if s.Stats == nil {
+		return &proto.GetPeerCountsResponse{Err: "peer stats not configured"}, nil
+	}
+	hostPeers, grpcPeers, gossipPeers := s.Stats.PeerCounts()
+	return &proto.GetPeerCountsResponse{
+		HostPeers:   int32(hostPeers),
+		GrpcPeers:   int32(grpcPeers),
+		GossipPeers: int32(gossipPeers),
+	}, nil
 }

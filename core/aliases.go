@@ -92,3 +92,4 @@ func UsedProviderTrackerFromContext(ctx context.Context) *UsedProviderTracker {
 
 // PeerConnector is an optional interface for proactive connection establishment.
 type PeerConnector = transport.PeerConnector
+type PeerConnectivity = transport.PeerConnectivity

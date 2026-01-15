@@ -7,6 +7,7 @@ import (
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/nustiueudinastea/doltswarm"
 	iproto "github.com/nustiueudinastea/doltswarm/integration/proto"
 	"github.com/sirupsen/logrus"
@@ -23,7 +24,7 @@ type GossipSubGossip struct {
 	log   *logrus.Entry
 }
 
-func New(ctx context.Context, h host.Host, logger *logrus.Entry, topic string) (*GossipSubGossip, error) {
+func New(ctx context.Context, h host.Host, logger *logrus.Entry, topic string, opts ...pubsub.Option) (*GossipSubGossip, error) {
 	if logger == nil {
 		logger = logrus.NewEntry(logrus.StandardLogger())
 	}
@@ -34,7 +35,7 @@ func New(ctx context.Context, h host.Host, logger *logrus.Entry, topic string) (
 		ctx = context.Background()
 	}
 
-	ps, err := pubsub.NewGossipSub(ctx, h)
+	ps, err := pubsub.NewGossipSub(ctx, h, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -48,6 +49,22 @@ func New(ctx context.Context, h host.Host, logger *logrus.Entry, topic string) (
 		topic: t,
 		log:   logger.WithField("component", "gossipsub"),
 	}, nil
+}
+
+// EventHandler exposes topic peer join/leave events for integration-layer coordination.
+func (g *GossipSubGossip) EventHandler(opts ...pubsub.TopicEventHandlerOpt) (*pubsub.TopicEventHandler, error) {
+	if g == nil || g.topic == nil {
+		return nil, fmt.Errorf("gossipsub topic is not initialized")
+	}
+	return g.topic.EventHandler(opts...)
+}
+
+// ListPeers returns the peers currently connected on the topic.
+func (g *GossipSubGossip) ListPeers() []peer.ID {
+	if g == nil || g.topic == nil {
+		return nil
+	}
+	return g.topic.ListPeers()
 }
 
 func (g *GossipSubGossip) PublishCommitAd(ctx context.Context, ad doltswarm.CommitAdV1) error {

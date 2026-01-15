@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v6.33.0
-// source: proto/tester.proto
+// source: tester.proto
 
 package proto
 
@@ -22,6 +22,8 @@ const (
 	Tester_ExecSQL_FullMethodName       = "/proto.Tester/ExecSQL"
 	Tester_GetAllCommits_FullMethodName = "/proto.Tester/GetAllCommits"
 	Tester_GetHead_FullMethodName       = "/proto.Tester/GetHead"
+	Tester_SetPeerLimits_FullMethodName = "/proto.Tester/SetPeerLimits"
+	Tester_GetPeerCounts_FullMethodName = "/proto.Tester/GetPeerCounts"
 )
 
 // TesterClient is the client API for Tester service.
@@ -31,6 +33,8 @@ type TesterClient interface {
 	ExecSQL(ctx context.Context, in *ExecSQLRequest, opts ...grpc.CallOption) (*ExecSQLResponse, error)
 	GetAllCommits(ctx context.Context, in *GetAllCommitsRequest, opts ...grpc.CallOption) (*GetAllCommitsResponse, error)
 	GetHead(ctx context.Context, in *GetHeadRequest, opts ...grpc.CallOption) (*GetHeadResponse, error)
+	SetPeerLimits(ctx context.Context, in *SetPeerLimitsRequest, opts ...grpc.CallOption) (*SetPeerLimitsResponse, error)
+	GetPeerCounts(ctx context.Context, in *GetPeerCountsRequest, opts ...grpc.CallOption) (*GetPeerCountsResponse, error)
 }
 
 type testerClient struct {
@@ -71,6 +75,26 @@ func (c *testerClient) GetHead(ctx context.Context, in *GetHeadRequest, opts ...
 	return out, nil
 }
 
+func (c *testerClient) SetPeerLimits(ctx context.Context, in *SetPeerLimitsRequest, opts ...grpc.CallOption) (*SetPeerLimitsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetPeerLimitsResponse)
+	err := c.cc.Invoke(ctx, Tester_SetPeerLimits_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *testerClient) GetPeerCounts(ctx context.Context, in *GetPeerCountsRequest, opts ...grpc.CallOption) (*GetPeerCountsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetPeerCountsResponse)
+	err := c.cc.Invoke(ctx, Tester_GetPeerCounts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // TesterServer is the server API for Tester service.
 // All implementations must embed UnimplementedTesterServer
 // for forward compatibility.
@@ -78,6 +102,8 @@ type TesterServer interface {
 	ExecSQL(context.Context, *ExecSQLRequest) (*ExecSQLResponse, error)
 	GetAllCommits(context.Context, *GetAllCommitsRequest) (*GetAllCommitsResponse, error)
 	GetHead(context.Context, *GetHeadRequest) (*GetHeadResponse, error)
+	SetPeerLimits(context.Context, *SetPeerLimitsRequest) (*SetPeerLimitsResponse, error)
+	GetPeerCounts(context.Context, *GetPeerCountsRequest) (*GetPeerCountsResponse, error)
 	mustEmbedUnimplementedTesterServer()
 }
 
@@ -96,6 +122,12 @@ func (UnimplementedTesterServer) GetAllCommits(context.Context, *GetAllCommitsRe
 }
 func (UnimplementedTesterServer) GetHead(context.Context, *GetHeadRequest) (*GetHeadResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetHead not implemented")
+}
+func (UnimplementedTesterServer) SetPeerLimits(context.Context, *SetPeerLimitsRequest) (*SetPeerLimitsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetPeerLimits not implemented")
+}
+func (UnimplementedTesterServer) GetPeerCounts(context.Context, *GetPeerCountsRequest) (*GetPeerCountsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPeerCounts not implemented")
 }
 func (UnimplementedTesterServer) mustEmbedUnimplementedTesterServer() {}
 func (UnimplementedTesterServer) testEmbeddedByValue()                {}
@@ -172,6 +204,42 @@ func _Tester_GetHead_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Tester_SetPeerLimits_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetPeerLimitsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TesterServer).SetPeerLimits(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tester_SetPeerLimits_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TesterServer).SetPeerLimits(ctx, req.(*SetPeerLimitsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tester_GetPeerCounts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPeerCountsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TesterServer).GetPeerCounts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tester_GetPeerCounts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TesterServer).GetPeerCounts(ctx, req.(*GetPeerCountsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Tester_ServiceDesc is the grpc.ServiceDesc for Tester service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -191,7 +259,15 @@ var Tester_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "GetHead",
 			Handler:    _Tester_GetHead_Handler,
 		},
+		{
+			MethodName: "SetPeerLimits",
+			Handler:    _Tester_SetPeerLimits_Handler,
+		},
+		{
+			MethodName: "GetPeerCounts",
+			Handler:    _Tester_GetPeerCounts_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "proto/tester.proto",
+	Metadata: "tester.proto",
 }

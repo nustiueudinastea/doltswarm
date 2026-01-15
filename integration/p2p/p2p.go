@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	p2pgrpc "github.com/birros/go-libp2p-grpc"
 	remotesapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/remotesapi/v1alpha1"
 	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -38,10 +40,13 @@ const (
 	protosRPCProtocol = protocol.ID("/protos/rpc/0.0.1")
 
 	// Connection stability settings
-	peerRemovalDelay   = 30 * time.Second // Delay before removing a disconnected peer
-	connGracePeriod    = 30 * time.Second // Grace period for new connections
-	connManagerLowMark = 50               // Low watermark for connection manager
-	connManagerHiMark  = 200              // High watermark for connection manager
+	connGracePeriod = 30 * time.Second // Grace period for new connections
+
+	defaultMaxPeers            = 12
+	defaultMinPeers            = 8
+	defaultRejectBackoff       = 30 * time.Second
+	defaultRejectBackoffMax    = 5 * time.Minute
+	defaultConnectLoopInterval = 2 * time.Second
 )
 
 type P2PClient struct {
@@ -76,20 +81,40 @@ type P2P struct {
 	bootstrapPeers []string
 	node           *doltswarm.Node
 
-	// Connection stability
-	pendingRemovals cmap.ConcurrentMap // Peers pending removal (debounce)
-	peerMu          cmap.ConcurrentMap // Per-peer mutex to prevent races
-	shuttingDown    bool               // Flag to prevent new removals during shutdown
-	shutdownMu      sync.Mutex         // Mutex for shutdown flag
+	// Connection coordination
+	peerMu       cmap.ConcurrentMap // Per-peer mutex to prevent races
+	shuttingDown bool               // Flag to prevent new removals during shutdown
+	shutdownMu   sync.Mutex         // Mutex for shutdown flag
 
-	// Dolt-capable peers: peers that were discovered through bootstrap or mDNS
-	// (as opposed to incoming connections from non-Dolt clients like test orchestrators).
-	// Only these peers should be used for Dolt chunk sync operations.
-	doltCapablePeers cmap.ConcurrentMap
+	// Peer policy (gRPC clients are derived from gossip peers)
+	maxPeers            int
+	minPeers            int
+	rejectBackoff       time.Duration
+	rejectBackoffMax    time.Duration
+	connectLoopInterval time.Duration
+	allowlistedPeers    map[string]struct{}
+	unlimitedStart      bool
+
+	knownPeersMu sync.Mutex
+	knownPeers   map[string]*knownPeer
+
+	gossipMu     sync.RWMutex
+	gossip       *gossipsub.GossipSubGossip
+	gossipCancel context.CancelFunc
 }
 
 type P2PKey struct {
 	prvKey crypto.PrivKey
+}
+
+type knownPeer struct {
+	info             peer.AddrInfo
+	lastSeen         time.Time
+	lastAttempt      time.Time
+	rejectedUntil    time.Time
+	rejects          int
+	lastRejectReason string
+	connected        bool
 }
 
 func (p2p *P2PKey) Sign(commit string) (string, error) {
@@ -155,7 +180,11 @@ func (p2p *P2PKey) GetID() string {
 }
 
 func (p2p *P2P) HandlePeerFound(pi peer.AddrInfo) {
-	p2p.PeerChan <- pi
+	p2p.recordKnownPeer(pi)
+	select {
+	case p2p.PeerChan <- pi:
+	default:
+	}
 }
 
 func (p2p *P2P) GetClients() []*P2PClient {
@@ -187,30 +216,6 @@ func (p2p *P2P) unprotectPeer(peerID peer.ID) {
 	p2p.host.ConnManager().Unprotect(peerID, "doltswarm")
 }
 
-// cancelPendingRemoval cancels any pending removal for the peer
-func (p2p *P2P) cancelPendingRemoval(peerID string) bool {
-	if cancelFunc, ok := p2p.pendingRemovals.Get(peerID); ok {
-		if cf, ok := cancelFunc.(context.CancelFunc); ok {
-			cf()
-			p2p.pendingRemovals.Remove(peerID)
-			return true
-		}
-	}
-	return false
-}
-
-// cancelAllPendingRemovals cancels all pending peer removals (used during shutdown)
-func (p2p *P2P) cancelAllPendingRemovals() {
-	for _, key := range p2p.pendingRemovals.Keys() {
-		if cancelFunc, ok := p2p.pendingRemovals.Get(key); ok {
-			if cf, ok := cancelFunc.(context.CancelFunc); ok {
-				cf()
-			}
-		}
-	}
-	p2p.pendingRemovals.Clear()
-}
-
 func (p2p *P2P) peerDiscoveryProcessor() func() error {
 	stopSignal := make(chan struct{})
 	go func() {
@@ -220,108 +225,10 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 			case peerInfo := <-p2p.PeerChan:
 				peerIDStr := peerInfo.ID.String()
 
-				// Use per-peer mutex to prevent race conditions with incoming connection handler
-				peerMu := p2p.getPeerMutex(peerIDStr)
-				peerMu.Lock()
-
-				// Cancel any pending removal for this peer (they might be reconnecting)
-				if p2p.cancelPendingRemoval(peerIDStr) {
-					p2p.log.Debugf("Cancelled pending removal for reconnecting peer %s", peerIDStr)
-				}
-
-				// Check if we already have this peer
-				if _, ok := p2p.clients.Get(peerIDStr); ok {
-					p2p.log.Debugf("Peer %s already in client list, skipping", peerIDStr)
-					peerMu.Unlock()
-					continue
-				}
-
-				p2p.log.Infof("New peer discovered. Connecting: %s (addrs: %v)", peerIDStr, peerInfo.Addrs)
-				ctx := context.Background()
-				if err := p2p.host.Connect(ctx, peerInfo); err != nil {
-					p2p.log.Errorf("Connection to %s failed: %v", peerIDStr, err)
-					peerMu.Unlock()
-					continue
-				}
-
-				tries := 0
-				for {
-					if tries == 20 {
-						break
-					}
-					tries += 1
-
-					connectedness := p2p.host.Network().Connectedness(peerInfo.ID)
-					if connectedness != network.Connected {
-						p2p.log.Debugf("Waiting for peer connection with %s (state=%v, try=%d/20)", peerIDStr, connectedness, tries)
-						time.Sleep(1 * time.Second)
-						continue
-					} else {
-						break
-					}
-				}
-
-				if p2p.host.Network().Connectedness(peerInfo.ID) != network.Connected {
-					p2p.log.Errorf("Connection to %s failed after 20 retries", peerIDStr)
-					peerMu.Unlock()
-					continue
-				}
-
-				p2p.log.Debugf("Peer %s connected, creating gRPC connection", peerIDStr)
-
-				// grpc conn
-				conn, err := grpc.Dial(
-					peerIDStr,
-					grpc.WithTransportCredentials(insecure.NewCredentials()),
-					p2pgrpc.WithP2PDialer(p2p.host, protosRPCProtocol),
-				)
-				if err != nil {
-					p2p.log.Errorf("Grpc conn to %s failed: %v", peerIDStr, err)
-					peerMu.Unlock()
-					continue
-				}
-
-				// client
-				client := &P2PClient{
-					PingerClient: p2pproto.NewPingerClient(conn),
-					TesterClient: p2pproto.NewTesterClient(conn),
-					id:           peerIDStr,
-					conn:         conn,
-				}
-
-				// test connectivity with a ping
-				p2p.log.Debugf("Testing connectivity to %s with ping", peerIDStr)
-				_, err = client.Ping(ctx, &p2pproto.PingRequest{
-					Ping: "pong",
-				})
-				if err != nil {
-					p2p.log.Errorf("Ping to %s failed: %v", peerIDStr, err)
-					peerMu.Unlock()
-					continue
-				}
-
-				p2p.log.Infof("Connected to %s", peerIDStr)
-				p2p.clients.Set(peerIDStr, client)
-				// Mark as Dolt-capable since this peer was discovered through bootstrap/mDNS
-				p2p.doltCapablePeers.Set(peerIDStr, true)
-				p2p.log.Debugf("Added P2P client for peer %s (total clients: %d, dolt-capable: %d)",
-					peerIDStr, p2p.clients.Count(), p2p.doltCapablePeers.Count())
-
-				// Protect this peer's connection from being pruned by connection manager
-				p2p.protectPeer(peerInfo.ID)
-				peerMu.Unlock()
-				// If we have pending hints for this peer, trigger a sync now that the connection is ready.
-				if p2p.node != nil {
-					if hint := p2p.node.LatestHintForProvider(peerIDStr); !hint.IsZero() {
-						go func(h doltswarm.HLCTimestamp) {
-							_, _ = p2p.node.SyncHint(context.Background(), h)
-						}(hint)
-					}
-				}
-				// Non-blocking send to avoid deadlock during shutdown
-				select {
-				case p2p.peerListChan <- p2p.host.Network().Peers():
-				default:
+				p2p.recordKnownPeer(peerInfo)
+				p2p.tryConnectPeer(peerInfo)
+				if peerIDStr != "" {
+					p2p.setKnownPeerConnected(peerIDStr, p2p.host.Network().Connectedness(peerInfo.ID) == network.Connected)
 				}
 
 			case <-stopSignal:
@@ -337,69 +244,236 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 	return stopper
 }
 
-func (p2p *P2P) openConnectionHandler(netw network.Network, conn network.Conn) {
-	peerID := conn.RemotePeer().String()
-
-	// Check if we already have this peer (we initiated the connection)
-	if _, ok := p2p.clients.Get(peerID); ok {
-		return // Already connected via our discovery processor
+func (p2p *P2P) connectLoop() func() error {
+	stopSignal := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(p2p.connectLoopInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				p2p.ensureMinPeers()
+			case <-stopSignal:
+				return
+			}
+		}
+	}()
+	return func() error {
+		stopSignal <- struct{}{}
+		return nil
 	}
-
-	p2p.log.Infof("Incoming connection from %s", peerID)
-
-	// Handle the incoming connection in a goroutine to avoid blocking the callback
-	go p2p.setupIncomingPeer(peerID)
 }
 
-func (p2p *P2P) setupIncomingPeer(peerID string) {
-	p2p.log.Debugf("Setting up incoming peer %s (waiting 500ms for connection to stabilize)", peerID)
-
-	// Wait a bit for the connection to stabilize
-	time.Sleep(500 * time.Millisecond)
-
-	// Verify connection is still active
-	peerIDParsed, err := peer.Decode(peerID)
-	if err != nil {
-		p2p.log.Errorf("Failed to parse peer ID %s: %v", peerID, err)
+func (p2p *P2P) ensureMinPeers() {
+	if p2p == nil || p2p.host == nil {
+		return
+	}
+	if p2p.clients.Count() >= p2p.minPeers {
 		return
 	}
 
-	// Use per-peer mutex to prevent race conditions with discovery processor
+	needed := p2p.minPeers - p2p.clients.Count()
+	candidates := p2p.selectDialCandidates(needed)
+	for _, info := range candidates {
+		p2p.tryConnectPeer(info)
+		if p2p.clients.Count() >= p2p.minPeers {
+			return
+		}
+	}
+}
+
+func (p2p *P2P) selectDialCandidates(limit int) []peer.AddrInfo {
+	p2p.knownPeersMu.Lock()
+	defer p2p.knownPeersMu.Unlock()
+
+	now := time.Now()
+	out := make([]peer.AddrInfo, 0, limit)
+	for _, kp := range p2p.knownPeers {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		if kp == nil || kp.info.ID == "" {
+			continue
+		}
+		if kp.info.ID == p2p.host.ID() {
+			continue
+		}
+		if kp.connected {
+			continue
+		}
+		if !kp.rejectedUntil.IsZero() && now.Before(kp.rejectedUntil) {
+			continue
+		}
+		if len(kp.info.Addrs) == 0 {
+			continue
+		}
+		out = append(out, kp.info)
+	}
+	return out
+}
+
+func (p2p *P2P) tryConnectPeer(peerInfo peer.AddrInfo) {
+	if p2p == nil || p2p.host == nil || peerInfo.ID == "" {
+		return
+	}
+	if peerInfo.ID == p2p.host.ID() {
+		return
+	}
+	peerIDStr := peerInfo.ID.String()
+	if p2p.tooManyHostPeers(peerIDStr) {
+		return
+	}
+	if p2p.isRejected(peerIDStr) {
+		return
+	}
+	if p2p.host.Network().Connectedness(peerInfo.ID) == network.Connected {
+		p2p.setKnownPeerConnected(peerIDStr, true)
+		return
+	}
+
+	peerMu := p2p.getPeerMutex(peerIDStr)
+	peerMu.Lock()
+	defer peerMu.Unlock()
+
+	if p2p.host.Network().Connectedness(peerInfo.ID) == network.Connected {
+		p2p.setKnownPeerConnected(peerIDStr, true)
+		return
+	}
+
+	p2p.log.Infof("Connecting to peer: %s (addrs: %v)", peerIDStr, peerInfo.Addrs)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	p2p.setKnownPeerAttempt(peerIDStr)
+	err := p2p.host.Connect(ctx, peerInfo)
+	cancel()
+	if err != nil {
+		p2p.log.Debugf("Connection to %s failed: %v", peerIDStr, err)
+		p2p.markRejected(peerIDStr, "connect failed")
+		return
+	}
+	p2p.setKnownPeerConnected(peerIDStr, true)
+}
+
+func (p2p *P2P) setGossip(ctx context.Context, gs *gossipsub.GossipSubGossip) {
+	p2p.gossipMu.Lock()
+	defer p2p.gossipMu.Unlock()
+	p2p.gossip = gs
+
+	if p2p.gossipCancel != nil {
+		p2p.gossipCancel()
+	}
+	p2p.startGossipPeerSync(ctx, gs)
+}
+
+func (p2p *P2P) startGossipPeerSync(ctx context.Context, gs *gossipsub.GossipSubGossip) {
+	if gs == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	p2p.gossipCancel = cancel
+
+	handler, err := gs.EventHandler()
+	if err != nil {
+		p2p.log.Warnf("Failed to create gossip event handler: %v", err)
+		return
+	}
+
+	// Seed with existing peers already in the topic.
+	for _, pid := range gs.ListPeers() {
+		p2p.onGossipPeerJoin(pid)
+	}
+
+	go func() {
+		for {
+			evt, err := handler.NextPeerEvent(ctx)
+			if err != nil {
+				return
+			}
+			switch evt.Type {
+			case pubsub.PeerJoin:
+				p2p.onGossipPeerJoin(evt.Peer)
+			case pubsub.PeerLeave:
+				p2p.onGossipPeerLeave(evt.Peer)
+			}
+		}
+	}()
+}
+
+func (p2p *P2P) onGossipPeerJoin(pid peer.ID) {
+	if p2p == nil || p2p.host == nil || pid == "" {
+		return
+	}
+	if pid == p2p.host.ID() {
+		return
+	}
+	peerIDStr := pid.String()
+	p2p.recordKnownPeer(peer.AddrInfo{ID: pid, Addrs: p2p.host.Peerstore().Addrs(pid)})
+	if p2p.tooManyHostPeers(peerIDStr) {
+		p2p.markRejected(peerIDStr, "max peers reached")
+		_ = p2p.host.Network().ClosePeer(pid)
+		return
+	}
+	if p2p.isRejected(peerIDStr) {
+		_ = p2p.host.Network().ClosePeer(pid)
+		return
+	}
+	p2p.connectRPCPeer(peerIDStr)
+}
+
+func (p2p *P2P) onGossipPeerLeave(pid peer.ID) {
+	if p2p == nil || pid == "" {
+		return
+	}
+	p2p.removeRPCPeer(pid.String())
+}
+
+func (p2p *P2P) connectRPCPeer(peerID string) {
+	if p2p == nil || peerID == "" {
+		return
+	}
+	if p2p.host != nil && peerID == p2p.host.ID().String() {
+		return
+	}
+	if p2p.maxPeers > 0 && p2p.clients.Count() >= p2p.maxPeers && !p2p.isAllowlisted(peerID) {
+		p2p.markRejected(peerID, "max peers reached")
+		if pid, err := peer.Decode(peerID); err == nil {
+			_ = p2p.host.Network().ClosePeer(pid)
+		}
+		return
+	}
+
 	peerMu := p2p.getPeerMutex(peerID)
 	peerMu.Lock()
 	defer peerMu.Unlock()
 
-	// Cancel any pending removal for this peer
-	if p2p.cancelPendingRemoval(peerID) {
-		p2p.log.Debugf("Cancelled pending removal for incoming peer %s", peerID)
-	}
-
-	// Check if we already have this peer (might have been added by discovery processor)
 	if _, ok := p2p.clients.Get(peerID); ok {
-		p2p.log.Debugf("Peer %s already in client list, skipping incoming setup", peerID)
+		return
+	}
+	if p2p.isRejected(peerID) {
 		return
 	}
 
-	connectedness := p2p.host.Network().Connectedness(peerIDParsed)
-	if connectedness != network.Connected {
-		p2p.log.Warnf("Peer %s no longer connected (state=%v), skipping setup", peerID, connectedness)
+	pid, err := peer.Decode(peerID)
+	if err != nil {
+		return
+	}
+	if p2p.host.Network().Connectedness(pid) != network.Connected {
 		return
 	}
 
-	p2p.log.Debugf("Peer %s still connected, creating gRPC connection", peerID)
-
-	// Create gRPC connection for the incoming peer
 	grpcConn, err := grpc.Dial(
 		peerID,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		p2pgrpc.WithP2PDialer(p2p.host, protosRPCProtocol),
 	)
 	if err != nil {
-		p2p.log.Errorf("Failed to create gRPC conn for incoming peer %s: %v", peerID, err)
+		p2p.markRejected(peerID, "grpc dial failed")
+		_ = p2p.host.Network().ClosePeer(pid)
 		return
 	}
 
-	// Create client
 	client := &P2PClient{
 		PingerClient: p2pproto.NewPingerClient(grpcConn),
 		TesterClient: p2pproto.NewTesterClient(grpcConn),
@@ -407,30 +481,21 @@ func (p2p *P2P) setupIncomingPeer(peerID string) {
 		conn:         grpcConn,
 	}
 
-	// Test connectivity with a ping (with timeout)
-	p2p.log.Debugf("Testing connectivity to incoming peer %s with ping", peerID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_, err = client.Ping(ctx, &p2pproto.PingRequest{Ping: "pong"})
 	cancel()
 	if err != nil {
-		p2p.log.Warnf("Ping failed for incoming peer %s: %v - not adding as active peer", peerID, err)
 		grpcConn.Close()
-		return
-	}
-
-	// Double-check: peer might have been added while we were doing the ping
-	if _, ok := p2p.clients.Get(peerID); ok {
-		p2p.log.Debugf("Peer %s already added by discovery processor, closing duplicate connection", peerID)
-		grpcConn.Close()
+		p2p.markRejected(peerID, "grpc ping failed")
+		_ = p2p.host.Network().ClosePeer(pid)
 		return
 	}
 
 	p2p.clients.Set(peerID, client)
-	p2p.log.Infof("Added P2P client for incoming peer %s (total clients: %d)", peerID, p2p.clients.Count())
+	p2p.protectPeer(pid)
+	p2p.log.Infof("Added P2P client for gossip peer %s (total clients: %d)", peerID, p2p.clients.Count())
+	p2p.setKnownPeerConnected(peerID, true)
 
-	// Protect this peer's connection from being pruned by connection manager
-	p2p.protectPeer(peerIDParsed)
-	// If we have pending hints for this peer, trigger a sync now that the connection is ready.
 	if p2p.node != nil {
 		if hint := p2p.node.LatestHintForProvider(peerID); !hint.IsZero() {
 			go func(h doltswarm.HLCTimestamp) {
@@ -438,11 +503,153 @@ func (p2p *P2P) setupIncomingPeer(peerID string) {
 			}(hint)
 		}
 	}
-	// Non-blocking send to avoid deadlock during shutdown
+
 	select {
 	case p2p.peerListChan <- p2p.host.Network().Peers():
 	default:
 	}
+}
+
+func (p2p *P2P) removeRPCPeer(peerID string) {
+	if p2p == nil || peerID == "" {
+		return
+	}
+	if v, ok := p2p.clients.Get(peerID); ok {
+		if client, ok := v.(*P2PClient); ok {
+			_ = client.Close()
+		}
+		p2p.clients.Remove(peerID)
+	}
+	if pid, err := peer.Decode(peerID); err == nil {
+		p2p.unprotectPeer(pid)
+	}
+	p2p.setKnownPeerConnected(peerID, false)
+}
+
+func (p2p *P2P) recordKnownPeer(info peer.AddrInfo) {
+	if p2p == nil || info.ID == "" {
+		return
+	}
+	p2p.knownPeersMu.Lock()
+	defer p2p.knownPeersMu.Unlock()
+
+	kp, ok := p2p.knownPeers[info.ID.String()]
+	if !ok {
+		kp = &knownPeer{info: info}
+		p2p.knownPeers[info.ID.String()] = kp
+	}
+	kp.info = info
+	kp.lastSeen = time.Now()
+	if p2p.host != nil && len(info.Addrs) > 0 {
+		p2p.host.Peerstore().AddAddrs(info.ID, info.Addrs, time.Hour)
+	}
+}
+
+func (p2p *P2P) setKnownPeerConnected(peerID string, connected bool) {
+	if p2p == nil || peerID == "" {
+		return
+	}
+	p2p.knownPeersMu.Lock()
+	defer p2p.knownPeersMu.Unlock()
+	if kp, ok := p2p.knownPeers[peerID]; ok && kp != nil {
+		kp.connected = connected
+		if connected {
+			kp.lastSeen = time.Now()
+		}
+	}
+}
+
+func (p2p *P2P) setKnownPeerAttempt(peerID string) {
+	if p2p == nil || peerID == "" {
+		return
+	}
+	p2p.knownPeersMu.Lock()
+	defer p2p.knownPeersMu.Unlock()
+	if kp, ok := p2p.knownPeers[peerID]; ok && kp != nil {
+		kp.lastAttempt = time.Now()
+	}
+}
+
+func (p2p *P2P) markRejected(peerID string, reason string) {
+	if p2p == nil || peerID == "" {
+		return
+	}
+	p2p.knownPeersMu.Lock()
+	defer p2p.knownPeersMu.Unlock()
+
+	kp, ok := p2p.knownPeers[peerID]
+	if !ok {
+		var pid peer.ID
+		if parsed, err := peer.Decode(peerID); err == nil {
+			pid = parsed
+		}
+		kp = &knownPeer{info: peer.AddrInfo{ID: pid}}
+		p2p.knownPeers[peerID] = kp
+	}
+	kp.rejects++
+	backoff := p2p.rejectBackoff
+	if kp.rejects > 1 {
+		backoff = time.Duration(float64(backoff) * math.Pow(2, float64(kp.rejects-1)))
+	}
+	if backoff > p2p.rejectBackoffMax {
+		backoff = p2p.rejectBackoffMax
+	}
+	kp.rejectedUntil = time.Now().Add(backoff)
+	kp.lastRejectReason = reason
+	kp.connected = false
+}
+
+func (p2p *P2P) isAllowlisted(peerID string) bool {
+	if p2p == nil || peerID == "" {
+		return false
+	}
+	_, ok := p2p.allowlistedPeers[peerID]
+	return ok
+}
+
+func (p2p *P2P) isRejected(peerID string) bool {
+	if p2p == nil || peerID == "" {
+		return false
+	}
+	p2p.knownPeersMu.Lock()
+	defer p2p.knownPeersMu.Unlock()
+	kp, ok := p2p.knownPeers[peerID]
+	if !ok || kp == nil {
+		return false
+	}
+	if kp.rejectedUntil.IsZero() {
+		return false
+	}
+	return time.Now().Before(kp.rejectedUntil)
+}
+
+func (p2p *P2P) tooManyHostPeers(peerID string) bool {
+	if p2p == nil || p2p.host == nil {
+		return false
+	}
+	if p2p.maxPeers <= 0 {
+		return false
+	}
+	if p2p.isAllowlisted(peerID) {
+		return false
+	}
+	return len(p2p.host.Network().Peers()) > p2p.maxPeers
+}
+
+func (p2p *P2P) openConnectionHandler(netw network.Network, conn network.Conn) {
+	peerID := conn.RemotePeer()
+	peerIDStr := peerID.String()
+
+	p2p.recordKnownPeer(peer.AddrInfo{ID: peerID, Addrs: p2p.host.Peerstore().Addrs(peerID)})
+
+	if p2p.tooManyHostPeers(peerIDStr) {
+		p2p.markRejected(peerIDStr, "max peers reached")
+		_ = p2p.host.Network().ClosePeer(peerID)
+		return
+	}
+
+	p2p.setKnownPeerConnected(peerIDStr, true)
+	p2p.log.Infof("Incoming connection from %s", peerIDStr)
 }
 
 func (p2p *P2P) closeConnectionHandler(netw network.Network, conn network.Conn) {
@@ -468,79 +675,11 @@ func (p2p *P2P) closeConnectionHandler(netw network.Network, conn network.Conn) 
 	default:
 	}
 
-	// Only remove the peer if there are no remaining connections to it
-	// libp2p can have multiple connections to the same peer
+	// Only update known-peer state; gRPC clients are tied to gossip peer events.
 	connectedness := p2p.host.Network().Connectedness(peerIDParsed)
-	if connectedness == network.Connected {
-		p2p.log.Debugf("Peer %s still connected (state=%v, conns=%d), not removing", peerIDStr, connectedness, len(conns))
-		return
+	if connectedness != network.Connected {
+		p2p.setKnownPeerConnected(peerIDStr, false)
 	}
-
-	// Check if we even have this peer in our client list
-	if _, ok := p2p.clients.Get(peerIDStr); !ok {
-		p2p.log.Debugf("Peer %s not in client list, nothing to remove", peerIDStr)
-		return
-	}
-
-	// Check if there's already a pending removal for this peer
-	if _, ok := p2p.pendingRemovals.Get(peerIDStr); ok {
-		p2p.log.Debugf("Peer %s already has pending removal, skipping", peerIDStr)
-		return
-	}
-
-	// Schedule debounced removal - gives the peer time to reconnect
-	p2p.log.Infof("Scheduling removal of peer %s in %v (state=%v)", peerIDStr, peerRemovalDelay, connectedness)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	p2p.pendingRemovals.Set(peerIDStr, cancel)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			// Removal was cancelled (peer reconnected)
-			p2p.log.Debugf("Removal cancelled for peer %s", peerIDStr)
-			return
-		case <-time.After(peerRemovalDelay):
-			// Proceed with removal after delay
-		}
-
-		// Use per-peer mutex for removal
-		peerMu := p2p.getPeerMutex(peerIDStr)
-		peerMu.Lock()
-		defer peerMu.Unlock()
-
-		// Clean up the pending removal entry
-		p2p.pendingRemovals.Remove(peerIDStr)
-
-		// Re-check connection state after delay
-		connectedness := p2p.host.Network().Connectedness(peerIDParsed)
-		if connectedness == network.Connected {
-			p2p.log.Debugf("Peer %s reconnected during removal delay, aborting removal", peerIDStr)
-			return
-		}
-
-		// Check if peer is still in our client list
-		if _, ok := p2p.clients.Get(peerIDStr); !ok {
-			p2p.log.Debugf("Peer %s already removed from client list", peerIDStr)
-			return
-		}
-
-		p2p.log.Infof("Removing peer %s after delay (state=%v)", peerIDStr, connectedness)
-
-		// Unprotect the peer connection before removal
-		p2p.unprotectPeer(peerIDParsed)
-
-		if v, ok := p2p.clients.Get(peerIDStr); ok {
-			if client, ok := v.(*P2PClient); ok {
-				_ = client.Close()
-			}
-		}
-
-		p2p.clients.Remove(peerIDStr)
-		p2p.doltCapablePeers.Remove(peerIDStr)
-		p2p.log.Debugf("Removed P2P client for peer %s (remaining clients: %d, dolt-capable: %d)",
-			peerIDStr, p2p.clients.Count(), p2p.doltCapablePeers.Count())
-	}()
 }
 
 func (p2p *P2P) GetGRPCServer() *grpc.Server {
@@ -567,15 +706,13 @@ func (p2p *P2P) EnsurePeerConnected(peerID string) {
 		return
 	}
 
-	// Check if already connected
-	if _, ok := p2p.clients.Get(peerID); ok {
-		return
-	}
-
 	// Parse peer ID and get addresses from the peerstore
 	pid, err := peer.Decode(peerID)
 	if err != nil {
 		p2p.log.Debugf("EnsurePeerConnected: failed to parse peer ID %s: %v", peerID, err)
+		return
+	}
+	if p2p.host.Network().Connectedness(pid) == network.Connected {
 		return
 	}
 
@@ -587,6 +724,8 @@ func (p2p *P2P) EnsurePeerConnected(peerID string) {
 		return
 	}
 
+	p2p.recordKnownPeer(peer.AddrInfo{ID: pid, Addrs: addrs})
+
 	// Queue connection request (non-blocking)
 	select {
 	case p2p.PeerChan <- peer.AddrInfo{ID: pid, Addrs: addrs}:
@@ -595,6 +734,72 @@ func (p2p *P2P) EnsurePeerConnected(peerID string) {
 		// Channel full, skip - the peer discovery processor is busy
 		p2p.log.Debugf("EnsurePeerConnected: channel full, skipping peer %s", peerID)
 	}
+}
+
+// IsPeerConnected reports whether we currently have a gRPC client for the peer.
+func (p2p *P2P) IsPeerConnected(peerID string) bool {
+	if p2p == nil || peerID == "" {
+		return false
+	}
+	if _, ok := p2p.clients.Get(peerID); ok {
+		return true
+	}
+	return false
+}
+
+// SetPeerLimits updates the max/min peer limits at runtime.
+// If max <= 0, peer limits are disabled (unlimited).
+func (p2p *P2P) SetPeerLimits(maxPeers, minPeers int) {
+	if p2p == nil {
+		return
+	}
+	if maxPeers <= 0 {
+		p2p.maxPeers = 0
+		p2p.minPeers = 0
+		return
+	}
+	if minPeers < 0 {
+		minPeers = 0
+	}
+	if minPeers > maxPeers {
+		minPeers = maxPeers
+	}
+	p2p.maxPeers = maxPeers
+	p2p.minPeers = minPeers
+
+	if p2p.host == nil {
+		return
+	}
+	// Trim excess host connections if above the new max.
+	peers := p2p.host.Network().Peers()
+	if len(peers) <= maxPeers {
+		return
+	}
+	for _, pid := range peers {
+		id := pid.String()
+		if p2p.isAllowlisted(id) {
+			continue
+		}
+		_ = p2p.host.Network().ClosePeer(pid)
+		if len(p2p.host.Network().Peers()) <= maxPeers {
+			return
+		}
+	}
+}
+
+// PeerCounts returns the number of connected host peers, gRPC peers, and gossip peers.
+func (p2p *P2P) PeerCounts() (hostPeers, grpcPeers, gossipPeers int) {
+	if p2p == nil {
+		return 0, 0, 0
+	}
+	if p2p.host != nil {
+		hostPeers = len(p2p.host.Network().Peers())
+	}
+	grpcPeers = p2p.clients.Count()
+	if p2p.gossip != nil {
+		gossipPeers = len(p2p.gossip.ListPeers())
+	}
+	return hostPeers, grpcPeers, gossipPeers
 }
 
 // SnapshotConns returns a snapshot of currently connected gRPC conns keyed by peer ID.
@@ -611,11 +816,6 @@ func (p2p *P2P) SnapshotConns() map[string]grpc.ClientConnInterface {
 		if !ok || c == nil || c.conn == nil || c.id == "" {
 			continue
 		}
-		// Only include Dolt-capable peers (discovered through bootstrap/mDNS)
-		// This filters out incoming connections from non-Dolt clients like test orchestrators
-		if _, isDoltCapable := p2p.doltCapablePeers.Get(c.id); !isDoltCapable {
-			continue
-		}
 		out[c.id] = c.conn
 	}
 	return out
@@ -624,7 +824,36 @@ func (p2p *P2P) SnapshotConns() map[string]grpc.ClientConnInterface {
 // NewGossipSub constructs a GossipSub-backed doltswarm.Gossip implementation.
 // This does not change any runtime behavior unless called by the application.
 func (p2p *P2P) NewGossipSub(ctx context.Context, topic string) (*gossipsub.GossipSubGossip, error) {
-	return gossipsub.New(ctx, p2p.host, p2p.log.WithField("context", "gossip"), topic)
+	if p2p == nil {
+		return nil, fmt.Errorf("p2p manager is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	params := pubsub.DefaultGossipSubParams()
+	if p2p.maxPeers > 0 {
+		params.D = p2p.maxPeers
+		params.Dhi = p2p.maxPeers
+	}
+	if p2p.minPeers > 0 {
+		params.Dlo = p2p.minPeers
+	}
+	// Ensure Dout satisfies constraints.
+	if params.D > 0 {
+		maxDout := int(math.Max(1, float64(params.D/2-1)))
+		params.Dout = maxDout
+		if params.Dlo > 0 && params.Dout >= params.Dlo {
+			params.Dout = int(math.Max(1, float64(params.Dlo-1)))
+		}
+	}
+
+	gs, err := gossipsub.New(ctx, p2p.host, p2p.log.WithField("context", "gossip"), topic, pubsub.WithGossipSubParams(params))
+	if err != nil {
+		return nil, err
+	}
+	p2p.setGossip(ctx, gs)
+	return gs, nil
 }
 
 // StartServer starts listening for p2p connections
@@ -634,7 +863,7 @@ func (p2p *P2P) StartServer() (func() error, error) {
 	ctx := context.TODO()
 
 	// register internal grpc servers
-	srv := &p2psrv.Server{DB: p2p.externalDB, Node: p2p.node}
+	srv := &p2psrv.Server{DB: p2p.externalDB, Node: p2p.node, Limiter: p2p, Stats: p2p}
 	p2pproto.RegisterPingerServer(p2p.grpcServer, srv)
 	p2pproto.RegisterTesterServer(p2p.grpcServer, srv)
 	if p2p.externalDB != nil {
@@ -665,6 +894,7 @@ func (p2p *P2P) StartServer() (func() error, error) {
 	}
 
 	peerDiscoveryStopper := p2p.peerDiscoveryProcessor()
+	connectLoopStopper := p2p.connectLoop()
 
 	mdnsService := mdns.NewMdnsService(p2p.host, "protos", p2p)
 	if err := mdnsService.Start(); err != nil {
@@ -683,9 +913,11 @@ func (p2p *P2P) StartServer() (func() error, error) {
 		p2p.shutdownMu.Lock()
 		p2p.shuttingDown = true
 		p2p.shutdownMu.Unlock()
-		// Cancel all pending removals
-		p2p.cancelAllPendingRemovals()
 		peerDiscoveryStopper()
+		connectLoopStopper()
+		if p2p.gossipCancel != nil {
+			p2p.gossipCancel()
+		}
 		mdnsService.Close()
 		for _, v := range p2p.clients.Items() {
 			if client, ok := v.(*P2PClient); ok {
@@ -816,13 +1048,20 @@ func NewKey(workdir string) (*P2PKey, error) {
 
 // P2PConfig holds configuration for the P2P manager
 type P2PConfig struct {
-	Key            *P2PKey
-	Port           int
-	ListenAddr     string // IP address to listen on (default: 127.0.0.1)
-	PeerListChan   chan peer.IDSlice
-	Logger         *logrus.Logger
-	ExternalDB     p2psrv.ExternalDB
-	BootstrapPeers []string // List of bootstrap peer multiaddrs
+	Key                 *P2PKey
+	Port                int
+	ListenAddr          string // IP address to listen on (default: 127.0.0.1)
+	PeerListChan        chan peer.IDSlice
+	Logger              *logrus.Logger
+	ExternalDB          p2psrv.ExternalDB
+	BootstrapPeers      []string // List of bootstrap peer multiaddrs
+	MaxPeers            int
+	MinPeers            int
+	RejectBackoff       time.Duration
+	RejectBackoffMax    time.Duration
+	ConnectLoopInterval time.Duration
+	AllowlistedPeers    []string
+	UnlimitedStart      bool
 }
 
 // NewManager creates and returns a new p2p manager
@@ -842,25 +1081,66 @@ func NewManagerWithConfig(cfg P2PConfig) (*P2P, error) {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = "127.0.0.1"
 	}
+	if cfg.UnlimitedStart {
+		cfg.MaxPeers = 0
+		cfg.MinPeers = 0
+	} else if cfg.MaxPeers == 0 {
+		cfg.MaxPeers = defaultMaxPeers
+	}
+	if cfg.MinPeers == 0 {
+		cfg.MinPeers = defaultMinPeers
+	}
+	if cfg.MinPeers > cfg.MaxPeers {
+		cfg.MinPeers = cfg.MaxPeers
+	}
+	if cfg.RejectBackoff == 0 {
+		cfg.RejectBackoff = defaultRejectBackoff
+	}
+	if cfg.RejectBackoffMax == 0 {
+		cfg.RejectBackoffMax = defaultRejectBackoffMax
+	}
+	if cfg.ConnectLoopInterval == 0 {
+		cfg.ConnectLoopInterval = defaultConnectLoopInterval
+	}
 
 	p2p := &P2P{
-		PeerChan:         make(chan peer.AddrInfo),
-		peerListChan:     cfg.PeerListChan,
-		clients:          cmap.New(),
-		log:              cfg.Logger,
-		grpcServer:       grpc.NewServer(p2pgrpc.WithP2PCredentials()),
-		externalDB:       cfg.ExternalDB,
-		prvKey:           cfg.Key.PrivateKey(),
-		bootstrapPeers:   cfg.BootstrapPeers,
-		pendingRemovals:  cmap.New(),
-		peerMu:           cmap.New(),
-		doltCapablePeers: cmap.New(),
+		PeerChan:            make(chan peer.AddrInfo),
+		peerListChan:        cfg.PeerListChan,
+		clients:             cmap.New(),
+		log:                 cfg.Logger,
+		grpcServer:          grpc.NewServer(p2pgrpc.WithP2PCredentials()),
+		externalDB:          cfg.ExternalDB,
+		prvKey:              cfg.Key.PrivateKey(),
+		bootstrapPeers:      cfg.BootstrapPeers,
+		peerMu:              cmap.New(),
+		maxPeers:            cfg.MaxPeers,
+		minPeers:            cfg.MinPeers,
+		rejectBackoff:       cfg.RejectBackoff,
+		rejectBackoffMax:    cfg.RejectBackoffMax,
+		connectLoopInterval: cfg.ConnectLoopInterval,
+		knownPeers:          make(map[string]*knownPeer),
+		allowlistedPeers:    make(map[string]struct{}),
+		unlimitedStart:      cfg.UnlimitedStart,
+	}
+	for _, id := range cfg.AllowlistedPeers {
+		if id == "" {
+			continue
+		}
+		p2p.allowlistedPeers[id] = struct{}{}
 	}
 
 	// Connection manager with grace period to avoid premature connection pruning
+	connLow := p2p.maxPeers
+	if p2p.minPeers > connLow {
+		connLow = p2p.minPeers
+	}
+	if p2p.maxPeers <= 0 {
+		connLow = 10000
+	}
+	connHigh := connLow + 4
 	con, err := connmgr.NewConnManager(
-		connManagerLowMark,
-		connManagerHiMark,
+		connLow,
+		connHigh,
 		connmgr.WithGracePeriod(connGracePeriod),
 	)
 	if err != nil {

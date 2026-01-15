@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.10
 // 	protoc        v6.33.0
-// source: proto/tester.proto
+// source: tester.proto
 
 package proto
 
@@ -31,7 +31,7 @@ type ExecSQLRequest struct {
 
 func (x *ExecSQLRequest) Reset() {
 	*x = ExecSQLRequest{}
-	mi := &file_proto_tester_proto_msgTypes[0]
+	mi := &file_tester_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -43,7 +43,7 @@ func (x *ExecSQLRequest) String() string {
 func (*ExecSQLRequest) ProtoMessage() {}
 
 func (x *ExecSQLRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_tester_proto_msgTypes[0]
+	mi := &file_tester_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -56,7 +56,7 @@ func (x *ExecSQLRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecSQLRequest.ProtoReflect.Descriptor instead.
 func (*ExecSQLRequest) Descriptor() ([]byte, []int) {
-	return file_proto_tester_proto_rawDescGZIP(), []int{0}
+	return file_tester_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *ExecSQLRequest) GetStatement() string {
@@ -84,7 +84,7 @@ type ExecSQLResponse struct {
 
 func (x *ExecSQLResponse) Reset() {
 	*x = ExecSQLResponse{}
-	mi := &file_proto_tester_proto_msgTypes[1]
+	mi := &file_tester_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -96,7 +96,7 @@ func (x *ExecSQLResponse) String() string {
 func (*ExecSQLResponse) ProtoMessage() {}
 
 func (x *ExecSQLResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_tester_proto_msgTypes[1]
+	mi := &file_tester_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -109,7 +109,7 @@ func (x *ExecSQLResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecSQLResponse.ProtoReflect.Descriptor instead.
 func (*ExecSQLResponse) Descriptor() ([]byte, []int) {
-	return file_proto_tester_proto_rawDescGZIP(), []int{1}
+	return file_tester_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *ExecSQLResponse) GetCommit() string {
@@ -141,7 +141,7 @@ type GetAllCommitsRequest struct {
 
 func (x *GetAllCommitsRequest) Reset() {
 	*x = GetAllCommitsRequest{}
-	mi := &file_proto_tester_proto_msgTypes[2]
+	mi := &file_tester_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -153,7 +153,7 @@ func (x *GetAllCommitsRequest) String() string {
 func (*GetAllCommitsRequest) ProtoMessage() {}
 
 func (x *GetAllCommitsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_tester_proto_msgTypes[2]
+	mi := &file_tester_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -166,7 +166,7 @@ func (x *GetAllCommitsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAllCommitsRequest.ProtoReflect.Descriptor instead.
 func (*GetAllCommitsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_tester_proto_rawDescGZIP(), []int{2}
+	return file_tester_proto_rawDescGZIP(), []int{2}
 }
 
 type GetAllCommitsResponse struct {
@@ -178,7 +178,7 @@ type GetAllCommitsResponse struct {
 
 func (x *GetAllCommitsResponse) Reset() {
 	*x = GetAllCommitsResponse{}
-	mi := &file_proto_tester_proto_msgTypes[3]
+	mi := &file_tester_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -190,7 +190,7 @@ func (x *GetAllCommitsResponse) String() string {
 func (*GetAllCommitsResponse) ProtoMessage() {}
 
 func (x *GetAllCommitsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_tester_proto_msgTypes[3]
+	mi := &file_tester_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -203,7 +203,7 @@ func (x *GetAllCommitsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAllCommitsResponse.ProtoReflect.Descriptor instead.
 func (*GetAllCommitsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_tester_proto_rawDescGZIP(), []int{3}
+	return file_tester_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *GetAllCommitsResponse) GetCommits() []string {
@@ -221,7 +221,7 @@ type GetHeadRequest struct {
 
 func (x *GetHeadRequest) Reset() {
 	*x = GetHeadRequest{}
-	mi := &file_proto_tester_proto_msgTypes[4]
+	mi := &file_tester_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -233,7 +233,7 @@ func (x *GetHeadRequest) String() string {
 func (*GetHeadRequest) ProtoMessage() {}
 
 func (x *GetHeadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_tester_proto_msgTypes[4]
+	mi := &file_tester_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -246,7 +246,7 @@ func (x *GetHeadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetHeadRequest.ProtoReflect.Descriptor instead.
 func (*GetHeadRequest) Descriptor() ([]byte, []int) {
-	return file_proto_tester_proto_rawDescGZIP(), []int{4}
+	return file_tester_proto_rawDescGZIP(), []int{4}
 }
 
 type GetHeadResponse struct {
@@ -258,7 +258,7 @@ type GetHeadResponse struct {
 
 func (x *GetHeadResponse) Reset() {
 	*x = GetHeadResponse{}
-	mi := &file_proto_tester_proto_msgTypes[5]
+	mi := &file_tester_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -270,7 +270,7 @@ func (x *GetHeadResponse) String() string {
 func (*GetHeadResponse) ProtoMessage() {}
 
 func (x *GetHeadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_tester_proto_msgTypes[5]
+	mi := &file_tester_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -283,7 +283,7 @@ func (x *GetHeadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetHeadResponse.ProtoReflect.Descriptor instead.
 func (*GetHeadResponse) Descriptor() ([]byte, []int) {
-	return file_proto_tester_proto_rawDescGZIP(), []int{5}
+	return file_tester_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *GetHeadResponse) GetCommit() string {
@@ -293,11 +293,211 @@ func (x *GetHeadResponse) GetCommit() string {
 	return ""
 }
 
-var File_proto_tester_proto protoreflect.FileDescriptor
+type SetPeerLimitsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Max           int32                  `protobuf:"varint,1,opt,name=max,proto3" json:"max,omitempty"`
+	Min           int32                  `protobuf:"varint,2,opt,name=min,proto3" json:"min,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
 
-const file_proto_tester_proto_rawDesc = "" +
+func (x *SetPeerLimitsRequest) Reset() {
+	*x = SetPeerLimitsRequest{}
+	mi := &file_tester_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetPeerLimitsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetPeerLimitsRequest) ProtoMessage() {}
+
+func (x *SetPeerLimitsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tester_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetPeerLimitsRequest.ProtoReflect.Descriptor instead.
+func (*SetPeerLimitsRequest) Descriptor() ([]byte, []int) {
+	return file_tester_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *SetPeerLimitsRequest) GetMax() int32 {
+	if x != nil {
+		return x.Max
+	}
+	return 0
+}
+
+func (x *SetPeerLimitsRequest) GetMin() int32 {
+	if x != nil {
+		return x.Min
+	}
+	return 0
+}
+
+type SetPeerLimitsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Err           string                 `protobuf:"bytes,1,opt,name=err,proto3" json:"err,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetPeerLimitsResponse) Reset() {
+	*x = SetPeerLimitsResponse{}
+	mi := &file_tester_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetPeerLimitsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetPeerLimitsResponse) ProtoMessage() {}
+
+func (x *SetPeerLimitsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tester_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetPeerLimitsResponse.ProtoReflect.Descriptor instead.
+func (*SetPeerLimitsResponse) Descriptor() ([]byte, []int) {
+	return file_tester_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *SetPeerLimitsResponse) GetErr() string {
+	if x != nil {
+		return x.Err
+	}
+	return ""
+}
+
+type GetPeerCountsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetPeerCountsRequest) Reset() {
+	*x = GetPeerCountsRequest{}
+	mi := &file_tester_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetPeerCountsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetPeerCountsRequest) ProtoMessage() {}
+
+func (x *GetPeerCountsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_tester_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetPeerCountsRequest.ProtoReflect.Descriptor instead.
+func (*GetPeerCountsRequest) Descriptor() ([]byte, []int) {
+	return file_tester_proto_rawDescGZIP(), []int{8}
+}
+
+type GetPeerCountsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	HostPeers     int32                  `protobuf:"varint,1,opt,name=host_peers,json=hostPeers,proto3" json:"host_peers,omitempty"`
+	GrpcPeers     int32                  `protobuf:"varint,2,opt,name=grpc_peers,json=grpcPeers,proto3" json:"grpc_peers,omitempty"`
+	GossipPeers   int32                  `protobuf:"varint,3,opt,name=gossip_peers,json=gossipPeers,proto3" json:"gossip_peers,omitempty"`
+	Err           string                 `protobuf:"bytes,4,opt,name=err,proto3" json:"err,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetPeerCountsResponse) Reset() {
+	*x = GetPeerCountsResponse{}
+	mi := &file_tester_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetPeerCountsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetPeerCountsResponse) ProtoMessage() {}
+
+func (x *GetPeerCountsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_tester_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetPeerCountsResponse.ProtoReflect.Descriptor instead.
+func (*GetPeerCountsResponse) Descriptor() ([]byte, []int) {
+	return file_tester_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetPeerCountsResponse) GetHostPeers() int32 {
+	if x != nil {
+		return x.HostPeers
+	}
+	return 0
+}
+
+func (x *GetPeerCountsResponse) GetGrpcPeers() int32 {
+	if x != nil {
+		return x.GrpcPeers
+	}
+	return 0
+}
+
+func (x *GetPeerCountsResponse) GetGossipPeers() int32 {
+	if x != nil {
+		return x.GossipPeers
+	}
+	return 0
+}
+
+func (x *GetPeerCountsResponse) GetErr() string {
+	if x != nil {
+		return x.Err
+	}
+	return ""
+}
+
+var File_tester_proto protoreflect.FileDescriptor
+
+const file_tester_proto_rawDesc = "" +
 	"\n" +
-	"\x12proto/tester.proto\x12\x05proto\"@\n" +
+	"\ftester.proto\x12\x05proto\"@\n" +
 	"\x0eExecSQLRequest\x12\x1c\n" +
 	"\tstatement\x18\x01 \x01(\tR\tstatement\x12\x10\n" +
 	"\x03msg\x18\x02 \x01(\tR\x03msg\"S\n" +
@@ -310,67 +510,90 @@ const file_proto_tester_proto_rawDesc = "" +
 	"\acommits\x18\x01 \x03(\tR\acommits\"\x10\n" +
 	"\x0eGetHeadRequest\")\n" +
 	"\x0fGetHeadResponse\x12\x16\n" +
-	"\x06commit\x18\x01 \x01(\tR\x06commit2\xce\x01\n" +
+	"\x06commit\x18\x01 \x01(\tR\x06commit\":\n" +
+	"\x14SetPeerLimitsRequest\x12\x10\n" +
+	"\x03max\x18\x01 \x01(\x05R\x03max\x12\x10\n" +
+	"\x03min\x18\x02 \x01(\x05R\x03min\")\n" +
+	"\x15SetPeerLimitsResponse\x12\x10\n" +
+	"\x03err\x18\x01 \x01(\tR\x03err\"\x16\n" +
+	"\x14GetPeerCountsRequest\"\x8a\x01\n" +
+	"\x15GetPeerCountsResponse\x12\x1d\n" +
+	"\n" +
+	"host_peers\x18\x01 \x01(\x05R\thostPeers\x12\x1d\n" +
+	"\n" +
+	"grpc_peers\x18\x02 \x01(\x05R\tgrpcPeers\x12!\n" +
+	"\fgossip_peers\x18\x03 \x01(\x05R\vgossipPeers\x12\x10\n" +
+	"\x03err\x18\x04 \x01(\tR\x03err2\xea\x02\n" +
 	"\x06Tester\x12:\n" +
 	"\aExecSQL\x12\x15.proto.ExecSQLRequest\x1a\x16.proto.ExecSQLResponse\"\x00\x12L\n" +
 	"\rGetAllCommits\x12\x1b.proto.GetAllCommitsRequest\x1a\x1c.proto.GetAllCommitsResponse\"\x00\x12:\n" +
-	"\aGetHead\x12\x15.proto.GetHeadRequest\x1a\x16.proto.GetHeadResponse\"\x00B\tZ\a./protob\x06proto3"
+	"\aGetHead\x12\x15.proto.GetHeadRequest\x1a\x16.proto.GetHeadResponse\"\x00\x12L\n" +
+	"\rSetPeerLimits\x12\x1b.proto.SetPeerLimitsRequest\x1a\x1c.proto.SetPeerLimitsResponse\"\x00\x12L\n" +
+	"\rGetPeerCounts\x12\x1b.proto.GetPeerCountsRequest\x1a\x1c.proto.GetPeerCountsResponse\"\x00B\tZ\a./protob\x06proto3"
 
 var (
-	file_proto_tester_proto_rawDescOnce sync.Once
-	file_proto_tester_proto_rawDescData []byte
+	file_tester_proto_rawDescOnce sync.Once
+	file_tester_proto_rawDescData []byte
 )
 
-func file_proto_tester_proto_rawDescGZIP() []byte {
-	file_proto_tester_proto_rawDescOnce.Do(func() {
-		file_proto_tester_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_tester_proto_rawDesc), len(file_proto_tester_proto_rawDesc)))
+func file_tester_proto_rawDescGZIP() []byte {
+	file_tester_proto_rawDescOnce.Do(func() {
+		file_tester_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_tester_proto_rawDesc), len(file_tester_proto_rawDesc)))
 	})
-	return file_proto_tester_proto_rawDescData
+	return file_tester_proto_rawDescData
 }
 
-var file_proto_tester_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
-var file_proto_tester_proto_goTypes = []any{
+var file_tester_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_tester_proto_goTypes = []any{
 	(*ExecSQLRequest)(nil),        // 0: proto.ExecSQLRequest
 	(*ExecSQLResponse)(nil),       // 1: proto.ExecSQLResponse
 	(*GetAllCommitsRequest)(nil),  // 2: proto.GetAllCommitsRequest
 	(*GetAllCommitsResponse)(nil), // 3: proto.GetAllCommitsResponse
 	(*GetHeadRequest)(nil),        // 4: proto.GetHeadRequest
 	(*GetHeadResponse)(nil),       // 5: proto.GetHeadResponse
+	(*SetPeerLimitsRequest)(nil),  // 6: proto.SetPeerLimitsRequest
+	(*SetPeerLimitsResponse)(nil), // 7: proto.SetPeerLimitsResponse
+	(*GetPeerCountsRequest)(nil),  // 8: proto.GetPeerCountsRequest
+	(*GetPeerCountsResponse)(nil), // 9: proto.GetPeerCountsResponse
 }
-var file_proto_tester_proto_depIdxs = []int32{
+var file_tester_proto_depIdxs = []int32{
 	0, // 0: proto.Tester.ExecSQL:input_type -> proto.ExecSQLRequest
 	2, // 1: proto.Tester.GetAllCommits:input_type -> proto.GetAllCommitsRequest
 	4, // 2: proto.Tester.GetHead:input_type -> proto.GetHeadRequest
-	1, // 3: proto.Tester.ExecSQL:output_type -> proto.ExecSQLResponse
-	3, // 4: proto.Tester.GetAllCommits:output_type -> proto.GetAllCommitsResponse
-	5, // 5: proto.Tester.GetHead:output_type -> proto.GetHeadResponse
-	3, // [3:6] is the sub-list for method output_type
-	0, // [0:3] is the sub-list for method input_type
+	6, // 3: proto.Tester.SetPeerLimits:input_type -> proto.SetPeerLimitsRequest
+	8, // 4: proto.Tester.GetPeerCounts:input_type -> proto.GetPeerCountsRequest
+	1, // 5: proto.Tester.ExecSQL:output_type -> proto.ExecSQLResponse
+	3, // 6: proto.Tester.GetAllCommits:output_type -> proto.GetAllCommitsResponse
+	5, // 7: proto.Tester.GetHead:output_type -> proto.GetHeadResponse
+	7, // 8: proto.Tester.SetPeerLimits:output_type -> proto.SetPeerLimitsResponse
+	9, // 9: proto.Tester.GetPeerCounts:output_type -> proto.GetPeerCountsResponse
+	5, // [5:10] is the sub-list for method output_type
+	0, // [0:5] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_proto_tester_proto_init() }
-func file_proto_tester_proto_init() {
-	if File_proto_tester_proto != nil {
+func init() { file_tester_proto_init() }
+func file_tester_proto_init() {
+	if File_tester_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_tester_proto_rawDesc), len(file_proto_tester_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tester_proto_rawDesc), len(file_tester_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_proto_tester_proto_goTypes,
-		DependencyIndexes: file_proto_tester_proto_depIdxs,
-		MessageInfos:      file_proto_tester_proto_msgTypes,
+		GoTypes:           file_tester_proto_goTypes,
+		DependencyIndexes: file_tester_proto_depIdxs,
+		MessageInfos:      file_tester_proto_msgTypes,
 	}.Build()
-	File_proto_tester_proto = out.File
-	file_proto_tester_proto_goTypes = nil
-	file_proto_tester_proto_depIdxs = nil
+	File_tester_proto = out.File
+	file_tester_proto_goTypes = nil
+	file_tester_proto_depIdxs = nil
 }

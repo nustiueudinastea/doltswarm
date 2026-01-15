@@ -767,15 +767,16 @@ func (pr *testDB) GetLastCommit(branch string) (doltswarm.Commit, error) {
 
 // dockerTestSetup holds Docker test infrastructure
 type dockerTestSetup struct {
-	cli        *client.Client
-	networkID  string
-	containers []containerInfo
-	clients    []*p2p.P2PClient
-	p2pMgr     *p2p.P2P
-	stopper    func() error
-	cleanup    func()
-	testName   string
-	startTime  time.Time
+	cli             *client.Client
+	networkID       string
+	containers      []containerInfo
+	clients         []*p2p.P2PClient
+	p2pMgr          *p2p.P2P
+	stopper         func() error
+	cleanup         func()
+	testName        string
+	startTime       time.Time
+	allowlistPeerID string
 }
 
 // lateJoinerInfo holds info for the late-joining container
@@ -1119,6 +1120,14 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 		startTime:  time.Now(),
 	}
 
+	p2pkey, err := p2p.NewKeyInMemory()
+	if err != nil {
+		cleanupNetwork(ctx, cli, networkID)
+		return nil, fmt.Errorf("failed to create P2P key: %w", err)
+	}
+	allowlistPeerID := p2pkey.GetID()
+	setup.allowlistPeerID = allowlistPeerID
+
 	// Start first container with local init
 	logger.Info("Starting first container with local init...")
 	firstContainer := containerInfo{
@@ -1132,6 +1141,8 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 		"LISTEN_ADDR=0.0.0.0",
 		"DB_PATH=/data",
 		"LOG_LEVEL=debug",
+		"UNLIMITED_START=1",
+		fmt.Sprintf("ALLOWLIST_PEERS=%s", allowlistPeerID),
 	}
 
 	initID, err := runInitContainer(ctx, cli, firstContainer.name+"-init", initEnv, networkID)
@@ -1173,6 +1184,8 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 		"LISTEN_ADDR=0.0.0.0",
 		"DB_PATH=/data",
 		"LOG_LEVEL=debug",
+		"UNLIMITED_START=1",
+		fmt.Sprintf("ALLOWLIST_PEERS=%s", allowlistPeerID),
 	}
 
 	firstServerID, err := runServerContainer(ctx, cli, firstContainer.name, firstContainer.hostPort, serverEnv, networkID, true)
@@ -1228,8 +1241,10 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 			"LISTEN_ADDR=0.0.0.0",
 			"DB_PATH=/data",
 			"LOG_LEVEL=debug",
+			"UNLIMITED_START=1",
 			fmt.Sprintf("INIT_PEER=%s", peerID), // Init from first peer
 			fmt.Sprintf("BOOTSTRAP_PEERS=%s", bootstrapPeersStr),
+			fmt.Sprintf("ALLOWLIST_PEERS=%s", allowlistPeerID),
 		}
 
 		// For subsequent containers, we need to init from peer first
@@ -1312,13 +1327,6 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	// Set up local P2P manager to connect to containers
 	peerListChan := make(chan peer.IDSlice, 100)
 	tDB := &testDB{}
-	p2pkey, err := p2p.NewKeyInMemory()
-	if err != nil {
-		setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
-		setup.cleanup()
-		return nil, fmt.Errorf("failed to create P2P key: %w", err)
-	}
-
 	// start local manager and clients
 	stopper, clients, err := startLocalManagerWithError(setup, p2pkey, peerListChan, tDB)
 	if err != nil {
@@ -1328,6 +1336,21 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	}
 	setup.stopper = stopper
 	setup.clients = clients
+	postMaxPeers, postMinPeers := postStartPeerLimits(len(setup.containers))
+	if postMaxPeers > 0 {
+		logger.Infof("Applying post-start peer limits: max=%d min=%d", postMaxPeers, postMinPeers)
+		if err := applyPostStartPeerLimits(clients, postMaxPeers, postMinPeers); err != nil {
+			setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
+			setup.cleanup()
+			return nil, fmt.Errorf("failed to apply post-start peer limits: %w", err)
+		}
+		waitSec := envIntDefaultTest("POST_START_WAIT_SEC", 60)
+		if err := waitForPeerCountStabilization(clients, postMinPeers, postMaxPeers, time.Duration(waitSec)*time.Second); err != nil {
+			setup.cleanup = func() { cleanupAll(ctx, cli, setup) }
+			setup.cleanup()
+			return nil, fmt.Errorf("post-start peer limits not reached: %w", err)
+		}
+	}
 	setup.cleanup = func() {
 		// Save container logs before cleanup
 		logDir, err := saveContainerLogs(ctx, setup)
@@ -1377,6 +1400,8 @@ func startLocalManagerWithError(setup *dockerTestSetup, key *p2p.P2PKey, peerLis
 		Logger:         logger,
 		ExternalDB:     extDB,
 		BootstrapPeers: bootstrapPeers,
+		MaxPeers:       len(setup.containers),
+		MinPeers:       len(setup.containers),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create P2P manager: %w", err)
@@ -1386,6 +1411,10 @@ func startLocalManagerWithError(setup *dockerTestSetup, key *p2p.P2PKey, peerLis
 	stopper, err := p2pMgr.StartServer()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to start P2P server: %w", err)
+	}
+	if _, err := p2pMgr.NewGossipSub(context.Background(), "doltswarmdemo-gossip-v1"); err != nil {
+		stopper()
+		return nil, nil, fmt.Errorf("failed to init gossip for local manager: %w", err)
 	}
 
 	// Wait for clients to connect
@@ -1413,6 +1442,122 @@ func startLocalManagerWithError(setup *dockerTestSetup, key *p2p.P2PKey, peerLis
 	logger.Infof("All %d clients connected", n)
 
 	return stopper, p2pMgr.GetClients(), nil
+}
+
+func postStartPeerLimits(totalPeers int) (int, int) {
+	maxPeers := envIntDefaultTest("POST_START_MAX_PEERS", 12)
+	minPeers := envIntDefaultTest("POST_START_MIN_PEERS", 8)
+	if maxPeers <= 0 {
+		return 0, 0
+	}
+	if totalPeers > 0 && maxPeers > totalPeers {
+		maxPeers = totalPeers
+	}
+	if minPeers > maxPeers {
+		minPeers = maxPeers
+	}
+	if minPeers < 0 {
+		minPeers = 0
+	}
+	return maxPeers, minPeers
+}
+
+func applyPostStartPeerLimits(clients []*p2p.P2PClient, maxPeers, minPeers int) error {
+	if maxPeers <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req := &p2pproto.SetPeerLimitsRequest{Max: int32(maxPeers), Min: int32(minPeers)}
+	for _, c := range clients {
+		if c == nil || c.TesterClient == nil {
+			continue
+		}
+		resp, err := c.TesterClient.SetPeerLimits(ctx, req)
+		if err != nil {
+			return err
+		}
+		if resp != nil && resp.Err != "" {
+			return fmt.Errorf("%s", resp.Err)
+		}
+	}
+	return nil
+}
+
+func waitForPeerCountStabilization(clients []*p2p.P2PClient, minPeers, maxPeers int, timeout time.Duration) error {
+	if maxPeers <= 0 {
+		return nil
+	}
+	if minPeers < 0 {
+		minPeers = 0
+	}
+	if minPeers > maxPeers {
+		minPeers = maxPeers
+	}
+	deadline := time.Now().Add(timeout)
+	lastLog := time.Now()
+	for time.Now().Before(deadline) {
+		allOK := true
+		within := 0
+		low := int(^uint(0) >> 1)
+		high := 0
+		for _, c := range clients {
+			if c == nil || c.TesterClient == nil {
+				allOK = false
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resp, err := c.TesterClient.GetPeerCounts(ctx, &p2pproto.GetPeerCountsRequest{})
+			cancel()
+			if err != nil {
+				allOK = false
+				continue
+			}
+			if resp != nil && resp.GetErr() != "" {
+				allOK = false
+				continue
+			}
+			grpcPeers := int(resp.GetGrpcPeers())
+			if grpcPeers < low {
+				low = grpcPeers
+			}
+			if grpcPeers > high {
+				high = grpcPeers
+			}
+			if grpcPeers < minPeers || grpcPeers > maxPeers {
+				allOK = false
+				break
+			}
+			within++
+		}
+		if allOK {
+			logger.Infof("Peer limits satisfied for all nodes (grpc peers in [%d,%d])", minPeers, maxPeers)
+			return nil
+		}
+		if time.Since(lastLog) >= 10*time.Second {
+			lastLog = time.Now()
+			if low == int(^uint(0)>>1) {
+				low = 0
+			}
+			logger.Infof("Waiting for peer limits: %d/%d within [%d,%d] (grpc peers min=%d max=%d)",
+				within, len(clients), minPeers, maxPeers, low, high)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for peers to stabilize within min=%d max=%d", minPeers, maxPeers)
+}
+
+func envIntDefaultTest(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		logger.Warnf("Invalid %s=%q; using default %d", name, v, def)
+		return def
+	}
+	return n
 }
 
 // runInitContainer runs a container that initializes the database locally
@@ -2116,6 +2261,8 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 		"LISTEN_ADDR=0.0.0.0",
 		"DB_PATH=/data",
 		"LOG_LEVEL=debug",
+		"UNLIMITED_START=1",
+		fmt.Sprintf("ALLOWLIST_PEERS=%s", setup.allowlistPeerID),
 		fmt.Sprintf("INIT_PEER=%s", setup.containers[0].peerID),
 	}
 	if len(bootstrapAddrs) > 0 {
@@ -2190,6 +2337,16 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 	if newClient == nil {
 		logger.Warnf("late joiner %s connected to swarm but local manager did not connect in time", containerName)
 		return nil
+	}
+	postMaxPeers, postMinPeers := postStartPeerLimits(len(setup.containers) + 1)
+	if postMaxPeers > 0 {
+		if err := applyPostStartPeerLimits([]*p2p.P2PClient{newClient}, postMaxPeers, postMinPeers); err != nil {
+			logger.Warnf("late joiner %s: failed to apply post-start peer limits: %v", containerName, err)
+		}
+		waitSec := envIntDefaultTest("POST_START_WAIT_SEC", 60)
+		if err := waitForPeerCountStabilization([]*p2p.P2PClient{newClient}, postMinPeers, postMaxPeers, time.Duration(waitSec)*time.Second); err != nil {
+			logger.Warnf("late joiner %s: peer limits not reached: %v", containerName, err)
+		}
 	}
 
 	return &lateJoinerInfo{

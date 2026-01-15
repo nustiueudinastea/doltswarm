@@ -41,3 +41,9 @@ type PeerConnector interface {
 	// This is best-effort and non-blocking; the transport may queue the request.
 	EnsurePeerConnected(peerID string)
 }
+
+// PeerConnectivity is an optional interface that transports can implement to
+// report whether a peer is currently connected in the data plane.
+type PeerConnectivity interface {
+	IsPeerConnected(peerID string) bool
+}

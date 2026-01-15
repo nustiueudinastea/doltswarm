@@ -8,6 +8,8 @@ service Tester {
   rpc ExecSQL(ExecSQLRequest) returns (ExecSQLResponse) {}
   rpc GetAllCommits(GetAllCommitsRequest) returns (GetAllCommitsResponse) {}
   rpc GetHead(GetHeadRequest) returns (GetHeadResponse) {}
+  rpc SetPeerLimits(SetPeerLimitsRequest) returns (SetPeerLimitsResponse) {}
+  rpc GetPeerCounts(GetPeerCountsRequest) returns (GetPeerCountsResponse) {}
 }
 
 message ExecSQLRequest {
@@ -28,4 +30,20 @@ message GetAllCommitsResponse {
 message GetHeadRequest {}
 message GetHeadResponse {
   string commit = 1;
+}
+
+message SetPeerLimitsRequest {
+  int32 max = 1;
+  int32 min = 2;
+}
+message SetPeerLimitsResponse {
+  string err = 1;
+}
+
+message GetPeerCountsRequest {}
+message GetPeerCountsResponse {
+  int32 host_peers = 1;
+  int32 grpc_peers = 2;
+  int32 gossip_peers = 3;
+  string err = 4;
 }

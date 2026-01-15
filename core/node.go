@@ -587,12 +587,13 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 	}
 
 	n.observeProvider(from, ad.HLC)
+	connected := n.isPeerConnected(from)
 	// Ignore our own adverts; local commits are already present and indexed.
 	if n.cfg.Signer != nil && ad.HLC.PeerID == n.cfg.Signer.GetID() {
 		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - own advert, ignoring", shortFrom, ad.HLC)
 		return
 	}
-	n.rememberHintProvider(ad.HLC, from)
+	n.rememberHintProvider(ad.HLC, from, connected)
 	now := time.Now().UnixNano()
 	if n.cfg.MaxClockSkew > 0 && ad.HLC.Wall > now+int64(n.cfg.MaxClockSkew) {
 		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - clock skew rejected", shortFrom, ad.HLC)
@@ -669,7 +670,12 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 
 	n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s (peer=%s) - accepted, requesting sync",
 		shortFrom, ad.HLC, shortPeerID)
-	requestSync(ad.HLC)
+	if connected {
+		requestSync(ad.HLC)
+	} else {
+		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - peer not connected, deferring sync",
+			shortFrom, ad.HLC)
+	}
 }
 
 func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSync func(HLCTimestamp)) {
@@ -684,12 +690,13 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 
 	// Observe provider with checkpoints for safe watermark computation
 	n.observeProviderWithCheckpoints(from, d.HeadHLC, d.Checkpoints)
+	connected := n.isPeerConnected(from)
 	// Ignore our own digests; local state is already present and indexed.
 	if n.cfg.Signer != nil && from == n.cfg.Signer.GetID() {
 		return
 	}
 	if !d.HeadHLC.IsZero() {
-		n.rememberHintProvider(d.HeadHLC, from)
+		n.rememberHintProvider(d.HeadHLC, from, connected)
 
 		// Update local HLC from remote head to reduce clock drift and replay churn.
 		if rec := n.db.GetReconciler(); rec != nil {
@@ -700,13 +707,17 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 	if err != nil || headMeta == nil || head.Hash == "" {
 		n.cfg.Log.Debugf("[gossip] Digest from=%s headHLC=%s - no local head, requesting sync",
 			shortFrom, d.HeadHLC)
-		requestSync(d.HeadHLC)
+		if connected {
+			requestSync(d.HeadHLC)
+		}
 		return
 	}
 	if headMeta.HLC.Less(d.HeadHLC) {
 		n.cfg.Log.Debugf("[gossip] Digest from=%s headHLC=%s - remote ahead (local=%s), requesting sync",
 			shortFrom, d.HeadHLC, headMeta.HLC)
-		requestSync(d.HeadHLC)
+		if connected {
+			requestSync(d.HeadHLC)
+		}
 	}
 
 	// Repair missed commit adverts: if the remote digest contains checkpoints we don't have,
@@ -721,8 +732,10 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 				shortFrom, cp.HLC)
 			// Remember the provider that advertised this checkpoint so the first sync attempt
 			// is more likely to contact a peer that has the missing commits.
-			n.rememberHintProvider(cp.HLC, from)
-			requestSync(cp.HLC)
+			n.rememberHintProvider(cp.HLC, from, connected)
+			if connected {
+				requestSync(cp.HLC)
+			}
 		}
 	}
 }
@@ -740,6 +753,18 @@ func (n *Node) observeProvider(from string, hlc HLCTimestamp) {
 
 	// Also track peer activity for watermark computation (without checkpoints)
 	n.observePeerActivityInternal(from, hlc, nil)
+}
+
+func (n *Node) isPeerConnected(peerID string) bool {
+	if n == nil || peerID == "" {
+		return false
+	}
+	if n.cfg.Transport != nil {
+		if c, ok := n.cfg.Transport.(PeerConnectivity); ok {
+			return c.IsPeerConnected(peerID)
+		}
+	}
+	return true
 }
 
 // observeProviderWithCheckpoints tracks provider with checkpoints from digest
@@ -784,7 +809,7 @@ func (n *Node) observePeerActivityInternal(peerID string, hlc HLCTimestamp, chec
 	n.peerActivity[peerID] = activity
 }
 
-func (n *Node) rememberHintProvider(hlc HLCTimestamp, from string) {
+func (n *Node) rememberHintProvider(hlc HLCTimestamp, from string, allowConnect bool) {
 	if n == nil || from == "" || hlc.IsZero() {
 		return
 	}
@@ -825,10 +850,8 @@ func (n *Node) rememberHintProvider(hlc HLCTimestamp, from string) {
 	}
 	n.providerMu.Unlock()
 
-	// Proactively request a data-plane connection to the hint provider.
-	// This helps ensure the provider is ready when we try to fetch.
-	// Called outside the lock to avoid contention or lock-ordering issues.
-	if connector != nil && peerToConnect != "" {
+	// Proactively request a data-plane connection to the hint provider only when allowed.
+	if allowConnect && connector != nil && peerToConnect != "" {
 		connector.EnsurePeerConnected(peerToConnect)
 	}
 }
@@ -885,6 +908,9 @@ func (n *Node) BestProvider() string {
 	best := n.lastProvider
 	bestHLC := HLCTimestamp{}
 	for id, h := range n.peerHeads {
+		if !n.isPeerConnected(id) {
+			continue
+		}
 		if best == "" || bestHLC.Less(h) {
 			best = id
 			bestHLC = h
@@ -1332,6 +1358,11 @@ func (n *Node) syncOnce(ctx context.Context, minH, maxH HLCTimestamp) error {
 			// No hint provider available, fall back to bestProvider (highest known HLC)
 			preferredProvider = n.BestProvider()
 			// Don't set preferredFromHint - this came from bestProvider, not a hint
+		}
+		if preferredProvider != "" && !n.isPeerConnected(preferredProvider) {
+			preferredProvider = ""
+			preferredFromHint = ""
+			hintHLCForProvider = HLCTimestamp{}
 		}
 		if preferredProvider != "" {
 			syncCtx = WithPreferredProvider(syncCtx, preferredProvider)
