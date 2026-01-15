@@ -22,11 +22,16 @@ type ConnSnapshot interface {
 	SnapshotConns() map[string]grpc.ClientConnInterface
 }
 
+// BestProviderFunc is called when the preferred provider isn't connected.
+// It should return the peer ID with the highest known HLC, if available.
+type BestProviderFunc func() string
+
 // Providers implements doltswarm.ProviderPicker using a snapshot of connected peers.
 type Providers struct {
-	Src      ConnSnapshot
-	rr       uint64
-	lastUsed atomic.Value // stores string of last used provider ID
+	Src          ConnSnapshot
+	BestProvider BestProviderFunc // Optional: called when preferred provider isn't in conns
+	rr           uint64
+	lastUsed     atomic.Value // stores string of last used provider ID
 }
 
 // LastUsedProvider returns the ID of the most recently selected provider.
@@ -77,6 +82,21 @@ func (p *Providers) PickProvider(ctx context.Context, repo doltswarm.RepoID) (do
 					cs: &chunkStoreClient{c: remotesapi.NewChunkStoreServiceClient(cc)},
 					dl: &downloaderClient{c: proto.NewDownloaderClient(cc)},
 				}, nil
+			}
+		}
+		// Preferred provider not connected - try bestProvider as fallback before round-robin
+		if p.BestProvider != nil {
+			if best := p.BestProvider(); best != "" && best != preferred {
+				if _, isExcluded := excluded[best]; !isExcluded {
+					if cc, ok := conns[best]; ok {
+						recordUsed(best)
+						return &provider{
+							id: best,
+							cs: &chunkStoreClient{c: remotesapi.NewChunkStoreServiceClient(cc)},
+							dl: &downloaderClient{c: proto.NewDownloaderClient(cc)},
+						}, nil
+					}
+				}
 			}
 		}
 	}

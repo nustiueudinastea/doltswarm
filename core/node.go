@@ -291,7 +291,7 @@ func (n *Node) pullFirstBestEffort() {
 		if !hint.IsZero() {
 			h = hint
 		}
-		if err := n.syncOnce(ctx, h); err != nil && ctx.Err() == nil {
+		if err := n.syncOnce(ctx, h, h); err != nil && ctx.Err() == nil {
 			// Pull-first is best-effort; don't block local writes indefinitely. But do try a few times
 			// because providers are picked opportunistically and may be stale.
 			lastErr = err
@@ -315,7 +315,7 @@ func (n *Node) SyncHint(ctx context.Context, hint HLCTimestamp) (changed bool, e
 		}
 	}
 
-	err = n.syncOnce(ctx, hint)
+	err = n.syncOnce(ctx, hint, hint)
 	if err != nil {
 		return false, err
 	}
@@ -460,7 +460,7 @@ func (n *Node) Run(ctx context.Context) error {
 				hintMu.Unlock()
 				n.cfg.Log.Debugf("[sync] Starting syncOnce (hint min=%s max=%s)", minH, maxH)
 				syncStart := time.Now()
-				syncErr := n.syncOnce(ctx, minH)
+				syncErr := n.syncOnce(ctx, minH, maxH)
 				syncDur := time.Since(syncStart).Round(time.Millisecond)
 				if syncErr != nil {
 					// This is the primary "why aren't we converging?" signal in integration runs,
@@ -587,12 +587,12 @@ func (n *Node) onCommitAd(ctx context.Context, from string, ad CommitAdV1, reque
 	}
 
 	n.observeProvider(from, ad.HLC)
-	n.rememberHintProvider(ad.HLC, from)
 	// Ignore our own adverts; local commits are already present and indexed.
 	if n.cfg.Signer != nil && ad.HLC.PeerID == n.cfg.Signer.GetID() {
 		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - own advert, ignoring", shortFrom, ad.HLC)
 		return
 	}
+	n.rememberHintProvider(ad.HLC, from)
 	now := time.Now().UnixNano()
 	if n.cfg.MaxClockSkew > 0 && ad.HLC.Wall > now+int64(n.cfg.MaxClockSkew) {
 		n.cfg.Log.Debugf("[gossip] CommitAd from=%s hlc=%s - clock skew rejected", shortFrom, ad.HLC)
@@ -684,6 +684,10 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 
 	// Observe provider with checkpoints for safe watermark computation
 	n.observeProviderWithCheckpoints(from, d.HeadHLC, d.Checkpoints)
+	// Ignore our own digests; local state is already present and indexed.
+	if n.cfg.Signer != nil && from == n.cfg.Signer.GetID() {
+		return
+	}
 	if !d.HeadHLC.IsZero() {
 		n.rememberHintProvider(d.HeadHLC, from)
 
@@ -784,9 +788,17 @@ func (n *Node) rememberHintProvider(hlc HLCTimestamp, from string) {
 	if n == nil || from == "" || hlc.IsZero() {
 		return
 	}
-	n.providerMu.Lock()
-	defer n.providerMu.Unlock()
+	if n.cfg.Signer != nil && from == n.cfg.Signer.GetID() {
+		// Never treat ourselves as a provider hint.
+		return
+	}
 
+	// Capture transport reference outside the lock to avoid holding the lock
+	// during the EnsurePeerConnected call, which could block or cause contention.
+	var connector PeerConnector
+	var peerToConnect string
+
+	n.providerMu.Lock()
 	now := time.Now()
 	if n.cfg.MaxHintProviders > 0 && len(n.hintProviders) >= n.cfg.MaxHintProviders {
 		n.cleanupHintProvidersLocked(now)
@@ -803,9 +815,27 @@ func (n *Node) rememberHintProvider(hlc HLCTimestamp, from string) {
 		from:      from,
 		expiresAt: now.Add(n.cfg.HintProviderTTL),
 	}
+
+	// Capture info for proactive connection before releasing lock.
+	if n.cfg.Transport != nil {
+		if c, ok := n.cfg.Transport.(PeerConnector); ok {
+			connector = c
+			peerToConnect = from
+		}
+	}
+	n.providerMu.Unlock()
+
+	// Proactively request a data-plane connection to the hint provider.
+	// This helps ensure the provider is ready when we try to fetch.
+	// Called outside the lock to avoid contention or lock-ordering issues.
+	if connector != nil && peerToConnect != "" {
+		connector.EnsurePeerConnected(peerToConnect)
+	}
 }
 
-func (n *Node) popHintProvider(hlc HLCTimestamp) string {
+// peekHintProvider returns the hint provider for the given HLC without removing it.
+// Use deleteHintProvider to remove the entry after successful use.
+func (n *Node) peekHintProvider(hlc HLCTimestamp) string {
 	if n == nil || hlc.IsZero() {
 		return ""
 	}
@@ -815,11 +845,22 @@ func (n *Node) popHintProvider(hlc HLCTimestamp) string {
 	if !ok {
 		return ""
 	}
-	delete(n.hintProviders, hlc)
 	if !e.expiresAt.IsZero() && time.Now().After(e.expiresAt) {
+		delete(n.hintProviders, hlc)
 		return ""
 	}
 	return e.from
+}
+
+// deleteHintProvider removes the hint provider entry for the given HLC.
+// Call this after the hint provider was successfully used.
+func (n *Node) deleteHintProvider(hlc HLCTimestamp) {
+	if n == nil || hlc.IsZero() {
+		return
+	}
+	n.providerMu.Lock()
+	defer n.providerMu.Unlock()
+	delete(n.hintProviders, hlc)
 }
 
 func (n *Node) cleanupHintProvidersLocked(now time.Time) {
@@ -833,7 +874,9 @@ func (n *Node) cleanupHintProvidersLocked(now time.Time) {
 	}
 }
 
-func (n *Node) bestProvider() string {
+// BestProvider returns the peer ID with the highest observed HLC.
+// This is useful as a fallback when the preferred provider isn't connected.
+func (n *Node) BestProvider() string {
 	if n == nil {
 		return ""
 	}
@@ -845,6 +888,32 @@ func (n *Node) bestProvider() string {
 		if best == "" || bestHLC.Less(h) {
 			best = id
 			bestHLC = h
+		}
+	}
+	return best
+}
+
+// LatestHintForProvider returns the newest (max HLC) hint for the given provider.
+// This is useful to trigger a sync immediately after the provider becomes connected.
+func (n *Node) LatestHintForProvider(providerID string) HLCTimestamp {
+	if n == nil || providerID == "" {
+		return HLCTimestamp{}
+	}
+	n.providerMu.Lock()
+	defer n.providerMu.Unlock()
+
+	now := time.Now()
+	var best HLCTimestamp
+	for hlc, entry := range n.hintProviders {
+		if entry.from != providerID {
+			continue
+		}
+		if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+			delete(n.hintProviders, hlc)
+			continue
+		}
+		if best.IsZero() || best.Less(hlc) {
+			best = hlc
 		}
 	}
 	return best
@@ -1222,7 +1291,10 @@ type syncResult struct {
 // maxSyncRetries limits how many different providers we try before giving up.
 const maxSyncRetries = 3
 
-func (n *Node) syncOnce(ctx context.Context, hint HLCTimestamp) error {
+// syncOnce attempts to sync with remote providers.
+// minH is the oldest hint HLC (used for "already applied" checks).
+// maxH is the newest hint HLC (used for provider selection to bias toward freshest data).
+func (n *Node) syncOnce(ctx context.Context, minH, maxH HLCTimestamp) error {
 	var excludedProviders []string
 
 	for attempt := 0; attempt < maxSyncRetries; attempt++ {
@@ -1235,21 +1307,38 @@ func (n *Node) syncOnce(ctx context.Context, hint HLCTimestamp) error {
 		tracker := &UsedProviderTracker{}
 		syncCtx = WithUsedProviderTracker(syncCtx, tracker)
 
-		// Prefer fetching from the peer that told us about the hinted commit (if any).
-		// This avoids getting stuck contacting a stale provider that doesn't yet have the objects.
-		// We consume the hint on the first attempt only; retries use round-robin with exclusions.
-		if !hint.IsZero() {
-			if attempt == 0 {
-				if from := n.popHintProvider(hint); from != "" {
-					syncCtx = WithPreferredProvider(syncCtx, from)
-				}
+		// Prefer fetching from the peer that told us about the hinted commit.
+		// Use peek instead of pop so we don't lose the mapping if the provider isn't connected.
+		// Try maxH first (freshest), then minH, then bestProvider.
+		// Track which hint we used so we only delete it if that provider was actually used.
+		var preferredProvider string
+		var preferredFromHint string // Only set if preferred came from a hint (not bestProvider)
+		var hintHLCForProvider HLCTimestamp
+		if !maxH.IsZero() {
+			if from := n.peekHintProvider(maxH); from != "" {
+				preferredProvider = from
+				preferredFromHint = from
+				hintHLCForProvider = maxH
 			}
-		} else if from := n.bestProvider(); from != "" {
-			syncCtx = WithPreferredProvider(syncCtx, from)
+		}
+		if preferredProvider == "" && !minH.IsZero() && minH != maxH {
+			if from := n.peekHintProvider(minH); from != "" {
+				preferredProvider = from
+				preferredFromHint = from
+				hintHLCForProvider = minH
+			}
+		}
+		if preferredProvider == "" {
+			// No hint provider available, fall back to bestProvider (highest known HLC)
+			preferredProvider = n.BestProvider()
+			// Don't set preferredFromHint - this came from bestProvider, not a hint
+		}
+		if preferredProvider != "" {
+			syncCtx = WithPreferredProvider(syncCtx, preferredProvider)
 		}
 
 		// Do the actual sync (with mutex held), track if we should resubmit after
-		result, err := n.syncOnceInner(syncCtx, hint)
+		result, err := n.syncOnceInner(syncCtx, minH)
 		if err != nil {
 			return err
 		}
@@ -1268,11 +1357,37 @@ func (n *Node) syncOnce(ctx context.Context, hint HLCTimestamp) error {
 
 		// If we got commits or we had no hint (nothing expected), we're done
 		if !result.gotNoCommits {
+			// Only delete the hint if the provider we actually used matches the hint provider.
+			// This prevents deleting hints when we fell back to a different provider.
+			if preferredFromHint != "" && result.usedProvider == preferredFromHint && !hintHLCForProvider.IsZero() {
+				n.deleteHintProvider(hintHLCForProvider)
+			}
 			return nil
 		}
 
-		// We expected commits but got none - the provider might be stale.
-		// Retry with a different provider if we haven't exceeded max retries.
+		// We expected commits but got none.
+		// CRITICAL: Only retry if we actually used the hinted provider.
+		// If we had a hint but couldn't reach that provider (fell back to another),
+		// retrying with more random providers is wasteful - they likely don't have
+		// the commit either. Let the next sync trigger handle it after EnsurePeerConnected
+		// has had time to establish the connection.
+		if preferredFromHint != "" && result.usedProvider != preferredFromHint {
+			// We had a hint but couldn't reach that provider. Don't burn retries.
+			hintShort := preferredFromHint
+			if len(hintShort) > 12 {
+				hintShort = hintShort[:12]
+			}
+			usedShort := result.usedProvider
+			if len(usedShort) > 12 {
+				usedShort = usedShort[:12]
+			}
+			n.cfg.Log.Debugf("[sync] Hint provider %s not used (used %s instead), skipping retries - will sync on next trigger",
+				hintShort, usedShort)
+			return nil
+		}
+
+		// Either we used the hinted provider and it returned nothing (stale), or we had
+		// no hint and used bestProvider. In these cases, retry with a different provider.
 		if result.usedProvider != "" {
 			excludedProviders = append(excludedProviders, result.usedProvider)
 			providerShort := result.usedProvider
@@ -1378,20 +1493,17 @@ func (n *Node) syncOnceInner(ctx context.Context, hint HLCTimestamp) (syncResult
 		return syncResult{}, err
 	}
 	if len(imported) == 0 {
-		// No commits to import. If we had a hint, check whether we should retry.
-		// If the hinted commit is already applied locally, we already have it - no retry needed.
-		// If it's not applied, the provider might be stale - signal for retry.
+		// No commits to import. Signal gotNoCommits if we had a hint that isn't applied yet.
+		// The caller (syncOnce) will decide whether to retry based on whether we actually
+		// reached the hinted provider.
 		gotNoCommits := false
 		if !hint.IsZero() && n.idx != nil {
 			if e, ok, _ := n.idx.Get(innerCtx, hint); ok && e.Status == CommitStatusApplied {
-				// Commit already applied locally, no need to retry
-				n.cfg.Log.Debugf("[sync] Hint %s already applied locally, no retry needed", hint)
-				gotNoCommits = false
+				n.cfg.Log.Debugf("[sync] Hint %s already applied locally", hint)
 			} else {
-				// Commit not applied yet but provider returned nothing - provider may be stale
 				localShort, remoteShort, baseShort := localHead[:8], remoteHead[:8], mergeBase[:8]
-				n.cfg.Log.Debugf("[sync] No commits imported from provider=%s (remote=%s local=%s base=%s) but hint %s not applied (status=%v)",
-					providerShort, remoteShort, localShort, baseShort, hint, e.Status)
+				n.cfg.Log.Debugf("[sync] No commits imported from provider=%s (remote=%s local=%s base=%s) hint %s pending",
+					providerShort, remoteShort, localShort, baseShort, hint)
 				gotNoCommits = true
 			}
 		}

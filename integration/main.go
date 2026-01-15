@@ -72,7 +72,7 @@ func p2pRun(noGUI bool, noCommits bool, commitInterval int) error {
 			log.Warnf("Failed to initialize GossipSub: %v", err)
 		} else {
 			providers := &grpcswarm.Providers{Src: p2pmgr}
-			tr := &overlay.Transport{G: gossip, P: providers}
+			tr := &overlay.Transport{G: gossip, P: providers, C: p2pmgr}
 			nodei, err = doltswarm.OpenNode(doltswarm.NodeConfig{
 				Repo:      doltswarm.RepoID{RepoName: dbName},
 				Signer:    signer,
@@ -84,6 +84,9 @@ func p2pRun(noGUI bool, noCommits bool, commitInterval int) error {
 				log.Warnf("Failed to open Node: %v", err)
 				nodei = nil
 			} else {
+				// Wire up bestProvider fallback for provider selection
+				providers.BestProvider = nodei.BestProvider
+
 				// Make Node available to ExecSQL handler.
 				p2pmgr.SetNode(nodei)
 
@@ -328,7 +331,7 @@ func Init(localInit bool, peerInit string, port int) error {
 			return fmt.Errorf("failed to init gossip: %w", gErr)
 		}
 		providers := &grpcswarm.Providers{Src: p2pmgr}
-		tr := &overlay.Transport{G: gossip, P: providers}
+		tr := &overlay.Transport{G: gossip, P: providers, C: p2pmgr}
 		node, nErr := doltswarm.OpenNode(doltswarm.NodeConfig{
 			Repo:      doltswarm.RepoID{RepoName: dbName},
 			Signer:    signer,
@@ -339,6 +342,8 @@ func Init(localInit bool, peerInit string, port int) error {
 		if nErr != nil {
 			return fmt.Errorf("failed to open node: %w", nErr)
 		}
+		// Wire up bestProvider fallback for provider selection
+		providers.BestProvider = node.BestProvider
 		defer node.Close()
 
 		// Wait briefly for at least one provider connection (bootstrap peer).

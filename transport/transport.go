@@ -31,3 +31,13 @@ type GossipEvent struct {
 	CommitAd *CommitAdV1
 	Digest   *DigestV1
 }
+
+// PeerConnector is an optional interface that transports can implement
+// to support proactive connection establishment to specific peers.
+// This helps ensure data-plane connections are ready when gossip arrives.
+type PeerConnector interface {
+	// EnsurePeerConnected requests that the transport establish a data-plane
+	// connection to the specified peer if not already connected.
+	// This is best-effort and non-blocking; the transport may queue the request.
+	EnsurePeerConnected(peerID string)
+}

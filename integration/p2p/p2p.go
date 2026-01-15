@@ -310,6 +310,14 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 				// Protect this peer's connection from being pruned by connection manager
 				p2p.protectPeer(peerInfo.ID)
 				peerMu.Unlock()
+				// If we have pending hints for this peer, trigger a sync now that the connection is ready.
+				if p2p.node != nil {
+					if hint := p2p.node.LatestHintForProvider(peerIDStr); !hint.IsZero() {
+						go func(h doltswarm.HLCTimestamp) {
+							_, _ = p2p.node.SyncHint(context.Background(), h)
+						}(hint)
+					}
+				}
 				// Non-blocking send to avoid deadlock during shutdown
 				select {
 				case p2p.peerListChan <- p2p.host.Network().Peers():
@@ -422,6 +430,14 @@ func (p2p *P2P) setupIncomingPeer(peerID string) {
 
 	// Protect this peer's connection from being pruned by connection manager
 	p2p.protectPeer(peerIDParsed)
+	// If we have pending hints for this peer, trigger a sync now that the connection is ready.
+	if p2p.node != nil {
+		if hint := p2p.node.LatestHintForProvider(peerID); !hint.IsZero() {
+			go func(h doltswarm.HLCTimestamp) {
+				_, _ = p2p.node.SyncHint(context.Background(), h)
+			}(hint)
+		}
+	}
 	// Non-blocking send to avoid deadlock during shutdown
 	select {
 	case p2p.peerListChan <- p2p.host.Network().Peers():
@@ -537,6 +553,48 @@ func (p2p *P2P) GetID() string {
 
 func (p2p *P2P) SetNode(n *doltswarm.Node) {
 	p2p.node = n
+}
+
+// EnsurePeerConnected requests that the P2P layer establish a data-plane connection
+// to the specified peer if not already connected. This is best-effort and non-blocking.
+// It helps ensure data-plane connections are ready when gossip arrives from a peer.
+func (p2p *P2P) EnsurePeerConnected(peerID string) {
+	if p2p == nil || peerID == "" {
+		return
+	}
+	if p2p.host != nil && peerID == p2p.host.ID().String() {
+		// Never attempt to connect to ourselves.
+		return
+	}
+
+	// Check if already connected
+	if _, ok := p2p.clients.Get(peerID); ok {
+		return
+	}
+
+	// Parse peer ID and get addresses from the peerstore
+	pid, err := peer.Decode(peerID)
+	if err != nil {
+		p2p.log.Debugf("EnsurePeerConnected: failed to parse peer ID %s: %v", peerID, err)
+		return
+	}
+
+	// Get known addresses for this peer from the peerstore
+	addrs := p2p.host.Peerstore().Addrs(pid)
+	if len(addrs) == 0 {
+		// No known addresses, can't connect proactively
+		p2p.log.Debugf("EnsurePeerConnected: no known addresses for peer %s", peerID)
+		return
+	}
+
+	// Queue connection request (non-blocking)
+	select {
+	case p2p.PeerChan <- peer.AddrInfo{ID: pid, Addrs: addrs}:
+		p2p.log.Debugf("EnsurePeerConnected: queued connection request for peer %s", peerID)
+	default:
+		// Channel full, skip - the peer discovery processor is busy
+		p2p.log.Debugf("EnsurePeerConnected: channel full, skipping peer %s", peerID)
+	}
 }
 
 // SnapshotConns returns a snapshot of currently connected gRPC conns keyed by peer ID.

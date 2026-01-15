@@ -918,9 +918,10 @@ func getContainerLogs(ctx context.Context, cli *client.Client, containerID strin
 
 // saveContainerLogs saves all container logs to a timestamped directory
 // Directory structure: logs/<testname>_<timestamp>/<container_name>.log
-func saveContainerLogs(ctx context.Context, setup *dockerTestSetup) error {
+// Returns the log directory path for further processing.
+func saveContainerLogs(ctx context.Context, setup *dockerTestSetup) (string, error) {
 	if setup == nil || setup.cli == nil || len(setup.containers) == 0 {
-		return nil
+		return "", nil
 	}
 
 	// Create timestamped directory name: TestName_2006-01-02_15-04-05
@@ -929,7 +930,7 @@ func saveContainerLogs(ctx context.Context, setup *dockerTestSetup) error {
 
 	// Create the logs directory
 	if err := os.MkdirAll(testLogDir, 0755); err != nil {
-		return fmt.Errorf("failed to create logs directory %s: %w", testLogDir, err)
+		return "", fmt.Errorf("failed to create logs directory %s: %w", testLogDir, err)
 	}
 
 	logger.Infof("Saving container logs to %s", testLogDir)
@@ -955,7 +956,96 @@ func saveContainerLogs(ctx context.Context, setup *dockerTestSetup) error {
 		logger.Infof("Saved logs for %s to %s", c.name, logFile)
 	}
 
-	return nil
+	return testLogDir, nil
+}
+
+// SyncStats holds aggregate sync statistics from container logs.
+// IMPORTANT: If you change the log line patterns that these stats depend on,
+// you MUST update the grep patterns in computeSyncStats accordingly.
+// See CLAUDE.md and AGENTS.md for details.
+type SyncStats struct {
+	TotalSyncPasses   int
+	SuccessfulImports int
+	FastForwards      int
+	Replays           int
+	ProviderRetries   int
+	ExhaustedRetries  int
+}
+
+// computeSyncStats parses container logs and computes aggregate sync statistics.
+// This greps log files for specific patterns - see the pattern comments below.
+// IMPORTANT: Do not change the log lines in core/node.go without updating these patterns.
+func computeSyncStats(logDir string) (*SyncStats, error) {
+	if logDir == "" {
+		return nil, nil
+	}
+
+	stats := &SyncStats{}
+
+	// Find all log files in the directory
+	files, err := filepath.Glob(filepath.Join(logDir, "*.log"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to glob log files: %w", err)
+	}
+
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			logger.Warnf("Failed to read log file %s: %v", file, err)
+			continue
+		}
+
+		logStr := string(content)
+
+		// Count sync passes: "[sync] syncOnce completed"
+		stats.TotalSyncPasses += strings.Count(logStr, "[sync] syncOnce completed")
+
+		// Count successful imports: "[sync] Importing"
+		stats.SuccessfulImports += strings.Count(logStr, "[sync] Importing")
+
+		// Count fast-forwards: "[sync] Fast-forward succeeded"
+		stats.FastForwards += strings.Count(logStr, "[sync] Fast-forward succeeded")
+
+		// Count replays: "[sync] Replaying"
+		stats.Replays += strings.Count(logStr, "[sync] Replaying")
+
+		// Count provider retries: "retrying with different provider"
+		stats.ProviderRetries += strings.Count(logStr, "retrying with different provider")
+
+		// Count exhausted retries: "Exhausted 3 provider retries"
+		stats.ExhaustedRetries += strings.Count(logStr, "Exhausted 3 provider retries")
+	}
+
+	return stats, nil
+}
+
+// printSyncStats prints the sync statistics summary.
+func printSyncStats(stats *SyncStats) {
+	if stats == nil {
+		return
+	}
+
+	logger.Info("=== Sync Statistics Summary ===")
+	logger.Infof("Total sync passes:                %d", stats.TotalSyncPasses)
+
+	importPct := 0.0
+	if stats.TotalSyncPasses > 0 {
+		importPct = float64(stats.SuccessfulImports) / float64(stats.TotalSyncPasses) * 100
+	}
+	logger.Infof("Successful imports:               %d (%.1f%% of passes)", stats.SuccessfulImports, importPct)
+
+	ffPct := 0.0
+	replayPct := 0.0
+	if stats.SuccessfulImports > 0 {
+		ffPct = float64(stats.FastForwards) / float64(stats.SuccessfulImports) * 100
+		replayPct = float64(stats.Replays) / float64(stats.SuccessfulImports) * 100
+	}
+	logger.Infof("Fast-forwards:                    %d (%.1f%% of imports)", stats.FastForwards, ffPct)
+	logger.Infof("Replays:                          %d (%.1f%% of imports)", stats.Replays, replayPct)
+
+	logger.Infof("Provider retry attempts:          %d", stats.ProviderRetries)
+	logger.Infof("Exhausted retries (all 3 failed): %d", stats.ExhaustedRetries)
+	logger.Info("===============================")
 }
 
 // getContainerIP returns the IP address of a container in the specified network
@@ -1240,8 +1330,18 @@ func createDockerEnvironment(numInstances int) (*dockerTestSetup, error) {
 	setup.clients = clients
 	setup.cleanup = func() {
 		// Save container logs before cleanup
-		if err := saveContainerLogs(ctx, setup); err != nil {
+		logDir, err := saveContainerLogs(ctx, setup)
+		if err != nil {
 			logger.Warnf("Failed to save container logs: %v", err)
+		}
+
+		// Compute and print sync statistics from the logs
+		if logDir != "" {
+			if stats, err := computeSyncStats(logDir); err != nil {
+				logger.Warnf("Failed to compute sync stats: %v", err)
+			} else if stats != nil {
+				printSyncStats(stats)
+			}
 		}
 
 		if stopper != nil {

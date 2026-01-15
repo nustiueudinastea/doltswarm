@@ -91,3 +91,20 @@ Integration scaffolding lives in `integration/`:
 To run Docker-based integration tests, use the Taskfile (`Taskfile.yaml`):
 - `task integration`
 - `task integration:quick`
+
+## Log Line Dependencies (IMPORTANT)
+
+The integration tests compute sync statistics by grepping container logs for specific patterns.
+**DO NOT change these log lines in `core/node.go` without updating `computeSyncStats()` in `integration/integration_test.go`.**
+
+The following log patterns are used for statistics:
+- `[sync] syncOnce completed` - counts total sync passes
+- `[sync] Importing` - counts successful imports
+- `[sync] Fast-forward succeeded` - counts fast-forward merges
+- `[sync] Replaying` - counts replay operations
+- `retrying with different provider` - counts provider retry attempts
+- `Exhausted 3 provider retries` - counts exhausted retries
+
+If you need to change any of these log lines, update both:
+1. The log statement in `core/node.go`
+2. The corresponding `strings.Count()` call in `integration/integration_test.go:computeSyncStats()`
