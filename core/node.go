@@ -715,6 +715,9 @@ func (n *Node) onDigest(ctx context.Context, from string, d DigestV1, requestSyn
 		if !ok || (e.Status != CommitStatusApplied && e.Status != CommitStatusRejected) || (e.CommitHash != "" && e.CommitHash != cp.CommitHash) {
 			n.cfg.Log.Debugf("[gossip] Digest from=%s - missing checkpoint hlc=%s, requesting sync",
 				shortFrom, cp.HLC)
+			// Remember the provider that advertised this checkpoint so the first sync attempt
+			// is more likely to contact a peer that has the missing commits.
+			n.rememberHintProvider(cp.HLC, from)
 			requestSync(cp.HLC)
 		}
 	}
@@ -1209,37 +1212,105 @@ func (n *Node) getHeadMeta(ctx context.Context) (Commit, *CommitMetadata, error)
 	return head, meta, nil
 }
 
+// syncResult contains the outcome of a single sync attempt.
+type syncResult struct {
+	shouldResubmit bool   // true if we should resubmit offline commits
+	gotNoCommits   bool   // true if we expected commits (had hints) but got none
+	usedProvider   string // which provider was used for the fetch
+}
+
+// maxSyncRetries limits how many different providers we try before giving up.
+const maxSyncRetries = 3
+
 func (n *Node) syncOnce(ctx context.Context, hint HLCTimestamp) error {
-	// Prefer fetching from the peer that told us about the hinted commit (if any).
-	// This avoids getting stuck contacting a stale provider that doesn't yet have the objects.
-	if !hint.IsZero() {
-		if from := n.popHintProvider(hint); from != "" {
-			ctx = WithPreferredProvider(ctx, from)
+	var excludedProviders []string
+
+	for attempt := 0; attempt < maxSyncRetries; attempt++ {
+		syncCtx := ctx
+		if len(excludedProviders) > 0 {
+			syncCtx = WithExcludedProviders(ctx, excludedProviders)
 		}
-	} else if from := n.bestProvider(); from != "" {
-		ctx = WithPreferredProvider(ctx, from)
+
+		// Set up a tracker to capture which provider was used
+		tracker := &UsedProviderTracker{}
+		syncCtx = WithUsedProviderTracker(syncCtx, tracker)
+
+		// Prefer fetching from the peer that told us about the hinted commit (if any).
+		// This avoids getting stuck contacting a stale provider that doesn't yet have the objects.
+		// We consume the hint on the first attempt only; retries use round-robin with exclusions.
+		if !hint.IsZero() {
+			if attempt == 0 {
+				if from := n.popHintProvider(hint); from != "" {
+					syncCtx = WithPreferredProvider(syncCtx, from)
+				}
+			}
+		} else if from := n.bestProvider(); from != "" {
+			syncCtx = WithPreferredProvider(syncCtx, from)
+		}
+
+		// Do the actual sync (with mutex held), track if we should resubmit after
+		result, err := n.syncOnceInner(syncCtx, hint)
+		if err != nil {
+			return err
+		}
+
+		// Capture the provider that was used (set during fetch)
+		usedProvider := tracker.Get()
+		if result.usedProvider == "" {
+			result.usedProvider = usedProvider
+		}
+
+		// Resubmit late offline commits AFTER releasing reconciler mutex to avoid deadlock.
+		// resubmitCommit also takes the reconciler mutex internally.
+		if result.shouldResubmit {
+			n.resubmitOfflineCommits(ctx)
+		}
+
+		// If we got commits or we had no hint (nothing expected), we're done
+		if !result.gotNoCommits {
+			return nil
+		}
+
+		// We expected commits but got none - the provider might be stale.
+		// Retry with a different provider if we haven't exceeded max retries.
+		if result.usedProvider != "" {
+			excludedProviders = append(excludedProviders, result.usedProvider)
+			providerShort := result.usedProvider
+			if len(providerShort) > 12 {
+				providerShort = providerShort[:12]
+			}
+			n.cfg.Log.Debugf("[sync] Provider %s returned no commits despite hints, retrying with different provider (attempt %d/%d)",
+				providerShort, attempt+1, maxSyncRetries)
+		} else {
+			// No provider info, can't meaningfully retry
+			return nil
+		}
 	}
 
-	// Do the actual sync (with mutex held), track if we should resubmit after
-	shouldResubmit, err := n.syncOnceInner(ctx, hint)
-	if err != nil {
-		return err
-	}
-
-	// Resubmit late offline commits AFTER releasing reconciler mutex to avoid deadlock.
-	// resubmitCommit also takes the reconciler mutex internally.
-	if shouldResubmit {
-		n.resubmitOfflineCommits(ctx)
-	}
-
+	n.cfg.Log.Debugf("[sync] Exhausted %d provider retries, giving up this sync pass", maxSyncRetries)
 	return nil
 }
 
 // syncOnceInner performs the actual sync with mutexes held.
-// Returns true if resubmission should be attempted after releasing mutexes.
-func (n *Node) syncOnceInner(ctx context.Context, hint HLCTimestamp) (shouldResubmit bool, err error) {
+// Returns a syncResult indicating what happened during the sync.
+func (n *Node) syncOnceInner(ctx context.Context, hint HLCTimestamp) (syncResult, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// Get the provider tracker to report which provider was used
+	var usedProvider string
+	if tracker := UsedProviderTrackerFromContext(ctx); tracker != nil {
+		defer func() {
+			usedProvider = tracker.Get()
+		}()
+	}
+	makeResult := func(shouldResubmit, gotNoCommits bool) syncResult {
+		return syncResult{
+			shouldResubmit: shouldResubmit,
+			gotNoCommits:   gotNoCommits,
+			usedProvider:   usedProvider,
+		}
+	}
 
 	// Serialize against local commits and other Dolt mutations.
 	// DB.Commit/ExecAndCommit already lock this; sync must do the same.
@@ -1253,42 +1324,84 @@ func (n *Node) syncOnceInner(ctx context.Context, hint HLCTimestamp) (shouldResu
 	defer cancel()
 
 	if err := n.db.EnsureSwarmRemote(innerCtx, n.cfg.Repo); err != nil {
-		return false, err
+		return syncResult{}, err
 	}
 	if err := n.db.FetchSwarm(innerCtx); err != nil {
-		return false, err
+		return syncResult{}, err
+	}
+
+	// Now we can capture the used provider (fetch has completed)
+	// Try context-based tracker first, then fall back to provider picker's LastUsedProvider
+	if tracker := UsedProviderTrackerFromContext(ctx); tracker != nil {
+		usedProvider = tracker.Get()
+	}
+	if usedProvider == "" {
+		// Context tracking didn't work (e.g., context not propagated through Dolt SQL layer)
+		// Fall back to the provider picker's LastUsedProvider if available
+		if getter, ok := n.cfg.Transport.Providers().(LastUsedProviderGetter); ok {
+			usedProvider = getter.LastUsedProvider()
+		}
 	}
 
 	remoteRef := "remotes/swarm/main"
 	remoteHead, ok, err := n.db.GetBranchHead(innerCtx, remoteRef)
 	if err != nil {
-		return false, err
+		return syncResult{}, err
 	}
 	if !ok {
 		// Nothing fetched yet (no remote branch).
-		return false, nil
+		return makeResult(false, false), nil
+	}
+
+	// Get local head for diagnostic comparison
+	localHead, _, _ := n.db.GetBranchHead(innerCtx, "main")
+	providerShort := usedProvider
+	if len(providerShort) > 12 {
+		providerShort = providerShort[:12]
 	}
 
 	mergeBase, err := n.db.MergeBase(innerCtx, "main", remoteRef)
 	if err != nil {
-		return false, err
+		return syncResult{}, err
 	}
 	if mergeBase == "" {
 		// Bootstrap: no shared history. Force main to the remote head and rebuild.
 		if err := n.forceResetMainTo(innerCtx, remoteHead); err != nil {
-			return false, err
+			return syncResult{}, err
 		}
 		_ = n.initIndexFromDB(innerCtx)
-		return false, nil
+		return makeResult(false, false), nil
 	}
 
 	imported, err := n.db.reconciler.getCommitsSince(innerCtx, n.db.sqldb, remoteRef, mergeBase)
 	if err != nil {
-		return false, err
+		return syncResult{}, err
 	}
 	if len(imported) == 0 {
-		return false, nil
+		// No commits to import. If we had a hint, check whether we should retry.
+		// If the hinted commit is already applied locally, we already have it - no retry needed.
+		// If it's not applied, the provider might be stale - signal for retry.
+		gotNoCommits := false
+		if !hint.IsZero() && n.idx != nil {
+			if e, ok, _ := n.idx.Get(innerCtx, hint); ok && e.Status == CommitStatusApplied {
+				// Commit already applied locally, no need to retry
+				n.cfg.Log.Debugf("[sync] Hint %s already applied locally, no retry needed", hint)
+				gotNoCommits = false
+			} else {
+				// Commit not applied yet but provider returned nothing - provider may be stale
+				localShort, remoteShort, baseShort := localHead[:8], remoteHead[:8], mergeBase[:8]
+				n.cfg.Log.Debugf("[sync] No commits imported from provider=%s (remote=%s local=%s base=%s) but hint %s not applied (status=%v)",
+					providerShort, remoteShort, localShort, baseShort, hint, e.Status)
+				gotNoCommits = true
+			}
+		}
+		return makeResult(false, gotNoCommits), nil
 	}
+
+	// Log successful import
+	localShort, remoteShort, baseShort := localHead[:8], remoteHead[:8], mergeBase[:8]
+	n.cfg.Log.Debugf("[sync] Importing %d commits from provider=%s (remote=%s local=%s base=%s)",
+		len(imported), providerShort, remoteShort, localShort, baseShort)
 
 	// Get finalized base for tail-only linearization
 	var fb *FinalizedBase
@@ -1298,18 +1411,20 @@ func (n *Node) syncOnceInner(ctx context.Context, hint HLCTimestamp) (shouldResu
 
 	// Try the cheap path first.
 	if ok, err := n.tryFastForward(innerCtx, remoteHead); err == nil && ok {
+		n.cfg.Log.Debugf("[sync] Fast-forward succeeded to %s", remoteShort)
 		_ = n.initIndexFromDB(innerCtx)
 		n.tryAdvanceFinalizedBase(innerCtx)
-		return true, nil // Signal to resubmit after releasing mutex
+		return makeResult(true, false), nil // Signal to resubmit after releasing mutex
 	}
 
+	n.cfg.Log.Debugf("[sync] Replaying %d commits (fast-forward not possible)", len(imported))
 	if err := n.db.reconciler.ReplayImported(innerCtx, mergeBase, imported, fb); err != nil {
-		return false, err
+		return syncResult{}, err
 	}
 
 	_ = n.initIndexFromDB(innerCtx)
 	n.tryAdvanceFinalizedBase(innerCtx)
-	return true, nil // Signal to resubmit after releasing mutex
+	return makeResult(true, false), nil // Signal to resubmit after releasing mutex
 }
 
 func (n *Node) updateHeadIndexBestEffort(ctx context.Context) {

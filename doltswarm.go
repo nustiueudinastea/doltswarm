@@ -64,6 +64,24 @@ func PreferredProviderFromContext(ctx context.Context) (string, bool) {
 	return transport.PreferredProviderFromContext(ctx)
 }
 
+func WithExcludedProviders(ctx context.Context, providerIDs []string) context.Context {
+	return transport.WithExcludedProviders(ctx, providerIDs)
+}
+
+func ExcludedProvidersFromContext(ctx context.Context) []string {
+	return transport.ExcludedProvidersFromContext(ctx)
+}
+
+type UsedProviderTracker = transport.UsedProviderTracker
+
+func WithUsedProviderTracker(ctx context.Context, tracker *UsedProviderTracker) context.Context {
+	return transport.WithUsedProviderTracker(ctx, tracker)
+}
+
+func UsedProviderTrackerFromContext(ctx context.Context) *UsedProviderTracker {
+	return transport.UsedProviderTrackerFromContext(ctx)
+}
+
 // --- Core engine types ---
 
 type DB = core.DB

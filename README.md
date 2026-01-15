@@ -35,7 +35,7 @@ The top-level `doltswarm` package remains the public import path and re-exports 
 - `transport/`: the pluggable networking boundary (no Dolt logic here):
   - control plane interfaces (`transport/transport.go`)
   - data plane provider interfaces (`transport/provider.go`)
-  - best-effort provider hint via context (`transport/provider_hint.go`)
+  - best-effort provider hints + retry exclusions via context (`transport/provider_hint.go`)
 - `core/`: the synchronization engine and Dolt integration:
   - `core/node.go`: `Node` (gossip loop, debounce, fetch+reconcile orchestration)
   - `core/reconciler_core.go`: deterministic linearizer (temp-branch replay + conflict drops)
@@ -77,6 +77,7 @@ Remote reception:
 
 Sync pass:
   DOLT_FETCH('swarm')               (transport picks any provider; may honor a preferred-provider hint)
+  if hinted fetch returns no commits, retry other providers (bounded)
   find merge base: MergeBase(main, remotes/swarm/main)
   try fast-forward main to remote head (ff-only merge)
   else replay deterministically on a temp branch in HLC order (tail-only when a finalized base is set)
@@ -84,7 +85,8 @@ Sync pass:
   resubmit any newly-detected late offline commits (best-effort, if enabled)
 ```
 
-Provider hints are best-effort: the node remembers which peer mentioned a given HLC for a short TTL and consumes that hint when choosing a fetch provider.
+Provider hints are best-effort: the node remembers which peer mentioned a given HLC (from commit adverts, digests, and missing checkpoints) for a short TTL and tries that provider first.
+If a hinted fetch returns stale data (no imported commits for the hint), the node retries the same sync pass against other providers (bounded), avoiding waiting for the next digest/`RepairInterval`.
 
 ## Commit Dissemination, Concurrency, and Reconciliation
 

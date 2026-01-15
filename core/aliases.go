@@ -54,6 +54,7 @@ type GossipSubscription = transport.GossipSubscription
 type GossipEvent = transport.GossipEvent
 
 type ProviderPicker = transport.ProviderPicker
+type LastUsedProviderGetter = transport.LastUsedProviderGetter
 type Provider = transport.Provider
 type ChunkStoreClient = transport.ChunkStoreClient
 type DownloaderClient = transport.DownloaderClient
@@ -69,4 +70,22 @@ func WithPreferredProvider(ctx context.Context, providerID string) context.Conte
 
 func PreferredProviderFromContext(ctx context.Context) (string, bool) {
 	return transport.PreferredProviderFromContext(ctx)
+}
+
+func WithExcludedProviders(ctx context.Context, providerIDs []string) context.Context {
+	return transport.WithExcludedProviders(ctx, providerIDs)
+}
+
+func ExcludedProvidersFromContext(ctx context.Context) []string {
+	return transport.ExcludedProvidersFromContext(ctx)
+}
+
+type UsedProviderTracker = transport.UsedProviderTracker
+
+func WithUsedProviderTracker(ctx context.Context, tracker *UsedProviderTracker) context.Context {
+	return transport.WithUsedProviderTracker(ctx, tracker)
+}
+
+func UsedProviderTrackerFromContext(ctx context.Context) *UsedProviderTracker {
+	return transport.UsedProviderTrackerFromContext(ctx)
 }

@@ -14,6 +14,13 @@ type ProviderPicker interface {
 	PickProvider(ctx context.Context, repo RepoID) (Provider, error)
 }
 
+// LastUsedProviderGetter is an optional interface that ProviderPicker implementations
+// can satisfy to report which provider was most recently selected.
+// This is useful when context-based tracking doesn't propagate through external layers (e.g., Dolt SQL).
+type LastUsedProviderGetter interface {
+	LastUsedProvider() string
+}
+
 // Provider is a read-only data-plane provider (any peer that can serve chunks / table files).
 type Provider interface {
 	ID() string

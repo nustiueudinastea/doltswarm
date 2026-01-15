@@ -24,8 +24,22 @@ type ConnSnapshot interface {
 
 // Providers implements doltswarm.ProviderPicker using a snapshot of connected peers.
 type Providers struct {
-	Src ConnSnapshot
-	rr  uint64
+	Src      ConnSnapshot
+	rr       uint64
+	lastUsed atomic.Value // stores string of last used provider ID
+}
+
+// LastUsedProvider returns the ID of the most recently selected provider.
+// This is useful when context-based tracking doesn't propagate through external layers.
+func (p *Providers) LastUsedProvider() string {
+	if p == nil {
+		return ""
+	}
+	v := p.lastUsed.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
 }
 
 func (p *Providers) PickProvider(ctx context.Context, repo doltswarm.RepoID) (doltswarm.Provider, error) {
@@ -38,26 +52,53 @@ func (p *Providers) PickProvider(ctx context.Context, repo doltswarm.RepoID) (do
 		return nil, fmt.Errorf("no connected providers")
 	}
 
-	// If the core sync engine provides a provider hint (e.g. from the peer that advertised a commit),
-	// honor it when possible to avoid fetching from stale providers.
-	if preferred, ok := doltswarm.PreferredProviderFromContext(ctx); ok {
-		if cc, ok := conns[preferred]; ok {
-			return &provider{
-				id: preferred,
-				cs: &chunkStoreClient{c: remotesapi.NewChunkStoreServiceClient(cc)},
-				dl: &downloaderClient{c: proto.NewDownloaderClient(cc)},
-			}, nil
+	// Build set of excluded providers (ones that returned stale data on previous attempts)
+	excluded := make(map[string]struct{})
+	for _, id := range doltswarm.ExcludedProvidersFromContext(ctx) {
+		excluded[id] = struct{}{}
+	}
+
+	// Helper to record which provider was selected (for retry logic)
+	recordUsed := func(id string) {
+		p.lastUsed.Store(id)
+		if tracker := doltswarm.UsedProviderTrackerFromContext(ctx); tracker != nil {
+			tracker.Set(id)
 		}
 	}
 
+	// If the core sync engine provides a provider hint (e.g. from the peer that advertised a commit),
+	// honor it when possible to avoid fetching from stale providers.
+	if preferred, ok := doltswarm.PreferredProviderFromContext(ctx); ok {
+		if _, isExcluded := excluded[preferred]; !isExcluded {
+			if cc, ok := conns[preferred]; ok {
+				recordUsed(preferred)
+				return &provider{
+					id: preferred,
+					cs: &chunkStoreClient{c: remotesapi.NewChunkStoreServiceClient(cc)},
+					dl: &downloaderClient{c: proto.NewDownloaderClient(cc)},
+				}, nil
+			}
+		}
+	}
+
+	// Filter out excluded providers
 	ids := make([]string, 0, len(conns))
 	for id := range conns {
-		ids = append(ids, id)
+		if _, isExcluded := excluded[id]; !isExcluded {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		// All providers are excluded, fall back to any available
+		for id := range conns {
+			ids = append(ids, id)
+		}
 	}
 	sort.Strings(ids)
 	idx := atomic.AddUint64(&p.rr, 1) - 1
 	id := ids[int(idx%uint64(len(ids)))]
 	cc := conns[id]
+	recordUsed(id)
 	return &provider{
 		id: id,
 		cs: &chunkStoreClient{c: remotesapi.NewChunkStoreServiceClient(cc)},
