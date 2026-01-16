@@ -2306,6 +2306,11 @@ func startLateJoiner(t *testing.T, setup *dockerTestSetup) *lateJoinerInfo {
 	}
 	logger.Infof("Late joiner %s started with peer ID %s", containerName, peerID)
 
+	// Allow the local manager to accept one more peer (late joiner).
+	if setup.p2pMgr != nil {
+		setup.p2pMgr.SetPeerLimits(len(setup.containers)+1, len(setup.containers)+1)
+	}
+
 	// Push address to local p2p manager so it connects
 	addr := fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1/p2p/%s", hostPort, peerID)
 	ma, err := multiaddr.NewMultiaddr(addr)

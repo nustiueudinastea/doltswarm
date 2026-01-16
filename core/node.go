@@ -1529,8 +1529,8 @@ func (n *Node) syncOnceInner(ctx context.Context, hint HLCTimestamp) (syncResult
 		// reached the hinted provider.
 		gotNoCommits := false
 		if !hint.IsZero() && n.idx != nil {
-			if e, ok, _ := n.idx.Get(innerCtx, hint); ok && e.Status == CommitStatusApplied {
-				n.cfg.Log.Debugf("[sync] Hint %s already applied locally", hint)
+			if e, ok, _ := n.idx.Get(innerCtx, hint); ok && (e.Status == CommitStatusApplied || e.Status == CommitStatusRejected) {
+				n.cfg.Log.Debugf("[sync] Hint %s already handled locally (%v)", hint, e.Status)
 			} else {
 				localShort, remoteShort, baseShort := localHead[:8], remoteHead[:8], mergeBase[:8]
 				n.cfg.Log.Debugf("[sync] No commits imported from provider=%s (remote=%s local=%s base=%s) hint %s pending",
