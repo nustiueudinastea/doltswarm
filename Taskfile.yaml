@@ -149,6 +149,36 @@ tasks:
     cmds:
       - pkill -9 -f ddolt || true
 
+  quint:run:
+    desc: Run Quint simulator on the verification spec (random sampling)
+    summary: |
+      Run the Quint simulator to randomly sample traces and check invariants.
+      Fast, no Java required. Does not prove correctness but can find bugs.
+
+      Options:
+        SAMPLES     Number of random traces (default: 10000)
+        STEPS       Max steps per trace (default: 20)
+        INVARIANT   Specific invariant to check (default: all four)
+
+      Examples:
+        task quint:run                          # All invariants, 10k samples
+        task quint:run SAMPLES=50000 STEPS=30   # More thorough
+        task quint:run INVARIANT=agreement      # Single invariant
+    dir: specs
+    vars:
+      SAMPLES: '{{.SAMPLES | default "10000"}}'
+      STEPS: '{{.STEPS | default "20"}}'
+    cmds:
+      - |
+        {{if .INVARIANT}}
+          quint run doltswarm_verify.qnt --invariant={{.INVARIANT}} --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
+        {{else}}
+          for inv in inv_clock_convergence inv_finalized_agreement inv_no_finalized_rejected_overlap inv_no_write_during_conflict inv_data_convergence; do
+            echo "=== Checking $inv ==="
+            quint run doltswarm_verify.qnt --invariant=$inv --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
+          done
+        {{end}}
+
   default:
     desc: Show available tasks
     cmds:

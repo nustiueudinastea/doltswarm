@@ -1,0 +1,1282 @@
+# Doltswarm: P2P Sync Protocol over Dolt
+
+## 0. Motivation and Research Background
+
+### Goal
+
+Design a peer-to-peer synchronization protocol for Dolt databases that allows multiple peers to concurrently read and write SQL data, automatically merge non-conflicting changes, surface conflicts to users for resolution, and converge on a shared finalized history — all without a central coordinator, with minimal inter-peer communication, and with no consensus protocol.
+
+### The problem with Dolt's commit model in a P2P setting
+
+Dolt stores data in content-addressed prolly trees (deterministic B-trees where the same dataset always produces the same root hash). This is excellent for sync — identical data produces identical chunks regardless of which peer produced it. However, Dolt layers a Git-style linear commit DAG on top of this data layer. Each commit's hash is computed from its serialized flatbuffer, which includes `parent_addrs` — the 20-byte hashes of parent commits. This means a commit's identity depends on its position in the DAG. Two commits with identical data but different parents produce different hashes.
+
+In a P2P setting, this creates a fundamental tension. If peers create commits independently and later try to stitch them into a shared history, every rebase or parent reassignment produces new commit hashes, which cascade through all descendants. Any external reference to the original hash becomes stale. Git solves this with a central server that establishes ordering. We cannot rely on that.
+
+### What DefraDB taught us: the CRDT approach avoids linear history entirely
+
+DefraDB (by Source Network) takes a radically different approach. Instead of a global linear commit history, each document has its own Merkle DAG. Every mutation to a document creates a new DAG node whose hash includes the content delta and the parent node hash(es). Concurrent edits to the same document produce multiple DAG heads — a natural representation of divergence. Merging happens per-document by walking the DAG to find the common ancestor and applying CRDT merge semantics at the field level.
+
+The key insight from DefraDB is that **a per-document Merkle DAG CRDT requires no coordination for non-conflicting changes.** Peers simply exchange DAG nodes. The DAG union is itself a CRDT (a G-Set of immutable nodes). Each peer independently computes the merged state from the same set of nodes and arrives at the same result. There is no rebase, no linear ordering to agree on, no epoch to finalize. The tradeoff is that DefraDB cannot easily prune history (every DAG node is needed for future merge-base computation) and its merge semantics are limited to CRDT-compatible operations on schemaless JSON documents — it cannot do the rich SQL-level three-way merge that Dolt provides.
+
+The lesson for doltswarm: **minimize coordination by making the shared data structure a CRDT.** Don't try to get peers to agree on a linear commit chain in real-time. Use an append-only structure that converges via set union.
+
+### What Fireproof taught us: separate the clock from the data
+
+Fireproof (by Chris Anderson, co-creator of CouchDB) provides the architectural blueprint. It cleanly separates two layers:
+
+**Merkle Clock (Pail):** A DAG of events where each event carries an operation payload and parent CIDs. The clock is a G-Set CRDT — merging two clocks is set union. Concurrent writes produce multiple heads. A deterministic total order (causal ordering from the DAG, with CID-based tiebreaker for concurrent events) allows any peer to replay events in the same sequence.
+
+**Prolly Trees:** Deterministic B-trees that store the actual data. Events from the clock are applied to the prolly tree in the deterministic order. Because the tree is history-independent (same data = same tree regardless of insertion order), all peers converge to the same root hash.
+
+The separation means the clock handles *what happened and when*, while the prolly tree handles *what is the current state*. This is exactly the split Dolt already has — prolly trees for data, commit DAG for ordering — but Fireproof's clock is designed for P2P from the ground up, whereas Dolt's commit DAG assumes a linear history with content-addressed identity that breaks under concurrent independent commits.
+
+### The non-obvious finding in Dolt: MergeRoots is DAG-independent
+
+The critical discovery from examining Dolt's Go codebase is that Dolt's three-way merge algorithm operates on `RootValue` objects, not commits:
+
+```go
+func MergeRoots(ctx, ourRoot, theirRoot, ancRoot *doltdb.RootValue) (*doltdb.RootValue, ...)
+```
+
+The merge algorithm computes `Diff(ancestor, ours)` and `Diff(ancestor, theirs)` using prolly tree diffing, streams both diffs in primary key order, and performs cell-level conflict detection. None of this touches the commit DAG. The DAG is only used *upstream* to find the common ancestor via `FindCommonAncestor`, which walks parent pointers.
+
+This means: **if we can supply a common ancestor `RootValue` through any external mechanism, the entire merge engine works without modification.** We do not need to change Dolt's merge code, its prolly tree implementation, or its chunk storage. We only need to replace the ancestor discovery layer.
+
+Additionally, Dolt's chunk-level sync (`Puller`) operates on opaque content-addressed chunks — it follows hash references without distinguishing between commit objects and prolly tree nodes. We can sync prolly tree data between peers without any commit wrapping.
+
+### The synthesis: a Merkle clock over Dolt's prolly trees
+
+Combining these findings:
+
+From **DefraDB** we take the principle: use a CRDT-based shared structure (the Merkle clock) so that peers converge without coordination. The clock DAG is a G-Set — append-only, union-merge, no rebase, no hash instability.
+
+From **Fireproof** we take the architecture: separate the ordering layer (Merkle clock) from the data layer (prolly trees). The clock establishes causal ordering and provides merge-base discovery. The prolly trees store the actual SQL data and provide efficient diffing and structural sharing.
+
+From **Dolt** we keep everything valuable: the SQL interface, the prolly tree storage engine, the three-way merge with cell-level conflict detection, the chunk-level sync protocol, and the local commit DAG for `dolt log` / `dolt diff` on each peer.
+
+The protocol does not modify Dolt's commit model. Instead, it introduces a new Merkle clock layer that sits between the prolly tree data and the local commit DAG. Peers exchange clock events (small metadata) via libp2p gossipsub and prolly tree chunks via libp2p streams. The clock's causal ordering + HLC tiebreaker establishes a deterministic total order that all peers compute identically. `MergeRoots` is called with ancestor roots discovered from the clock, not from Dolt's commit parents. Local Dolt commits are created after reconciliation — they provide SQL tooling compatibility but their hashes are peer-specific in the tentative zone and byte-identical in the finalized zone (once causal stability confirms the ordering is settled).
+
+The result: Dolt's full SQL merge semantics in a P2P setting, with coordination limited to gossip protocol message exchange, no consensus, and no central coordinator.
+
+---
+
+## 1. Architecture Overview
+
+Three layers, two provided by Dolt, one new:
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Layer 3: Reconciliation (NEW — doltswarm Go)        │
+│  Merkle clock (in-memory), causal stability,         │
+│  merge orchestration, libp2p gossipsub transport     │
+├──────────────────────────────────────────────────────┤
+│  Layer 2: Commit DAG (EXISTING — Dolt, local-only)   │
+│  Local branch refs, working sets, dolt log           │
+├──────────────────────────────────────────────────────┤
+│  Layer 1: Prolly Trees + ChunkStore (EXISTING)       │
+│  Content-addressed NBS, RootValue, MergeRoots        │
+└──────────────────────────────────────────────────────┘
+```
+
+**Layer 1 (Dolt, unmodified):** Prolly trees store table data. `ChunkStore.{HasMany,GetMany,PutMany}` is the I/O surface. `MergeRoots(ours, theirs, ancestor)` performs three-way merge given any three `RootValue` objects. `Puller` syncs chunks by walking hash references. All content-addressed via SHA-512/20.
+
+**Layer 2 (Dolt, local-only):** Each peer creates Dolt commits locally after reconciliation. Commits have peer-specific hashes (parents, timestamps differ). Split into a **finalized zone** (deterministic, identical across peers) and a **tentative zone** (local convenience, rewritten on finalization).
+
+**Layer 3 (NEW — this protocol):** A Merkle clock DAG of events held in-memory and disseminated via libp2p gossipsub. Causal stability determines finalization (no voting). Merge orchestration calls into Layer 1. All conflicts — data and schema — are rejected and pushed back to the user.
+
+---
+
+## 2. Abstract Protocol
+
+### 2.1 Data Types
+
+```
+Hash        = byte[20]                    -- SHA-512/20
+PeerID      = libp2p.PeerID
+HLC         = { wall: uint64, logical: uint16, peer: PeerID }
+EventCID    = Hash                        -- hash of serialized Event
+
+Event = {
+  cid:            EventCID,
+  root_hash:      Hash,                   -- RootValue hash after this peer's local write
+  op_summary:     OpSummary,
+  parents:        Set[EventCID],          -- causal parents in the Merkle clock
+  hlc:            HLC,
+  peer:           PeerID,
+  signature:      Signature,              -- metadata signature from originating peer
+}
+
+Signature = byte[]                        -- signs (root_hash, parents, hlc, peer, op_summary)
+
+OpSummary = {
+  tables_modified:  Set[string],
+  is_schema_change: bool,
+  description:      string,
+}
+
+StaleVote = {
+  event:    EventCID,
+  voter:    PeerID,
+  reason:   StaleReason,
+}
+
+StaleReason = TooOld | MalformedOp
+
+MergeResult =
+  | Ok     { merged_root: Hash }
+  | Conflict { tables: Set[string], details: string }
+```
+
+### 2.2 Per-Peer State
+
+All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2 and from libp2p gossipsub message replay on rejoin.
+
+| Variable | Type | Description |
+|---|---|---|
+| `clock` | `Map[EventCID, Event]` | Local Merkle clock (G-Set of events) |
+| `heads` | `Set[EventCID]` | Clock heads (events with no children locally) |
+| `latest_root` | `Hash` | Current merged RootValue |
+| `hlc` | `HLC` | Local hybrid logical clock |
+| `peer_hlc` | `Map[PeerID, HLC]` | Latest observed HLC per peer (from heartbeats) |
+| `stable_hlc` | `HLC` | `min(peer_hlc)` — everything below is causally stable |
+| `finalized_root` | `Hash` | RootValue at the stability boundary |
+| `finalized_events` | `Set[EventCID]` | Events that have been finalized |
+| `stale_votes` | `Map[EventCID, Set[PeerID]]` | Peers that voted to reject an event |
+| `rejected_events` | `Set[EventCID]` | Globally rejected events (≥30% voted stale) |
+| `pending_conflicts` | `Map[EventCID, MergeResult]` | Unresolved conflicts awaiting user |
+| `active_peers` | `Set[PeerID]` | Peers seen in the last heartbeat window |
+
+### 2.3 Communication Model
+
+Communication is via a **pluggable transport** abstraction. The reference implementation uses libp2p gossipsub, but the protocol is transport-agnostic.
+
+**Control plane (gossip)** — three logical topics:
+
+| Topic | Message Type | Rate |
+|---|---|---|
+| `/doltswarm/events/1.0` | `Event` | On local write |
+| `/doltswarm/heartbeat/1.0` | `{ peer: PeerID, hlc: HLC, heads: Set[EventCID] }` | Periodic (every 2s) |
+| `/doltswarm/stale/1.0` | `StaleVote` | Rare (only on staleness detection) |
+
+**Data plane (chunk sync)** — prolly tree data is synced via **libp2p direct streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks for the event's `root_hash` from the originating peer (or any peer that has them). The sync walks the prolly tree from the root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not gossip — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
+
+> **Implementation note:** Dolt's built-in `DOLT_FETCH` is ref-based (fetches branch tips, not arbitrary root hashes) and cannot be used to fetch chunks for a specific event's `root_hash`. The chunk sync mechanism must be implemented as a custom prolly tree walker that uses `ChunkStore.HasMany` to determine missing chunks and requests them from remote peers via the transport's data plane interface. This is an area requiring investigation — see §7.4.
+
+**No voting, no consensus, no coordinator.** The only "agreement" mechanism is the staleness vote, which is a distributed threshold check with no leader, and fires rarely (<10s-old events are an edge case).
+
+### 2.3.1 Event Signing and Verification
+
+Every event carries a `signature` over its metadata fields (`root_hash`, `parents`, `hlc`, `peer`, `op_summary`). The signing scheme is pluggable (the `Signer` interface).
+
+On event receipt:
+- If the receiving peer has an `IdentityResolver` configured, the event's signature is verified against the sender's known public key.
+- Events that fail verification are **silently discarded** (not added to the clock, not forwarded).
+- If no `IdentityResolver` is configured, events are accepted best-effort (useful for testing or trusted networks).
+
+### 2.4 Protocol Actions
+
+#### LOCAL_WRITE(peer, sql_ops) → Event
+
+Precondition: `pending_conflicts[peer]` is empty.
+
+1. Apply `sql_ops` to local Dolt instance → new `RootValue` with hash `r`.
+2. `hlc ← tick(hlc)`.
+3. `sig = Sign(r, heads, hlc, peer, op_summary)`.
+4. `e = Event { cid: hash(r, heads, hlc, peer), root_hash: r, parents: heads, hlc, peer, signature: sig }`.
+5. `clock[e.cid] ← e`.
+6. Recompute `heads` from clock (= `{e.cid}`, since all prior heads are parents of `e`).
+7. `latest_root ← r`.
+8. Create tentative local Dolt commit.
+9. Publish `e` on `/doltswarm/events/1.0`.
+
+#### RECEIVE_EVENT(peer, e) → Accept | Reject
+
+1. If `e.cid ∈ clock ∪ rejected_events`: discard (idempotent).
+2. **Signature check:** If `IdentityResolver` is configured, verify `e.signature` against `e.peer`'s public key. If invalid, discard silently.
+3. **Staleness check:** If `now() - e.hlc.wall > 10 seconds`:
+   - Publish `StaleVote { event: e.cid, voter: self, reason: TooOld }` on `/doltswarm/stale/1.0`.
+   - Add to `clock` tentatively but do not merge. Mark pending-stale.
+   - If event is not globally rejected later, proceed with merge.
+4. `hlc ← merge(hlc, e.hlc)`.
+5. `clock[e.cid] ← e`.
+6. Recompute `heads` from clock: `heads = { cid ∈ clock | cid is not a parent of any event in clock }`.
+7. If `|heads| = 1`: fast-forward `latest_root ← clock[head].root_hash`.
+8. Request prolly tree chunks for `e.root_hash` from originating peer via libp2p stream.
+9. Call `RECONCILE(peer)` (if `|heads| > 1`).
+
+#### RECEIVE_STALE_VOTE(peer, vote) → unit
+
+1. `stale_votes[vote.event] ← stale_votes[vote.event] ∪ {vote.voter}`.
+2. If `|stale_votes[vote.event]| ≥ ceil(0.3 × |active_peers|)`:
+   - `rejected_events ← rejected_events ∪ {vote.event}`.
+   - Remove event from `clock`, recompute `heads`.
+   - If event was already merged, roll back: replay non-rejected events from `finalized_root`.
+   - Notify originating peer that their event was globally rejected.
+
+#### RECONCILE(peer) → unit
+
+**Merges are deterministic local computations, not new information.** If peers A and B both have events `{e1, e2}` with two heads, they each independently call `MergeRoots` and arrive at the same `latest_root`. There is nothing to communicate — the merge result is fully determined by the inputs that all peers already have. No event is created, nothing is broadcast.
+
+1. If `|heads| ≤ 1`: nothing to do.
+2. Sort heads by HLC total order (deterministic).
+3. For each consecutive pair `h1, h2` (in sorted order):
+   a. Find **LCA** in the Merkle clock DAG → `ancestor_event`.
+   b. `ancestor_root` = if LCA exists, `ancestor_event.root_hash`; else `finalized_root` (or `EMPTY_ROOT`).
+   c. `result = MergeRoots(current_root, clock[h2].root_hash, ancestor_root)`.
+   d. Match:
+      - `Ok(merged)`: `latest_root ← merged`.
+      - `Conflict(tables, details)`: **Reject merge. Do not apply.** Store in `pending_conflicts[h2]`. Notify user. Both heads remain live until conflict is resolved.
+4. `heads` remain unchanged — they are always derived from `computeHeads(clock)`.
+5. The next `LOCAL_WRITE` will have `parents = heads` (all current heads), which collapses them in the DAG.
+
+> **Why no merge events?** Broadcasting merges would be pure redundancy — every peer holding the same events computes the same merged state. Worse, if merge events were broadcast, concurrent merges by different peers would create new DAG forks requiring further reconciliation (an infinite merge loop). Only three things produce gossipsub traffic: `LOCAL_WRITE` (new data), `RESOLVE_CONFLICT` (user resolution, which flows through `LOCAL_WRITE`), and `HEARTBEAT` (which naturally reflects the reduced head set after merge).
+
+#### RESOLVE_CONFLICT(peer, event_cid, resolution_ops) → unit
+
+User provides `resolution_ops` (SQL that fixes conflicting rows/schema).
+
+1. Apply `resolution_ops` to local Dolt → `resolved_root`.
+2. Remove `event_cid` from `pending_conflicts`.
+3. Create new `Event` with `resolved_root`, parents = current heads.
+4. Normal `LOCAL_WRITE` flow from step 3.
+
+#### HEARTBEAT(peer) → unit
+
+Every 2 seconds:
+
+1. `hlc ← tick(hlc)`.
+2. Publish `{ peer: self, hlc, heads }` on `/doltswarm/heartbeat/1.0`.
+
+On receive from peer `q`:
+
+1. `peer_hlc[q] ← max(peer_hlc[q], received.hlc)`.
+2. `active_peers ← active_peers ∪ {q}`.
+3. `stable_hlc ← min(peer_hlc[p] for p in active_peers)`.
+4. If receiver is missing events referenced by sender's `heads`, request them (pull-on-demand).
+
+#### ADVANCE_STABILITY(peer) → unit
+
+Triggered when `stable_hlc` advances.
+
+1. `newly_stable = { e ∈ clock | e.hlc < stable_hlc ∧ e ∉ finalized_events ∧ e ∉ rejected_events }`.
+2. Sort `newly_stable` by total order (causal → HLC → CID).
+3. Replay from `finalized_root` via `MergeRoots` → `new_finalized_root`.
+4. Materialize deterministic Dolt commits (all fields from event metadata, HLC timestamp, deterministic parents).
+5. Replace tentative commits. `finalized_root ← new_finalized_root`. Prune stale votes.
+
+#### EVICT_STALE_PEER(peer) → unit
+
+After `HEARTBEAT_TIMEOUT` (10s) with no heartbeat from peer `q`:
+
+1. `active_peers ← active_peers \ {q}`.
+2. Recompute `stable_hlc` without `q`.
+3. Call `ADVANCE_STABILITY` — finalization resumes.
+
+No coordination needed. Each peer makes the same eviction decision independently based on the same timeout.
+
+#### EPOCH_FORCE_FINALIZE(peer) → unit
+
+Fallback: if `stable_hlc` hasn't advanced for `EPOCH_TIMEOUT` (60s) despite heartbeating active peers:
+
+1. Evict the blocking peer(s).
+2. Recompute `stable_hlc`, call `ADVANCE_STABILITY`.
+
+#### PEER_JOIN(new_peer) → unit
+
+1. Subscribe to all three gossipsub topics.
+2. Heartbeats from active peers provide current `heads`.
+3. Request from any active peer: `finalized_root` + finalized Dolt commits (shallow clone via `Puller`), all post-finalization clock events, chunks for `latest_root`.
+4. Reconstruct local state. Join `active_peers` via heartbeat.
+
+#### PEER_LEAVE(peer) → unit
+
+Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: stops heartbeating, evicted after `HEARTBEAT_TIMEOUT`.
+
+### 2.5 Key Invariants
+
+**INV1 — Clock Convergence:** For any two peers `p, q` that have received the same set of events, `p.clock == q.clock` and `p.heads == q.heads`.
+
+**INV2 — Data Convergence:** For any two peers that have processed the same set of non-rejected events in the same total order, `p.latest_root == q.latest_root`.
+
+**INV3 — Finalized History Agreement:** For any two peers, the finalized Dolt commit DAG is byte-identical: same hashes, same parents, same roots.
+
+**INV4 — Causal Consistency:** If `e1` is an ancestor of `e2` in the clock DAG, then `e1` precedes `e2` in the total order.
+
+**INV5 — No Silent Data Loss:** Every event either enters the finalized set, or is explicitly rejected with originator notified.
+
+**INV6 — Stability Monotonicity:** `stable_hlc` and `finalized_root` never move backward.
+
+**INV7 — Rejection Consistency:** If ≥30% of `active_peers` vote stale on event `e`, then eventually all peers mark `e` as rejected.
+
+**INV8 — Conflict Visibility:** Every `MergeConflict` result is surfaced to the user. No conflict is auto-resolved or silently discarded.
+
+---
+
+## 3. Quint-lang Choreo Specification
+
+```quint
+// doltswarm.qnt — Formal specification of the Doltswarm P2P sync protocol
+module doltswarm {
+
+  import choreo(processes = PEERS) as choreo from "./choreo"
+
+  // ─── Constants ───
+
+  const PEERS: Set[str]
+  const STALENESS_THRESHOLD: int      // 10 (seconds, in model time units)
+  const REJECTION_RATIO: int          // 30 (percent)
+  const HEARTBEAT_TIMEOUT: int        // ticks before peer eviction
+  const EPOCH_TIMEOUT: int            // ticks before forced finalization
+
+  // ─── Types ───
+
+  type Hash = str
+  type PeerID = str
+  type EventCID = str
+
+  type HLC = {
+    wall: int,
+    logical: int,
+    peer: PeerID
+  }
+
+  type Event = {
+    cid: EventCID,
+    root_hash: Hash,
+    parents: Set[EventCID],
+    hlc: HLC,
+    peer: PeerID,
+    is_schema_change: bool
+  }
+
+  type MergeOutcome =
+    | MergeOk(Hash)
+    | MergeConflict(Set[str])
+
+  type StaleVote = {
+    event_cid: EventCID,
+    voter: PeerID
+  }
+
+  type Heartbeat = {
+    peer: PeerID,
+    hlc: HLC,
+    heads: Set[EventCID]
+  }
+
+  // ─── Dolt oracle (abstract, axiomatized) ───
+  //
+  // A1: Deterministic — same (a,b,c) → same result (by pure def)
+  // A2: Identity     — dolt_merge(r,r,r) == MergeOk(r)
+  // A3: Commutative  — dolt_merge(a,b,c) == dolt_merge(b,a,c) when Ok
+
+  pure def dolt_merge(ours: Hash, theirs: Hash, ancestor: Hash): MergeOutcome
+  pure def dolt_apply(root: Hash, op: str): Hash
+
+  // ─── Abstract oracles ───
+  //
+  // Total order: causal from DAG → HLC → CID lexicographic
+  // LCA: BFS over Merkle clock DAG, returns "" if none
+  //
+  // Left abstract for protocol-level verification.
+
+  pure def total_order(
+    events: Set[Event],
+    clock_state: Map[EventCID, Event]
+  ): List[Event]
+
+  pure def find_lca(
+    clock_state: Map[EventCID, Event],
+    a: EventCID,
+    b: EventCID
+  ): EventCID
+
+  // ─── HLC operations ───
+
+  pure def hlc_tick(h: HLC): HLC =
+    { wall: h.wall + 1, logical: 0, peer: h.peer }
+
+  pure def hlc_merge(local: HLC, remote: HLC): HLC =
+    if (remote.wall > local.wall)
+      { wall: remote.wall, logical: remote.logical + 1, peer: local.peer }
+    else if (local.wall > remote.wall)
+      { wall: local.wall, logical: local.logical + 1, peer: local.peer }
+    else
+      { wall: local.wall,
+        logical: max(local.logical, remote.logical) + 1,
+        peer: local.peer }
+
+  pure def hlc_lt(a: HLC, b: HLC): bool =
+    a.wall < b.wall
+    or (a.wall == b.wall and a.logical < b.logical)
+    or (a.wall == b.wall and a.logical == b.logical and a.peer < b.peer)
+
+  pure def hlc_max(a: HLC, b: HLC): HLC =
+    if (hlc_lt(a, b)) b else a
+
+  pure def hlc_min_over(m: Map[PeerID, HLC], peers: Set[PeerID]): HLC =
+    peers.fold({ wall: 999999999, logical: 999, peer: "" },
+      (acc, p) => if (m.has(p) and hlc_lt(m.get(p), acc)) m.get(p) else acc
+    )
+
+  // ─── State variables ───
+
+  var clock:             PeerID -> Map[EventCID, Event]
+  var heads:             PeerID -> Set[EventCID]
+  var latest_root:       PeerID -> Hash
+  var hlc_state:         PeerID -> HLC
+  var peer_hlc:          PeerID -> Map[PeerID, HLC]
+  var stable_hlc:        PeerID -> HLC
+  var finalized_root:    PeerID -> Hash
+  var finalized_events:  PeerID -> Set[EventCID]
+  var stale_votes:       PeerID -> Map[EventCID, Set[PeerID]]
+  var rejected_events:   PeerID -> Set[EventCID]
+  var pending_conflicts: PeerID -> Map[EventCID, Set[str]]
+  var active_peers:      PeerID -> Set[PeerID]
+  var last_heartbeat:    PeerID -> Map[PeerID, int]
+  var global_tick:       int
+
+  // ─── Init ───
+
+  action init = {
+    val empty = "EMPTY_ROOT"
+    all {
+      clock'             = PEERS.mapBy(_ => Map()),
+      heads'             = PEERS.mapBy(_ => Set()),
+      latest_root'       = PEERS.mapBy(_ => empty),
+      hlc_state'         = PEERS.mapBy(p => { wall: 0, logical: 0, peer: p }),
+      peer_hlc'          = PEERS.mapBy(p =>
+                             PEERS.mapBy(q => { wall: 0, logical: 0, peer: q })),
+      stable_hlc'        = PEERS.mapBy(_ => { wall: 0, logical: 0, peer: "" }),
+      finalized_root'    = PEERS.mapBy(_ => empty),
+      finalized_events'  = PEERS.mapBy(_ => Set()),
+      stale_votes'       = PEERS.mapBy(_ => Map()),
+      rejected_events'   = PEERS.mapBy(_ => Set()),
+      pending_conflicts' = PEERS.mapBy(_ => Map()),
+      active_peers'      = PEERS.mapBy(_ => PEERS),
+      last_heartbeat'    = PEERS.mapBy(p => PEERS.mapBy(_ => 0)),
+      global_tick'       = 0,
+    }
+  }
+
+  // ─── Helper: unchanged state macro ───
+  // (Quint requires all vars assigned in every action)
+
+  val UNCH_clock             = clock'             = clock
+  val UNCH_heads             = heads'             = heads
+  val UNCH_latest_root       = latest_root'       = latest_root
+  val UNCH_hlc_state         = hlc_state'         = hlc_state
+  val UNCH_peer_hlc          = peer_hlc'          = peer_hlc
+  val UNCH_stable_hlc        = stable_hlc'        = stable_hlc
+  val UNCH_finalized_root    = finalized_root'    = finalized_root
+  val UNCH_finalized_events  = finalized_events'  = finalized_events
+  val UNCH_stale_votes       = stale_votes'       = stale_votes
+  val UNCH_rejected_events   = rejected_events'   = rejected_events
+  val UNCH_pending_conflicts = pending_conflicts'  = pending_conflicts
+  val UNCH_active_peers      = active_peers'      = active_peers
+  val UNCH_last_heartbeat    = last_heartbeat'    = last_heartbeat
+  val UNCH_global_tick       = global_tick'       = global_tick
+
+  // ─── LOCAL_WRITE ───
+
+  action local_write(p: PeerID, op: str) = all {
+    pending_conflicts.get(p).keys() == Set(),
+    p.in(active_peers.get(p)),
+
+    val new_root = dolt_apply(latest_root.get(p), op)
+    val new_hlc = hlc_tick(hlc_state.get(p))
+    val new_cid = "e_" + p + "_" + new_hlc.wall.itos()
+    val e: Event = {
+      cid: new_cid,
+      root_hash: new_root,
+      parents: heads.get(p),
+      hlc: new_hlc,
+      peer: p,
+      is_schema_change: false,
+    }
+    all {
+      clock'       = clock.setBy(p, c => c.put(new_cid, e)),
+      heads'       = heads.set(p, Set(new_cid)),
+      latest_root' = latest_root.set(p, new_root),
+      hlc_state'   = hlc_state.set(p, new_hlc),
+      UNCH_peer_hlc, UNCH_stable_hlc,
+      UNCH_finalized_root, UNCH_finalized_events,
+      UNCH_stale_votes, UNCH_rejected_events,
+      UNCH_pending_conflicts, UNCH_active_peers,
+      UNCH_last_heartbeat, UNCH_global_tick,
+    }
+  }
+
+  // ─── RECEIVE_EVENT ───
+
+  action receive_event(p: PeerID, e: Event) = all {
+    not(clock.get(p).has(e.cid)),
+    not(rejected_events.get(p).contains(e.cid)),
+
+    val is_stale = (global_tick - e.hlc.wall) > STALENESS_THRESHOLD
+    val merged_hlc = hlc_merge(hlc_state.get(p), e.hlc)
+    val new_clock = clock.get(p).put(e.cid, e)
+    val new_heads = heads.get(p).exclude(e.parents).union(Set(e.cid))
+    val new_stale = if (is_stale)
+      stale_votes.get(p).setBy(e.cid, s => s.union(Set(p)))
+    else
+      stale_votes.get(p)
+
+    all {
+      clock'        = clock.set(p, new_clock),
+      heads'        = heads.set(p, new_heads),
+      hlc_state'    = hlc_state.set(p, merged_hlc),
+      stale_votes'  = stale_votes.set(p, new_stale),
+      UNCH_latest_root, UNCH_peer_hlc, UNCH_stable_hlc,
+      UNCH_finalized_root, UNCH_finalized_events,
+      UNCH_rejected_events, UNCH_pending_conflicts,
+      UNCH_active_peers, UNCH_last_heartbeat, UNCH_global_tick,
+    }
+  }
+
+  // ─── RECEIVE_STALE_VOTE ───
+
+  action receive_stale_vote(p: PeerID, vote: StaleVote) = {
+    val updated = stale_votes.get(p).setBy(vote.event_cid, s =>
+      s.union(Set(vote.voter))
+    )
+    val count = if (updated.has(vote.event_cid))
+      updated.get(vote.event_cid).size() else 0
+    val threshold = (active_peers.get(p).size() * REJECTION_RATIO) / 100
+    val now_rejected = count >= threshold
+
+    if (now_rejected and clock.get(p).has(vote.event_cid)) {
+      val evt = clock.get(p).get(vote.event_cid)
+      val cleaned_clock = clock.get(p).mapRemove(vote.event_cid)
+      val cleaned_heads = if (heads.get(p).contains(vote.event_cid))
+        heads.get(p).exclude(Set(vote.event_cid)).union(
+          evt.parents.filter(pid => cleaned_clock.has(pid))
+        )
+      else heads.get(p)
+      all {
+        rejected_events' = rejected_events.setBy(p, r => r.union(Set(vote.event_cid))),
+        clock'           = clock.set(p, cleaned_clock),
+        heads'           = heads.set(p, cleaned_heads),
+        stale_votes'     = stale_votes.set(p, updated),
+        UNCH_latest_root, UNCH_hlc_state, UNCH_peer_hlc, UNCH_stable_hlc,
+        UNCH_finalized_root, UNCH_finalized_events,
+        UNCH_pending_conflicts, UNCH_active_peers,
+        UNCH_last_heartbeat, UNCH_global_tick,
+      }
+    } else {
+      all {
+        stale_votes' = stale_votes.set(p, updated),
+        UNCH_clock, UNCH_heads, UNCH_latest_root, UNCH_hlc_state,
+        UNCH_peer_hlc, UNCH_stable_hlc,
+        UNCH_finalized_root, UNCH_finalized_events,
+        UNCH_rejected_events, UNCH_pending_conflicts,
+        UNCH_active_peers, UNCH_last_heartbeat, UNCH_global_tick,
+      }
+    }
+  }
+
+  // ─── RECONCILE ───
+
+  action reconcile(p: PeerID) = {
+    val h = heads.get(p)
+    if (h.size() <= 1) {
+      all {
+        UNCH_clock, UNCH_heads, UNCH_latest_root, UNCH_hlc_state,
+        UNCH_peer_hlc, UNCH_stable_hlc,
+        UNCH_finalized_root, UNCH_finalized_events,
+        UNCH_stale_votes, UNCH_rejected_events,
+        UNCH_pending_conflicts, UNCH_active_peers,
+        UNCH_last_heartbeat, UNCH_global_tick,
+      }
+    } else {
+      nondet h1 = h.oneOf()
+      nondet h2 = h.exclude(Set(h1)).oneOf()
+      val e1 = clock.get(p).get(h1)
+      val e2 = clock.get(p).get(h2)
+      val lca_cid = find_lca(clock.get(p), h1, h2)
+      val ancestor_root =
+        if (lca_cid != "") clock.get(p).get(lca_cid).root_hash
+        else finalized_root.get(p)
+      val result = dolt_merge(e1.root_hash, e2.root_hash, ancestor_root)
+      match result {
+        | MergeOk(merged) => all {
+            latest_root' = latest_root.set(p, merged),
+            heads'       = heads.set(p, h.exclude(Set(h1, h2)).union(Set(h1))),
+            UNCH_clock, UNCH_hlc_state, UNCH_peer_hlc, UNCH_stable_hlc,
+            UNCH_finalized_root, UNCH_finalized_events,
+            UNCH_stale_votes, UNCH_rejected_events,
+            UNCH_pending_conflicts, UNCH_active_peers,
+            UNCH_last_heartbeat, UNCH_global_tick,
+          }
+        | MergeConflict(tables) => all {
+            pending_conflicts' = pending_conflicts.setBy(p,
+              pc => pc.put(h2, tables)),
+            UNCH_clock, UNCH_heads, UNCH_latest_root, UNCH_hlc_state,
+            UNCH_peer_hlc, UNCH_stable_hlc,
+            UNCH_finalized_root, UNCH_finalized_events,
+            UNCH_stale_votes, UNCH_rejected_events,
+            UNCH_active_peers, UNCH_last_heartbeat, UNCH_global_tick,
+          }
+      }
+    }
+  }
+
+  // ─── RECEIVE_HEARTBEAT ───
+
+  action receive_heartbeat(p: PeerID, hb: Heartbeat) = {
+    val updated_peer_hlc = peer_hlc.get(p).set(hb.peer,
+      hlc_max(peer_hlc.get(p).get(hb.peer), hb.hlc))
+    val updated_active = active_peers.get(p).union(Set(hb.peer))
+    val new_stable = hlc_min_over(updated_peer_hlc, updated_active)
+    all {
+      peer_hlc'       = peer_hlc.set(p, updated_peer_hlc),
+      active_peers'   = active_peers.set(p, updated_active),
+      stable_hlc'     = stable_hlc.set(p, new_stable),
+      last_heartbeat' = last_heartbeat.setBy(p, lh => lh.set(hb.peer, global_tick)),
+      UNCH_clock, UNCH_heads, UNCH_latest_root, UNCH_hlc_state,
+      UNCH_finalized_root, UNCH_finalized_events,
+      UNCH_stale_votes, UNCH_rejected_events,
+      UNCH_pending_conflicts, UNCH_global_tick,
+    }
+  }
+
+  // ─── ADVANCE_STABILITY ───
+
+  action advance_stability(p: PeerID) = {
+    val s = stable_hlc.get(p)
+    val newly_stable = clock.get(p).keys().filter(cid =>
+      val e = clock.get(p).get(cid)
+      hlc_lt(e.hlc, s)
+      and not(finalized_events.get(p).contains(cid))
+      and not(rejected_events.get(p).contains(cid))
+    )
+    if (newly_stable == Set()) {
+      all {
+        UNCH_clock, UNCH_heads, UNCH_latest_root, UNCH_hlc_state,
+        UNCH_peer_hlc, UNCH_stable_hlc,
+        UNCH_finalized_root, UNCH_finalized_events,
+        UNCH_stale_votes, UNCH_rejected_events,
+        UNCH_pending_conflicts, UNCH_active_peers,
+        UNCH_last_heartbeat, UNCH_global_tick,
+      }
+    } else {
+      val ordered = total_order(
+        newly_stable.map(cid => clock.get(p).get(cid)),
+        clock.get(p)
+      )
+      val new_fin_root = ordered.foldl(finalized_root.get(p), (acc, evt) =>
+        match dolt_merge(acc, evt.root_hash, finalized_root.get(p)) {
+          | MergeOk(r) => r
+          | MergeConflict(_) => acc  // conflict already surfaced in RECONCILE
+        }
+      )
+      all {
+        finalized_root'   = finalized_root.set(p, new_fin_root),
+        finalized_events' = finalized_events.setBy(p, fe => fe.union(newly_stable)),
+        latest_root'      = latest_root.set(p, new_fin_root),
+        stale_votes'      = stale_votes.setBy(p, sv =>
+          newly_stable.fold(sv, (acc, cid) => acc.mapRemove(cid))
+        ),
+        UNCH_clock, UNCH_heads, UNCH_hlc_state,
+        UNCH_peer_hlc, UNCH_stable_hlc,
+        UNCH_rejected_events, UNCH_pending_conflicts,
+        UNCH_active_peers, UNCH_last_heartbeat, UNCH_global_tick,
+      }
+    }
+  }
+
+  // ─── EVICT_STALE_PEER ───
+
+  action evict_stale_peer(p: PeerID) = {
+    nondet stale_peer = active_peers.get(p).exclude(Set(p)).oneOf()
+    all {
+      (global_tick - last_heartbeat.get(p).get(stale_peer)) > HEARTBEAT_TIMEOUT,
+      val new_active = active_peers.get(p).exclude(Set(stale_peer))
+      val new_stable = hlc_min_over(peer_hlc.get(p), new_active)
+      all {
+        active_peers' = active_peers.set(p, new_active),
+        stable_hlc'   = stable_hlc.set(p, new_stable),
+        UNCH_clock, UNCH_heads, UNCH_latest_root, UNCH_hlc_state,
+        UNCH_peer_hlc, UNCH_finalized_root, UNCH_finalized_events,
+        UNCH_stale_votes, UNCH_rejected_events,
+        UNCH_pending_conflicts, UNCH_last_heartbeat, UNCH_global_tick,
+      }
+    }
+  }
+
+  // ─── PEER_REJOIN ───
+
+  action peer_rejoin(returning: PeerID, helper: PeerID) = all {
+    not(returning.in(active_peers.get(helper))),
+    helper.in(active_peers.get(helper)),
+    all {
+      finalized_root'    = finalized_root.set(returning, finalized_root.get(helper)),
+      finalized_events'  = finalized_events.set(returning, finalized_events.get(helper)),
+      clock'             = clock.set(returning, clock.get(helper)),
+      heads'             = heads.set(returning, heads.get(helper)),
+      latest_root'       = latest_root.set(returning, latest_root.get(helper)),
+      rejected_events'   = rejected_events.set(returning, rejected_events.get(helper)),
+      pending_conflicts' = pending_conflicts.set(returning, Map()),
+      stale_votes'       = stale_votes.set(returning, stale_votes.get(helper)),
+      hlc_state'         = hlc_state.set(returning,
+        { wall: global_tick, logical: 0, peer: returning }),
+      UNCH_peer_hlc, UNCH_stable_hlc, UNCH_active_peers,
+      UNCH_last_heartbeat, UNCH_global_tick,
+    }
+  }
+
+  // ─── TICK ───
+
+  action tick = all {
+    global_tick' = global_tick + 1,
+    UNCH_clock, UNCH_heads, UNCH_latest_root, UNCH_hlc_state,
+    UNCH_peer_hlc, UNCH_stable_hlc,
+    UNCH_finalized_root, UNCH_finalized_events,
+    UNCH_stale_votes, UNCH_rejected_events,
+    UNCH_pending_conflicts, UNCH_active_peers, UNCH_last_heartbeat,
+  }
+
+  // ─── STEP (nondeterministic interleaving) ───
+
+  action step = any {
+    tick,
+
+    nondet p = PEERS.oneOf()
+    nondet op = Set("op1", "op2", "op3").oneOf()
+    local_write(p, op),
+
+    nondet sender = PEERS.oneOf()
+    nondet receiver = PEERS.exclude(Set(sender)).oneOf()
+    nondet evt_cid = clock.get(sender).keys().oneOf()
+    receive_event(receiver, clock.get(sender).get(evt_cid)),
+
+    nondet hb_sender = PEERS.oneOf()
+    nondet hb_receiver = PEERS.exclude(Set(hb_sender)).oneOf()
+    receive_heartbeat(hb_receiver, {
+      peer: hb_sender,
+      hlc: hlc_state.get(hb_sender),
+      heads: heads.get(hb_sender),
+    }),
+
+    nondet sv_sender = PEERS.oneOf()
+    nondet sv_receiver = PEERS.exclude(Set(sv_sender)).oneOf()
+    nondet sv_evt = stale_votes.get(sv_sender).keys().oneOf()
+    receive_stale_vote(sv_receiver, { event_cid: sv_evt, voter: sv_sender }),
+
+    nondet p2 = PEERS.oneOf()
+    reconcile(p2),
+
+    nondet p3 = PEERS.oneOf()
+    advance_stability(p3),
+
+    nondet p4 = PEERS.oneOf()
+    evict_stale_peer(p4),
+
+    nondet returning = PEERS.oneOf()
+    nondet helper = PEERS.exclude(Set(returning)).oneOf()
+    peer_rejoin(returning, helper),
+
+    nondet p5 = PEERS.oneOf()
+    heartbeat(p5),
+  }
+
+  // ─── INVARIANTS ───
+
+  val inv_clock_convergence: bool = PEERS.forall(p =>
+    PEERS.forall(q =>
+      (clock.get(p).keys() == clock.get(q).keys())
+        implies (heads.get(p) == heads.get(q))
+    )
+  )
+
+  val inv_finalized_agreement: bool = PEERS.forall(p =>
+    PEERS.forall(q =>
+      (finalized_events.get(p) == finalized_events.get(q))
+        implies (finalized_root.get(p) == finalized_root.get(q))
+    )
+  )
+
+  val inv_rejection_threshold: bool = PEERS.forall(p =>
+    rejected_events.get(p).forall(cid =>
+      not(stale_votes.get(p).has(cid))
+      or stale_votes.get(p).get(cid).size() >=
+          (active_peers.get(p).size() * REJECTION_RATIO) / 100
+    )
+  )
+
+  val inv_conflict_visibility: bool = PEERS.forall(p =>
+    pending_conflicts.get(p).keys().forall(cid =>
+      // Every conflict references a known or recently-rejected event
+      clock.get(p).has(cid) or rejected_events.get(p).contains(cid)
+    )
+  )
+
+  // No write while conflicts pending
+  val inv_no_write_during_conflict: bool = PEERS.forall(p =>
+    pending_conflicts.get(p).keys() != Set()
+      implies true  // enforced by local_write precondition
+  )
+}
+```
+
+---
+
+## 4. What Dolt Provides vs. What We Build
+
+### 4.1 Dolt Provides (No Modification Required)
+
+| Component | API | Used For |
+|---|---|---|
+| Prolly tree storage | `ChunkStore.{HasMany,GetMany,PutMany}` | Content-addressed data I/O |
+| Three-way merge | `MergeRoots(ours, theirs, ancestor)` | DAG-free merge of any 3 RootValues |
+| Chunk store I/O | `ChunkStore.{HasMany,GetMany}` | Determine missing chunks, store received chunks |
+| Dangling commits | `CommitDanglingWithParentCommits` | Creating commits with arbitrary parents |
+| Ghost hashes | `PersistGhostHashes` | References to absent history |
+| Schema merge | `SchemaMerge` | Detecting schema conflicts |
+| SQL engine | `sqle.Server` | Local read/write via SQL |
+| Diff engine | Prolly tree differ | `Diff(ancestor, current)` for op summaries |
+
+### 4.2 What We Build (Layer 3 — doltswarm)
+
+| Component | Storage | Transport |
+|---|---|---|
+| **Merkle Clock** | In-memory `map[EventCID]Event` | gossipsub `/doltswarm/events/1.0` |
+| **HLC Module** | In-memory per peer | Embedded in events + heartbeats |
+| **Heartbeat** | In-memory peer tracking | gossipsub `/doltswarm/heartbeat/1.0` |
+| **Stale Vote** | In-memory vote tally | gossipsub `/doltswarm/stale/1.0` |
+| **Total Order** | Pure computation | N/A |
+| **LCA Finder** | Pure computation over clock | N/A |
+| **Event Signer** | N/A (pluggable `Signer`) | Signature embedded in events |
+| **Chunk Sync** | Calls ChunkStore APIs | libp2p direct streams for chunk requests |
+| **Reconciliation Loop** | Calls Dolt Go APIs | N/A (local after chunk sync) |
+| **Stability Tracker** | In-memory `stable_hlc` | Derived from heartbeats |
+| **Finalization Engine** | Writes to Dolt Layer 2 | Local only |
+| **Conflict Surface** | Dolt conflict tables + metadata | Local SQL |
+| **Peer Manager** | In-memory `active_peers` | Derived from heartbeats |
+
+### 4.3 Boundary
+
+```
+doltswarm (Go)                              Dolt (Go, unmodified)
+──────────────                              ─────────────────────
+RECEIVE_EVENT(e)
+  │
+  ├─► Verify(e.signature, e.peer) ────► discard if invalid
+  │
+  ├─► ChunkSync(e.root_hash, e.peer) ► walk prolly tree from root
+  │     libp2p stream to e.peer            ChunkStore.HasMany (missing?)
+  │                                        ChunkStore.PutMany (store)
+  │
+  ├─► find_lca(clock, h1, h2)
+  │     walks in-memory Merkle clock
+  │
+  ├─► MergeRoots(ours, theirs, anc) ──► merge/merge.go
+  │     Ok  → latest_root = merged
+  │     Conflict → pending_conflicts
+  │
+  ├─► [tentative] CommitDangling ──────► local Dolt commit
+  │
+  └─► [finalized] CreateDeterministic ─► shared Dolt commit
+        deterministic fields from HLC      byte-identical across peers
+```
+
+---
+
+## 5. Required Dolt Modifications
+
+### 5.1 Necessary
+
+1. **Public `MergeRootValues` wrapper.** Currently `MergeRoots` is internal to `merge` package:
+   ```go
+   func (db *DoltDB) MergeRootValues(ctx context.Context,
+       ours, theirs, ancestor *RootValue) (*RootValue, map[string]*MergeStats, error)
+   ```
+
+2. **Unrelated histories support.** `MergeRoots` with `EMPTY_ROOT` as ancestor must surface same-table-different-schema as a conflict, not an error.
+
+3. **Deterministic commit helper:**
+   ```go
+   func (db *DoltDB) CreateDeterministicCommit(ctx context.Context,
+       root Hash, parents []Hash, meta CommitMeta) (Hash, error)
+   ```
+   All fields caller-supplied. Identical hash on every peer.
+
+### 5.2 Desirable
+
+4. **Scoped prolly tree walk** — sync specific tables only.
+5. **Conflict table event tagging** — annotate conflict rows with `EventCID`.
+6. **`dolt_finalization_status` system table** — expose stability boundary via SQL.
+
+---
+
+## 6. Edge Cases
+
+### 6.1 Stale Event (>10s old)
+
+Receiving peer votes stale, publishes on `/doltswarm/stale/1.0`. Event added tentatively but not merged. If <30% vote stale, proceeds normally. If ≥30%, globally rejected: removed from clocks, originator notified. If already merged by some peers before rejection, those peers roll back by replaying non-rejected events from `finalized_root`. All chunks already local — CPU-only, no network.
+
+### 6.2 Conflicts (Data or Schema)
+
+All conflicts rejected at merge step. Conflicting event stays in clock (it happened) but `latest_root` not updated. Stored in `pending_conflicts`. User provides `resolution_ops` via `RESOLVE_CONFLICT`. Peer with unresolved conflicts cannot `LOCAL_WRITE` (precondition blocks).
+
+### 6.3 No Common Ancestor
+
+`find_lca` returns nothing. Use `finalized_root` as ancestor (or `EMPTY_ROOT`). All rows treated as insertions. Identical rows auto-merge. Schema clashes on same table → conflict per §6.2.
+
+### 6.4 Peer Goes Offline
+
+Heartbeats stop. After `HEARTBEAT_TIMEOUT` (10s), each remaining peer independently evicts. `stable_hlc` recomputes, finalization resumes. No coordination. When peer returns: `PEER_JOIN` — shallow clone from finalized state, catch up clock, re-enter via heartbeat.
+
+### 6.5 Forced Epoch Finalization
+
+`stable_hlc` stuck for `EPOCH_TIMEOUT` (60s). Evict blocking peer(s). Recompute, advance stability. Fallback only — causal stability handles normal case.
+
+### 6.6 Concurrent Schema Changes
+
+Same pipeline as data conflicts. `SchemaMerge` auto-resolves where possible (e.g., both add different columns). Non-resolvable cases → conflict → user.
+
+### 6.7 Rollback After Late Rejection
+
+Replay all non-rejected events in total order from `finalized_root`. Chunks already in `ChunkStore`. CPU-only operation.
+
+### 6.8 Network Partition
+
+Peers in each partition continue operating independently. When partition heals, heartbeats resume, events flow, merges happen. If >10s elapsed, some cross-partition events may trigger staleness votes. If partitions operated concurrently for extended periods, conflicts are likely and surfaced to user.
+
+---
+
+## 7. Design Decisions
+
+These decisions refine the abstract protocol for the doltswarm implementation.
+
+### 7.1 Conflict handling: user-resolved (not FWW)
+
+Conflicts detected by `MergeRoots` are **rejected and surfaced to the user**. The conflicting event stays in the clock (it happened) but `latest_root` is not updated. The peer cannot perform `LOCAL_WRITE` until all conflicts are resolved via `RESOLVE_CONFLICT`. This preserves data integrity at the cost of requiring user intervention.
+
+An earlier design used First-Write-Wins (FWW), which auto-resolved conflicts by dropping the later commit. FWW is simpler but causes silent data loss.
+
+### 7.2 Event signing: required
+
+Every event carries a `signature` field computed over its metadata (`root_hash`, `parents`, `hlc`, `peer`, `op_summary`). The signing scheme is pluggable via a `Signer` interface.
+
+When an `IdentityResolver` is configured on a peer, incoming events are verified against the sender's public key. Invalid or unverifiable events are silently discarded. When no `IdentityResolver` is configured, events are accepted best-effort.
+
+### 7.3 No epoch grouping
+
+Events are processed individually via `MergeRoots`. There is no batching into wall-time epochs. Each event triggers its own merge operation with the ancestor discovered via LCA in the Merkle clock. This is simpler than epoch-based batching and avoids epoch boundary edge cases.
+
+### 7.3.1 Merges are silent local state
+
+Merges (RECONCILE) are deterministic local computations derived entirely from the Merkle clock and `finalized_root`. They produce no events, no gossip traffic, and no DAG entries. Every peer holding the same event set independently computes the same `latest_root`.
+
+Only three protocol actions produce gossipsub messages:
+- **LOCAL_WRITE** — new data (the event's `parents = heads` naturally reflects the post-merge state).
+- **RESOLVE_CONFLICT** — user resolution SQL, which flows through LOCAL_WRITE.
+- **HEARTBEAT** — periodic, carries current `heads` (which may reflect a post-merge single head if the peer has subsequently written).
+
+Heads (`computeHeads(clock)`) are always derived from the clock structure, never stored independently. After reconciliation, `heads` remain multi-valued until the next LOCAL_WRITE collapses them.
+
+### 7.4 Data plane: Puller-based chunk sync via SwarmChunkStore
+
+Prolly tree data is synced using **Dolt's existing `Puller` API** (`dolt/go/store/datas/pull`), which is entirely hash-based — not commit- or ref-based. The Puller accepts arbitrary root hashes and a `WalkAddrs` function, recursively fetches all reachable chunks that the local store doesn't have, and writes them into local NBS table files.
+
+#### Why Puller works for root-hash-based sync
+
+Investigation of Dolt's Puller confirmed that:
+
+1. **`pull.NewPuller`** takes `hashes []hash.Hash` as starting points — these can be prolly tree root hashes, not just commit hashes. The Puller never references commits, branches, or refs internally.
+2. **`types.WalkAddrsForChunkStore`** returns a `WalkAddrs` function that handles both prolly tree and old Noms binary formats, automatically dispatching based on `cs.Version()`. No manual prolly tree parsing needed.
+3. **The Puller pipeline** (tracker → fetcher → walker → writer) handles batching, missing-chunk detection via `HasMany`, multi-threaded transfer, and NBS table file creation.
+4. **The source `ChunkStore` must implement `nbs.NBSCompressedChunkStore`** (i.e., provide `GetManyCompressed`). The existing `RemoteChunkStore` already satisfies this.
+
+#### SwarmChunkStore architecture
+
+The data plane uses a **single `SwarmChunkStore`** per database that represents the entire swarm as a read-only chunk source. It implements `nbs.NBSCompressedChunkStore` and routes chunk requests to appropriate peers internally:
+
+```
+SwarmChunkStore (single instance, represents whole swarm)
+  │
+  ├─ HasMany(hashes)     → queries local cache, then asks peers
+  ├─ GetManyCompressed() → fetches from best peer(s)
+  │
+  ├─ Peer selection logic:
+  │   ├─ Event metadata provides originating peer hint
+  │   ├─ Fallback to any peer that responds to HasMany
+  │   └─ Future: parallel fetch from multiple peers
+  │
+  └─ Backed by transport's data plane interface
+```
+
+When a peer receives an event with `root_hash`:
+
+```go
+walkAddrs, _ := types.WalkAddrsForChunkStore(swarmCS)
+puller, _ := pull.NewPuller(ctx, tempDir, targetFileSz,
+    swarmCS,              // source: the swarm (routes to peers)
+    localCS,              // sink: local ChunkStore
+    walkAddrs,
+    []hash.Hash{rootHash},
+    statsCh,
+)
+puller.Pull(ctx)
+```
+
+The `SwarmChunkStore` is not per-peer — it is a swarm-level abstraction. Internally, it uses the event's originating peer as a hint for where to fetch, but falls back to other peers if the originator is unavailable. Future optimization: fetch different chunks from different peers in parallel (chunked BitTorrent-style).
+
+#### Current RemoteChunkStore analysis
+
+The existing `core/remote_chunk_store.go` already implements `nbs.NBSCompressedChunkStore` (required by Puller) and provides a solid foundation for the `SwarmChunkStore`:
+
+**What it has (keep and extend):**
+- `GetManyCompressed(ctx, hashes, found)` → cache-first, then download missing chunks. The download path calls `DownloaderClient.DownloadChunks(ctx, hashStrings, callback)` which streams compressed chunks back.
+- `HasMany(ctx, hashes)` → cache-first, then batch `ChunkStoreClient.HasChunks(ctx, repoPath, byteSlices)`. Returns absent set.
+- `Get`/`GetMany` → delegate to `GetManyCompressed` with decompression.
+- LRU chunk cache (`globalRemoteChunkCache`) with `InsertChunks`/`GetCachedChunks`/`InsertHas`/`GetCachedHas`.
+- `Sources()` → `ListTableFiles` for TableFileStore interface (may be needed by Puller internals).
+- `Version()` → returns `nbfVersion` (needed by Puller for format dispatch).
+- Read-only enforcement (`Put`/`Commit` return errors).
+
+**What changes for SwarmChunkStore:**
+- Currently takes a **single `Provider`** in `NewRemoteChunkStore(provider, repo, nbfVersion)`. The `SwarmChunkStore` must accept a `ProviderPicker` (or equivalent) and route requests to the best peer.
+- `chunkClient` and `downloader` are currently bound to one provider. These must become dynamic — selected per-request or per-batch based on peer availability.
+- Add **peer hint** parameter: when syncing chunks for a specific event, the originating peer is preferred. The hint comes from the event's `peer` field.
+- Add **retry with fallback**: if the preferred peer fails, fall back to other peers.
+- `Root()` / `loadRoot()` — currently loads the root from a single remote peer. For SwarmChunkStore, `Root()` is less meaningful (we don't need a single root for the swarm). May return a sentinel or the local root.
+- `repoSize` / `GetRepoMetadata` — initialization step that queries a single peer. May need to be lazy or skipped for SwarmChunkStore.
+
+**SwarmChunkStore constructor sketch:**
+```go
+type SwarmChunkStore struct {
+    repo       RepoID
+    repoPath   string
+    picker     ProviderPicker  // selects peers dynamically
+    cache      ChunkCache
+    nbfVersion string
+    log        *logrus.Entry
+
+    // Per-request hint: prefer this peer for chunk fetches
+    hintPeerMu sync.RWMutex
+    hintPeer   string
+}
+
+func (scs *SwarmChunkStore) SetHintPeer(peerID string)
+func (scs *SwarmChunkStore) ClearHintPeer()
+```
+
+The key insight: `GetManyCompressed` and `HasMany` already have the right signatures. The only change is making the underlying `chunkClient`/`downloader` dynamic instead of fixed.
+
+#### Remaining implementation work
+
+- Refactor `RemoteChunkStore` into `SwarmChunkStore` with `ProviderPicker` instead of single `Provider`
+- Make `chunkClient`/`downloader` selection dynamic per-request (hint peer → fallback)
+- Wire up `Puller` integration: on event receipt, create `Puller` with `SwarmChunkStore` as source, local `ChunkStore` as sink, event's `root_hash` as starting hash
+- Handle `ErrDBUpToDate` (all chunks already present — skip reconciliation)
+- Remove `Root()`/`loadRoot()` initialization requirement (SwarmChunkStore doesn't represent a single remote root)
+- Remove `swarm_dbfactory.go` and `swarm_registry.go` (no more `swarm://` scheme)
+
+### 7.5 In-memory Layer 3 state
+
+All Merkle clock state (events, heads, peer tracking, stale votes) is held in-memory. There is no local persistence for Layer 3. On crash, a peer rejoins from a live peer via `PEER_JOIN` (shallow clone of finalized state + clock events). This requires at least one live peer for recovery.
+
+### 7.6 Heartbeats only (no digest messages)
+
+Anti-entropy is handled entirely by heartbeats (every 2s, carrying `{ peer, hlc, heads }`). There are no separate digest/checkpoint messages. If a receiver is missing events referenced by a sender's heads, it requests them (pull-on-demand). Heartbeats also drive causal stability computation.
+
+### 7.7 No pull-first optimization
+
+The `LOCAL_WRITE` path does not include a pre-write sync pass. Peers write immediately and let `RECONCILE` handle convergence. This simplifies the write path at the cost of potentially more merge operations.
+
+### 7.8 Pluggable transport
+
+The core library uses abstract transport interfaces (`Transport`, `Gossip`, `Provider`). It does not depend on libp2p directly. The reference implementation uses libp2p GossipSub for the control plane and gRPC for the data plane, but other transports are possible. This enables testing with in-process transports and supports alternative network stacks.
+
+### 7.9 Core package adaptation plan
+
+The `core/` package currently implements the epoch-merge/FWW sync protocol. Below is a file-by-file plan for adapting it to the Merkle clock protocol.
+
+#### Files to DELETE (no longer applicable)
+
+| File | Reason |
+|------|--------|
+| `epoch.go` | Epoch grouping removed; events are processed individually |
+| `bundles.go` | Bundle building/importing replaced by Puller-based chunk sync |
+| `swarm_dbfactory.go` | `swarm://` URL scheme no longer used; data plane uses SwarmChunkStore directly |
+| `swarm_registry.go` | Global provider registry for `swarm://` no longer needed |
+| `commit_ad.go` | `CommitAd` struct replaced by `Event` from Merkle clock |
+
+#### Files to REWRITE (fundamentally different logic)
+
+**`index.go` → Merkle clock interface**
+- Current: `CommitIndex` with HLC-keyed entries, checkpoints, finalized base
+- New: `MerkleClock` interface with event DAG, heads tracking, LCA computation
+- Key methods: `AddEvent(e Event)`, `Heads() []EventCID`, `LCA(h1, h2 EventCID) (EventCID, bool)`, `GetEvent(cid EventCID) (Event, bool)`, `AllEvents() map[EventCID]Event`
+
+**`index_mem.go` → In-memory Merkle clock**
+- Current: `MemoryCommitIndex` with LRU map of HLC→entry
+- New: `MemMerkleClock` with `map[EventCID]Event`, heads set, peer_hlc map, stable_hlc, finalized/rejected event sets, pending conflicts
+
+**`reconciler_core.go` → Merkle clock reconciliation**
+- Current: `ReplayImportedEpochMerges` — epoch grouping, temp branch, HLC-sorted replay, FWW on conflict
+- New: `Reconcile` — pick two heads, find LCA in Merkle clock DAG, call `MergeRoots(h1.root_hash, h2.root_hash, ancestor.root_hash)`. On success: collapse heads, create tentative Dolt commit. On conflict: reject merge, store in pending_conflicts, notify user. Repeat for remaining head pairs.
+- Remove: epoch metadata, FWW conflict resolution, parent chain collapsing, replay stall detection
+- Add: LCA computation (ancestor set intersection), conflict surfacing, conflict resolution path
+
+**`finalization.go` → Causal stability finalization**
+- Current: Checkpoint-based watermarks with slack, `ComputeWatermark` from peer activity
+- New: `stable_hlc = min(peer_hlc[p] for p in active_peers)`. When stable_hlc advances, identify events with `hlc < stable_hlc`, sort by total order (causal→HLC→CID), replay from `finalized_root` via `MergeRoots`, create deterministic Dolt commits
+- Much simpler: no checkpoints, no slack duration, no commonly-known threshold
+
+**`node.go` → Merkle clock sync engine**
+- Current: CommitAd/Digest gossip → debounced sync → swarm:// fetch → epoch replay
+- New: Event/Heartbeat/StaleVote gossip → per-event chunk sync via Puller → Merkle clock reconcile
+- Major changes:
+  - Replace `onCommitAd` with `onEvent`: add to Merkle clock, merge HLC, trigger chunk sync for `root_hash` via SwarmChunkStore/Puller, call reconcile
+  - Replace `onDigest` with `onHeartbeat`: update `peer_hlc[sender]`, recompute `stable_hlc`, pull-on-demand for missing events
+  - Add `onStaleVote`: collect votes, reject events with ≥30% votes
+  - Replace `syncOnce` (fetch → epoch replay) with `syncEvent` (Puller chunk sync → reconcile)
+  - Remove pull-first from `Commit`/`ExecAndCommit`
+  - Add heartbeat publishing loop (every 2s)
+  - `Commit`/`ExecAndCommit`: check no pending conflicts, create Event, add to clock, publish
+  - Remove swarm:// remote setup (`EnsureSwarmRemote`, `RegisterSwarmProviders`)
+- Remove: hint providers, sync debounce, repair interval, digest publishing, epoch config
+- Add: heartbeat interval, staleness threshold, rejection ratio config
+
+#### Files to ADAPT (modify, not rewrite)
+
+**`remote_chunk_store.go` → `swarm_chunk_store.go`**
+- Rename and refactor into `SwarmChunkStore` (see section 7.4 for details)
+- Change constructor from single `Provider` to `ProviderPicker`
+- Make `chunkClient`/`downloader` dynamic per-request
+- Add hint peer support
+- Remove `Root()`/`loadRoot()` initialization
+
+**`db.go` → Simplified database wrapper**
+- Remove: `EnsureSwarmRemote`, `FetchSwarm` (no swarm:// remote)
+- Keep: `GetChunkStore()` (needed as Puller sink), `Open`, `Close`, `InitLocal`, commit helpers, branch helpers
+- Keep: `GetBranchHead`, `MergeBase` (still useful for Dolt branch management)
+- Adapt: `Commit`/`ExecAndCommit` in `sql.go` — now creates Events instead of CommitAds, checks pending conflicts precondition
+
+**`commit_sql_helpers.go` → Remove epoch merge metadata**
+- Remove: `NewEpochMergeMetadata` helper
+- Keep: `doCommitWithMetadata`, `CreateCommitMetadata`, `escapeSQL`
+- Adapt: metadata format may change (Event-aware)
+
+**`protocol_helpers.go` → Remove epoch helpers**
+- Remove: `NewEpochMergeMetadata`, `NewHLC` (HLC construction moves to protocol)
+- Keep: `ParseCommitMetadata`, `IsMetadataCommit`, `NewCommitMetadata`
+
+**`aliases.go` → Update type re-exports**
+- Remove: `CommitAdV1`, `DigestV1`, `Checkpoint`, `BundleRequest`, `BundleHeader`, `BundledCommit`, `BundledChunk`, `CommitBundle`, `ChunkCodec`, `CommitKindEpochMerge`
+- Add: Event types from protocol (if defined there)
+- Update gossip types: `GossipEvent` changes to carry Event/Heartbeat/StaleVote instead of CommitAd/Digest
+
+#### Files to KEEP (unchanged or minimal changes)
+
+| File | Status |
+|------|--------|
+| `cache.go` | Keep — LRU chunk cache reused by SwarmChunkStore |
+| `remote_table_file.go` | Keep — may be needed for TableFileStore interface in SwarmChunkStore |
+| `sql.go` | Keep — SQL types, mappers, `ExecContext`/`QueryContext` wrappers |
+| `utils.go` | Keep — `ensureDir` utility |
+
+#### Dependency changes in transport/
+
+The `transport/` package interfaces also need updates:
+
+- `Gossip` interface: replace `PublishCommitAd`/`PublishDigest` with `PublishEvent`/`PublishHeartbeat`/`PublishStaleVote`
+- `GossipSubscription`/`GossipEvent`: carry Event/Heartbeat/StaleVote instead of CommitAd/Digest
+- `Provider` interface: keep `ChunkStore()`/`Downloader()` for data plane; may simplify
+- `ProviderPicker`: keep — used by SwarmChunkStore for peer selection
+
+## 8. Repository Structure
+
+The repo is organized into small packages so the "what" (protocol), "how" (core engine), and "I/O boundary" (transport) are separated. The top-level `doltswarm` package remains the public import path and re-exports the main API for convenience.
+
+```
+doltswarm.go          — public facade (type aliases + wrapper functions)
+protocol/             — wire- and identity-level types used across the system
+  protocol/hlc.go       — HLC implementation
+  protocol/repo_id.go   — repo identity
+  protocol/metadata.go  — commit metadata format + signing
+  protocol/signer.go    — signing interface
+  protocol/messages.go  — gossip payload structs
+transport/            — pluggable networking boundary (no Dolt logic)
+  transport/transport.go      — control plane interfaces
+  transport/provider.go       — data plane provider interfaces
+  transport/provider_hint.go  — best-effort provider hints + retry exclusions via context
+core/                 — synchronization engine and Dolt integration
+  core/node.go              — Node (gossip loop, heartbeat, fetch+reconcile orchestration)
+  core/reconciler_core.go   — merge orchestration via Merkle clock LCA + MergeRoots
+  core/db.go / core/sql.go  — Dolt SQL driver wrapper + commit helpers
+  core/swarm_chunk_store.go  — SwarmChunkStore (swarm-level read-only chunk store, Puller source)
+  core/index.go / core/index_mem.go — in-memory Merkle clock (event DAG, heads, LCA)
+specs/                — Quint formal specification (model-checkable with Apalache)
+integration/          — demo + docker-based integration tests + transport implementations
+  integration/main.go             — ddolt demo CLI used by tests
+  integration/integration_test.go — container-per-peer test harness
+  integration/transport/          — sample transports (gossipsub, grpcswarm, overlay)
+```
+
+## 9. Public Go API
+
+Most consumers should use `Node` and treat transport as a plug-in.
+
+### Core types
+
+- `OpenNode(cfg NodeConfig) (*Node, error)` and `(*Node).Run(ctx)` start the background gossip+heartbeat+sync loops.
+- `(*Node).Commit(msg)` and `(*Node).ExecAndCommit(exec, msg)` perform local writes and automatically publish events.
+- `(*Node).Sync(ctx)` / `(*Node).SyncHint(ctx, hlc)` allow manual/one-shot sync passes (useful for CLIs/tests).
+
+`NodeConfig` requires:
+- `Repo` (`RepoID{Org, RepoName}`): logical repo identity.
+- `Signer`: signs event metadata and provides `Verify` for remote signature checks.
+- `Identity` (optional): if set, incoming events are verified against peer public keys; unverifiable/invalid events are rejected.
+- `Transport`: provides (1) gossip message delivery (events, heartbeats, stale votes) and (2) a provider picker for the read-only data plane.
+
+### Minimal usage (transport omitted)
+
+```go
+cfg := doltswarm.NodeConfig{
+  Dir:    "/path/to/dolt/working/dir",
+  Repo:   doltswarm.RepoID{RepoName: "mydb"},
+  Signer: signer,        // implements doltswarm.Signer
+  Transport: transport,  // implements doltswarm.Transport (details omitted)
+}
+
+n, _ := doltswarm.OpenNode(cfg)
+go n.Run(ctx)
+
+_, _ = n.ExecAndCommit(func(tx *sql.Tx) error {
+  _, err := tx.Exec("CREATE TABLE IF NOT EXISTS t (pk INT PRIMARY KEY, v TEXT)")
+  return err
+}, "init schema")
+```
+
+## 10. Integration Tests
+
+Integration scaffolding lives in `integration/`:
+- `integration/main.go` contains the `ddolt` demo used by tests.
+- A libp2p GossipSub control-plane is implemented in `integration/transport/gossipsub/`.
+- A data-plane is implemented in `integration/transport/grpcswarm/` by exposing Dolt's read-only chunk store for root-hash-based chunk fetching via the `SwarmChunkStore` + `Puller` pipeline.
+
+To run Docker-based integration tests, use the Taskfile (`Taskfile.yaml`):
+- `task integration`
+- `task integration:quick`
+
+### Log Line Dependencies (IMPORTANT)
+
+The integration tests compute sync statistics by grepping container logs for specific patterns.
+**DO NOT change these log lines in `core/node.go` without updating `computeSyncStats()` in `integration/integration_test.go`.**
+
+The following log patterns are used for statistics:
+- `[sync] syncOnce completed` - counts total sync passes
+- `[sync] Importing` - counts successful imports
+- `[sync] Fast-forward succeeded` - counts fast-forward merges
+- `[sync] Epoch merging` - counts merge passes
+- `[sync] Merge commits:` - counts merge commits created
+- `retrying with different provider` - counts provider retry attempts
+- `Exhausted 3 provider retries` - counts exhausted retries
+
+If you need to change any of these log lines, update both:
+1. The log statement in `core/node.go`
+2. The corresponding `strings.Count()` call in `integration/integration_test.go:computeSyncStats()`
