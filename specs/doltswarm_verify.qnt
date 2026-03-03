@@ -156,9 +156,15 @@ module doltswarm_verify {
   /// Deterministic merge model with conflict capability.
   ///
   /// Returns CONFLICT_HASH when two divergent writes conflict (both differ
-  /// from ancestor and from each other, AND their combined hash matches
-  /// a conflict pattern). This models the fact that Dolt's MergeRoots can
-  /// return a conflict when concurrent edits touch the same rows.
+  /// from ancestor and from each other, AND both are "raw content" values).
+  /// This models the fact that Dolt's MergeRoots can return a conflict when
+  /// concurrent edits touch the same rows — regardless of the ancestor.
+  ///
+  /// The conflict condition is: both ours and theirs are raw content values
+  /// (from CONTENTS) that each differ from the ancestor. This fires with
+  /// any ancestor, including post-finalization merged roots, so that
+  /// partition conflicts (INV8b, INV11) and post-finalization tentative
+  /// conflicts (INV8a, INV8d) are exercised realistically.
   ///
   /// NOTE: This uses finalized_root as the merge ancestor, not an LCA-derived
   /// ancestor from the Merkle clock DAG. The protocol doc (§2.4 step 3a)
@@ -171,11 +177,11 @@ module doltswarm_verify {
     if (ours == theirs) ours
     else if (ours == ancestor) theirs
     else if (theirs == ancestor) ours
-    // Both diverge from ancestor: conflict when both are from CONTENTS
+    // Both diverge from ancestor: conflict when both are raw content values
     // (models concurrent writes to the same table producing a conflict).
-    // We use a simple heuristic: if both hashes are "raw content" values
-    // (i.e., from CONTENTS set) rather than already-merged results, conflict.
-    else if (CONTENTS.contains(ours) and CONTENTS.contains(theirs) and ancestor == EMPTY_ROOT)
+    // Fires with any ancestor — not just EMPTY_ROOT — so that conflicts
+    // are exercised in post-finalization and partition-recovery scenarios.
+    else if (CONTENTS.contains(ours) and CONTENTS.contains(theirs))
       CONFLICT_HASH
     else ours + theirs + ancestor  // deterministic combined hash
   }
@@ -610,6 +616,8 @@ module doltswarm_verify {
   /// guarantee that the same finalized_events always yield the same root,
   /// regardless of the order peers finalize events.
   ///
+  /// Prunes stale votes for the finalized event (§2.4 ADVANCE_STABILITY step 5).
+  ///
   /// Blocked when partition_conflict is active — no new finalization
   /// until the partition conflict is resolved (§7.10).
   action do_finalize(p: PeerID): bool = {
@@ -629,11 +637,17 @@ module doltswarm_verify {
         nondet cid = candidates.oneOf()
         val newFinalizedEvents = st.finalized_events.union(Set(cid))
         val newFinRoot = computeFinalizedRoot(newFinalizedEvents, st.clock)
+        // Prune stale votes for the finalized event (§2.4 step 5)
+        val prunedStaleVotes = if (st.stale_votes.has(cid))
+          st.stale_votes.mapRemove(cid)
+        else
+          st.stale_votes
         all {
           nodes' = nodes.set(p, {
             ...st,
             finalized_root: newFinRoot,
             finalized_events: newFinalizedEvents,
+            stale_votes: prunedStaleVotes,
           }),
           inbox' = inbox,
           prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
