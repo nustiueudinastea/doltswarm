@@ -146,7 +146,7 @@ The protocol assumes a **direct mesh** network: every peer can send messages to 
 | Message Type | Payload | Rate |
 |---|---|---|
 | `Event` | See §2.1 | On local write |
-| `Heartbeat` | `{ peer: PeerID, hlc: HLC, heads: Set[EventCID], finalized_root: Hash }` | Periodic (every 2s) |
+| `Heartbeat` | `{ peer: PeerID, hlc: HLC, heads_digest: Hash, finalized_root: Hash }` | Periodic (every 2s) |
 
 **Data plane (chunk sync)** — prolly tree data is synced via **point-to-point streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks for the event's `root_hash` from the originating peer (or any peer that has them). The sync walks the prolly tree from the root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not broadcast — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
 
@@ -226,7 +226,8 @@ User (typically the author of the parked event) provides `resolution_ops` (SQL t
 Every 2 seconds:
 
 1. `hlc ← tick(hlc)`.
-2. Broadcast `{ peer: self, hlc, heads, finalized_root }` to all peers.
+2. `heads_digest ← hash(sort(heads))`.
+3. Broadcast `{ peer: self, hlc, heads_digest, finalized_root }` to all peers.
 
 On receive from peer `q`:
 
@@ -234,7 +235,7 @@ On receive from peer `q`:
 2. `peer_hlc[self] ← max(peer_hlc[self], hlc)` (a peer always knows its own clock is at least this advanced; without this, `stable_hlc` could be held back by the peer's own outdated entry).
 3. `active_peers ← active_peers ∪ {q}`.
 4. `stable_hlc ← min(peer_hlc[p] for p in active_peers)`.
-5. If receiver is missing events referenced by sender's `heads`, request them (pull-on-demand).
+5. **Frontier digest comparison:** Compute `own_digest ← hash(sort(own heads))`. If `own_digest ≠ received.heads_digest`, request full head set from sender via point-to-point, then pull missing events (pull-on-demand). If digests match, no action needed — peers are in sync.
 6. **Partition divergence detection:** If `received.finalized_root ≠ finalized_root` and neither root is an ancestor of the other (i.e., they diverged independently during a partition), trigger `MERGE_FINALIZED(peer, received.finalized_root)`. See §6.6.
 
 #### ADVANCE_STABILITY(peer) → unit
@@ -284,7 +285,7 @@ Triggered when a peer detects a different `finalized_root` from a reconnecting p
 #### PEER_JOIN(new_peer) → unit
 
 1. Join the peer mesh (begin receiving broadcast messages).
-2. Heartbeats from active peers provide current `heads`.
+2. Heartbeats from active peers provide `heads_digest`. The joining peer's empty head set causes a digest mismatch, triggering pull-on-demand to fetch the current event set.
 3. Request from any active peer: `finalized_root` + finalized Dolt commits (shallow clone via `Puller`), all post-finalization clock events, chunks for `latest_root`. `finalized_root` must be transferred as an opaque value, not reconstructed from events — reconstruction via `computeFinalizedRoot` is unsound after partition merges (the from-scratch fold discards merge results from `MERGE_FINALIZED`).
 4. Reconstruct local state. Join `active_peers` via heartbeat.
 
@@ -328,8 +329,8 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 - **Event fields:** The spec's `Event` omits `op_summary` and `signature`. `op_summary` is metadata that does not affect core state machine logic. `signature` omission is noted above (signature verification is document-only).
 - **`parked_conflicts` type:** The protocol defines `parked_conflicts: Map[EventCID, MergeResult]`, mapping parked events to conflict details (tables, description). The spec uses `Set[EventCID]` — tracking only which events are parked, not conflict presentation details.
 - **Heartbeat HLC tick:** The protocol ticks the sender's HLC on heartbeat send (`hlc ← tick(hlc)`, §2.4 HEARTBEAT step 1). The spec's `do_heartbeat` models only the receiver side and does not tick `hlc_clock`. Wall-time advancement is provided by the separate `do_tick` action. This may cause `stable_hlc` to advance slightly slower in the spec than in the protocol — a liveness concern, not a safety issue.
-- **Heartbeat as direct state read:** The protocol broadcasts heartbeat messages; receivers process the payload. The spec's `do_heartbeat` reads the sender's node state directly (no message inbox). This is a standard model-checking simplification and does not model heartbeat message loss or reordering.
-- **Pull-on-demand scope:** The protocol (§2.4 HEARTBEAT step 5) pulls events "referenced by sender's heads." The spec pulls all missing events from the remote peer's clock — a sound over-approximation that transfers more events than strictly required.
+- **Heartbeat as direct state read:** The protocol broadcasts heartbeat messages carrying `heads_digest` (a hash of the sorted head set), not the full `heads`. Receivers compare digests and request full heads on mismatch. The spec's `do_heartbeat` reads the sender's node state directly (no message inbox, no digest). This is a standard model-checking simplification and does not model heartbeat message loss, reordering, or the digest-compare step.
+- **Pull-on-demand scope:** The protocol (§2.4 HEARTBEAT step 5) compares frontier digests and, on mismatch, requests the full head set then pulls missing events. The spec pulls all missing events from the remote peer's clock — a sound over-approximation that transfers more events than strictly required and skips the digest-compare optimization.
 - **Partition divergence detection:** The protocol (§2.4 HEARTBEAT step 6) checks whether "neither root is an ancestor of the other" using the commit DAG. The spec uses finalized-event subset checks (`not(A ⊆ B) ∧ not(B ⊆ A)`), which directly captures independent divergence without requiring DAG ancestry computation.
 - **Action decoupling from heartbeat:** The protocol (§2.4 HEARTBEAT step 6) triggers `MERGE_FINALIZED` inline when partition divergence is detected, and implicitly triggers `ADVANCE_STABILITY` when `stable_hlc` advances. The spec decouples both into standalone nondeterministic actions (`do_merge_finalized`, `do_finalize`) that can fire independently in the `step` relation. The preconditions are equivalent (same guards), so the reachable state space is the same — the spec just does not model the causal triggering chain. This is standard for model checking where nondeterministic scheduling subsumes specific trigger ordering.
 - **`localWall` state variable:** The spec adds `localWall: int` to `NodeState`, not present in the protocol's §2.2 per-peer state table. This separates wall-clock progression into explicit `do_tick` actions, giving the model checker control over time advancement. In the protocol, wall time is implicit (read from the system clock).
@@ -627,9 +628,9 @@ The key insight: `GetManyCompressed` and `HasMany` already have the right signat
 
 All Merkle clock state (events, heads, peer tracking) is held in-memory. There is no local persistence for Layer 3. On crash, a peer rejoins from a live peer via `PEER_JOIN` (shallow clone of finalized state + clock events). This requires at least one live peer for recovery.
 
-### 7.6 Heartbeats only (no digest messages)
+### 7.6 Frontier digest heartbeats
 
-Anti-entropy is handled entirely by heartbeats (every 2s, carrying `{ peer, hlc, heads }`). There are no separate digest/checkpoint messages. If a receiver is missing events referenced by a sender's heads, it requests them (pull-on-demand). Heartbeats also drive causal stability computation.
+Anti-entropy is handled entirely by heartbeats (every 2s, carrying `{ peer, hlc, heads_digest, finalized_root }`). Heartbeats carry a compact frontier digest — `heads_digest = hash(sort(heads))` — instead of the full head set. On receive, the receiver compares `hash(sort(own heads))` against the received `heads_digest`. Digest match = peers are in sync, no action needed. Digest mismatch = request the sender's full head set via point-to-point, then pull missing events (pull-on-demand). This makes the common case (peers in sync) a cheap fixed-size comparison; only divergence triggers additional traffic. Heartbeats also drive causal stability computation.
 
 ### 7.7 No pull-first optimization
 
@@ -680,7 +681,7 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 - New: Event/Heartbeat broadcast → per-event chunk sync via Puller → Merkle clock reconcile
 - Major changes:
   - Replace `onCommitAd` with `onEvent`: add to Merkle clock, merge HLC, trigger chunk sync for `root_hash` via SwarmChunkStore/Puller, call reconcile
-  - Replace `onDigest` with `onHeartbeat`: update `peer_hlc[sender]`, recompute `stable_hlc`, pull-on-demand for missing events
+  - Replace `onDigest` with `onHeartbeat`: update `peer_hlc[sender]`, recompute `stable_hlc`, compare frontier digests (`heads_digest`), pull-on-demand on mismatch
   - Replace `syncOnce` (fetch → epoch replay) with `syncEvent` (Puller chunk sync → reconcile)
   - Remove pull-first from `Commit`/`ExecAndCommit`
   - Add heartbeat publishing loop (every 2s)
@@ -731,7 +732,7 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 
 The `transport/` package interfaces also need updates:
 
-- `Gossip` interface: replace `PublishCommitAd`/`PublishDigest` with `BroadcastEvent`/`BroadcastHeartbeat`
+- `Gossip` interface: replace `PublishCommitAd`/`PublishDigest` with `BroadcastEvent`/`BroadcastHeartbeat` (heartbeat carries `heads_digest`, not full `heads`)
 - `GossipSubscription`/`GossipEvent`: carry Event/Heartbeat instead of CommitAd/Digest
 - `Provider` interface: keep `ChunkStore()`/`Downloader()` for data plane; may simplify
 - `ProviderPicker`: keep — used by SwarmChunkStore for peer selection

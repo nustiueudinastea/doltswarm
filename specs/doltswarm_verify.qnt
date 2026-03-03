@@ -10,6 +10,11 @@
  * heartbeats for stability, causal finalization,
  * merge conflicts, tentative conflict resolution, network partitions,
  * and partition recovery via accept-the-fork finalized merge (§7.10).
+ *
+ * NOTE: The protocol uses frontier digests (heads_digest = hash(sort(heads)))
+ * in heartbeats for bandwidth efficiency (§7.6). The spec reads full remote
+ * state directly — a sound over-approximation that skips the digest-compare
+ * optimization without affecting safety properties.
  * Partition conflicts are handled inline by MERGE_FINALIZED using the
  * ours-side root — no blocking, no separate resolution action.
  *
@@ -393,6 +398,11 @@ module doltswarm_verify {
   /// Requires connectivity (heartbeats don't flow across partitions).
   /// Also updates p's own peer_hlc entry to its current HLC clock,
   /// ensuring that stable_hlc can advance (a peer always knows its own time).
+  ///
+  /// NOTE: The protocol uses frontier digests (heads_digest) for bandwidth
+  /// efficiency — peers compare digests and only exchange full heads on
+  /// mismatch (§7.6). The spec reads full remote state directly as a sound
+  /// over-approximation, skipping the digest-compare step.
   ///
   /// Pull-on-demand (§2.4 HEARTBEAT step 5): if p is missing events that q
   /// has in its clock, those events are added to p's inbox for later
