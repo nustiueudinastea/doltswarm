@@ -7,7 +7,7 @@
  * no List (Seq) types — everything is sets and maps.
  *
  * Models the core protocol: Merkle clock events, MergeRoots-based reconcile,
- * heartbeats for stability, causal finalization, staleness/rejection,
+ * heartbeats for stability, causal finalization,
  * merge conflicts, tentative conflict resolution, network partitions,
  * and partition recovery via accept-the-fork finalized merge (§7.10).
  *
@@ -25,8 +25,6 @@ module doltswarm_verify {
   // ===========================================================================
 
   pure val PEERS: Set[PeerID] = Set(1, 2, 3)
-  pure val STALENESS_THRESHOLD: int = 3
-  pure val REJECTION_RATIO: int = 30
   pure val CONTENTS: Set[int] = Set(100, 200)
   pure val MAX_WALL: int = 6
   pure val MAX_EVENTS: int = 8
@@ -77,8 +75,6 @@ module doltswarm_verify {
     stable_hlc: HLC,
     finalized_root: Hash,
     finalized_events: Set[EventCID],
-    stale_votes: EventCID -> Set[PeerID],
-    rejected_events: Set[EventCID],
     parked_conflicts: Set[EventCID],
     active_peers: Set[PeerID],
     localWall: int,
@@ -215,7 +211,7 @@ module doltswarm_verify {
   pure def computeFinalizedRoot(events: Set[EventCID], clock: EventCID -> Event): Hash = {
     if (events.empty()) EMPTY_ROOT
     else {
-      // Only include events still present in the clock (rejected events may be absent)
+      // Only include events still present in the clock
       val present = events.filter(cid => clock.has(cid))
       if (present.empty()) EMPTY_ROOT
       else {
@@ -254,37 +250,6 @@ module doltswarm_verify {
     }
   }
 
-  /// Compute the transitive ancestor set of an event in the clock DAG.
-  /// Returns all CIDs reachable by walking parents from the given CID.
-  /// With MAX_EVENTS=8 and 3 peers this is tractable for model checking.
-  pure def ancestors(cid: EventCID, clock: EventCID -> Event): Set[EventCID] = {
-    // Fixed-point iteration: expand frontier until stable.
-    // With MAX_EVENTS=8, at most 8 iterations needed.
-    val seed = if (clock.has(cid)) clock.get(cid).parents else Set()
-    // Iterate enough times to reach fixed point (MAX_EVENTS rounds)
-    range(0, 8).foldl(seed, (acc, _) =>
-      acc.union(acc.fold(Set(), (inner, a) =>
-        if (clock.has(a)) inner.union(clock.get(a).parents) else inner
-      ))
-    )
-  }
-
-  /// Staleness lineage exemption (§6.1): an event is exempt from staleness
-  /// voting if it is an ancestor of a non-stale event from the same peer
-  /// already in the clock. This prevents the staleness mechanism from
-  /// punching holes in a reconnecting peer's event chain during partition
-  /// recovery. The entire lineage is treated as a unit.
-  ///
-  /// Matches protocol: "check if any event e' in the clock satisfies
-  /// e'.peer == e.peer ∧ e.cid ∈ ancestors(e') ∧ (now() - e'.hlc.wall ≤ 10s)"
-  pure def isLineageExempt(e: Event, clock: EventCID -> Event, localWall: int): bool =
-    clock.keys().exists(cid =>
-      val other = clock.get(cid)
-      other.peer == e.peer and
-      ancestors(cid, clock).contains(e.cid) and
-      (localWall - other.hlc.wall) <= STALENESS_THRESHOLD
-    )
-
   // ===========================================================================
   // Actions
   // ===========================================================================
@@ -299,8 +264,6 @@ module doltswarm_verify {
       stable_hlc: ZERO,
       finalized_root: EMPTY_ROOT,
       finalized_events: Set(),
-      stale_votes: Map(),
-      rejected_events: Set(),
       parked_conflicts: Set(),
       active_peers: PEERS,
       localWall: 1,
@@ -364,18 +327,13 @@ module doltswarm_verify {
   /// A peer processes a single event from its inbox.
   /// Events are processed one at a time (not batched), matching the protocol's
   /// per-event processing with inline reconciliation between events.
-  /// Reconciliation is inlined here (matching §2.4 RECEIVE_EVENT step 9):
+  /// Reconciliation is inlined here (matching §2.4 RECEIVE_EVENT step 8):
   /// when receiving creates multiple active heads, immediately compute the
   /// merged root and park any conflicts.
-  ///
-  /// Staleness check includes lineage exemption (§6.1): events that are part
-  /// of a reconnecting peer's chain (same peer has a later non-stale event)
-  /// are exempt from staleness voting.
   action do_receive(p: PeerID): bool = {
     val st = nodes.get(p)
     val processable = inbox.get(p).filter(e =>
-      not(st.clock.keys().contains(e.cid)) and
-      not(st.rejected_events.contains(e.cid))
+      not(st.clock.keys().contains(e.cid))
     )
 
     all {
@@ -387,19 +345,7 @@ module doltswarm_verify {
       val newHLC = observe(st.hlc_clock, e.hlc, st.localWall, p)
       // Recompute heads from the full clock (order-independent)
       val newHeads = computeHeads(newClock)
-      // Check for staleness with lineage exemption (§6.1)
-      val isStale = (st.localWall - e.hlc.wall) > STALENESS_THRESHOLD
-      val isExempt = isLineageExempt(e, newClock, st.localWall)
-      val shouldVoteStale = isStale and not(isExempt)
-      val newStaleVotes = if (shouldVoteStale) {
-        if (st.stale_votes.has(e.cid))
-          st.stale_votes.setBy(e.cid, voters => voters.union(Set(p)))
-        else
-          st.stale_votes.put(e.cid, Set(p))
-      } else {
-        st.stale_votes
-      }
-      // Inline reconciliation (§2.4 step 9): if multiple heads,
+      // Inline reconciliation (§2.4 step 8): if multiple heads,
       // compute merged root and park any conflicts. computeMergedRoot
       // operates on ALL heads and returns the complete parked set,
       // making parking a pure function of (heads, clock, finalized_root).
@@ -408,7 +354,6 @@ module doltswarm_verify {
         clock: newClock,
         heads: newHeads,
         hlc_clock: newHLC,
-        stale_votes: newStaleVotes,
       }
       val reconcileResult = if (newHeads.size() > 1) {
         computeMergedRoot(tempState)
@@ -430,88 +375,6 @@ module doltswarm_verify {
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
         prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
         connected' = connected,
-      }
-    }
-  }
-
-  /// Propagate stale votes between peers.
-  /// Models the broadcast of stale votes between peers.
-  /// When enough peers vote stale (≥ REJECTION_RATIO%), the event is rejected.
-  action do_stale_vote(p: PeerID, q: PeerID): bool = {
-    val st_p = nodes.get(p)
-    val st_q = nodes.get(q)
-    all {
-      p != q,
-      isConnected(connected, p, q),
-      // q must have stale votes that p doesn't have yet
-      val qVotes = st_q.stale_votes
-      val pVotes = st_p.stale_votes
-      // Find an event that q voted stale on but p hasn't counted q's vote
-      nondet eventCID = qVotes.keys().oneOf()
-      val qVoters = qVotes.get(eventCID)
-      val pVoters = if (pVotes.has(eventCID)) pVotes.get(eventCID) else Set()
-      val newVoters = pVoters.union(qVoters)
-      all {
-        // Only fire if this actually adds new voters
-        newVoters.size() > pVoters.size(),
-        val updatedVotes = if (pVotes.has(eventCID))
-          pVotes.setBy(eventCID, _ => newVoters)
-        else
-          pVotes.put(eventCID, newVoters)
-        // Check rejection threshold: ceil(active_peers * REJECTION_RATIO / 100)
-        // Never reject an already-finalized event.
-        val threshold = (st_p.active_peers.size() * REJECTION_RATIO + 99) / 100
-        val shouldReject = newVoters.size() >= threshold and
-          not(st_p.rejected_events.contains(eventCID)) and
-          not(st_p.finalized_events.contains(eventCID))
-        if (shouldReject and st_p.clock.has(eventCID)) {
-          // Reject: remove from clock, recompute heads, latest_root, and parking
-          val evt = st_p.clock.get(eventCID)
-          val cleanedClock = st_p.clock.mapRemove(eventCID)
-          val cleanedHeads = computeHeads(cleanedClock)
-          // Recompute parking and latest_root from the cleaned state
-          val cleanedState: NodeState = {
-            ...st_p,
-            clock: cleanedClock,
-            heads: cleanedHeads,
-          }
-          val reconcileResult = if (cleanedHeads.size() > 1) {
-            computeMergedRoot(cleanedState)
-          } else if (cleanedHeads.size() == 1) {
-            val root = cleanedHeads.fold(EMPTY_ROOT, (_, cid) => cleanedClock.get(cid).root_hash)
-            (root, Set())
-          } else {
-            (st_p.finalized_root, Set())
-          }
-          val newLatestRoot = reconcileResult._1
-          val newParkedConflicts = reconcileResult._2
-          all {
-            nodes' = nodes.set(p, {
-              ...st_p,
-              clock: cleanedClock,
-              heads: cleanedHeads,
-              latest_root: newLatestRoot,
-              stale_votes: updatedVotes,
-              rejected_events: st_p.rejected_events.union(Set(eventCID)),
-              parked_conflicts: newParkedConflicts,
-            }),
-            inbox' = inbox,
-            prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-            prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-            prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
-            connected' = connected,
-          }
-        } else {
-          // Not yet rejected, just update votes
-          all {
-            nodes' = nodes.set(p, { ...st_p, stale_votes: updatedVotes }),
-            inbox' = inbox,
-            prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-            prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-            prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
-            connected' = connected,
-          }
-        }
       }
     }
   }
@@ -591,7 +454,7 @@ module doltswarm_verify {
       val newStable = hlcMinOver(updatedPeerHLC, newActivePeers)
       // Pull-on-demand: events q has that p is missing (§2.4 step 5)
       val missingEvents = remote.clock.keys().filter(cid =>
-        not(st.clock.has(cid)) and not(st.rejected_events.contains(cid))
+        not(st.clock.has(cid))
       )
       val pulledEvents = missingEvents.map(cid => remote.clock.get(cid))
       all {
@@ -616,8 +479,6 @@ module doltswarm_verify {
   /// guarantee that the same finalized_events always yield the same root,
   /// regardless of the order peers finalize events.
   ///
-  /// Prunes stale votes for the finalized event (§2.4 ADVANCE_STABILITY step 5).
-  ///
   /// Blocked when partition_conflict is active — no new finalization
   /// until the partition conflict is resolved (§7.10).
   action do_finalize(p: PeerID): bool = {
@@ -629,7 +490,6 @@ module doltswarm_verify {
         val e = st.clock.get(cid)
         less(e.hlc, st.stable_hlc) and
         not(st.finalized_events.contains(cid)) and
-        not(st.rejected_events.contains(cid)) and
         not(st.parked_conflicts.contains(cid))
       )
       all {
@@ -637,17 +497,11 @@ module doltswarm_verify {
         nondet cid = candidates.oneOf()
         val newFinalizedEvents = st.finalized_events.union(Set(cid))
         val newFinRoot = computeFinalizedRoot(newFinalizedEvents, st.clock)
-        // Prune stale votes for the finalized event (§2.4 step 5)
-        val prunedStaleVotes = if (st.stale_votes.has(cid))
-          st.stale_votes.mapRemove(cid)
-        else
-          st.stale_votes
         all {
           nodes' = nodes.set(p, {
             ...st,
             finalized_root: newFinRoot,
             finalized_events: newFinalizedEvents,
-            stale_votes: prunedStaleVotes,
           }),
           inbox' = inbox,
           prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
@@ -664,7 +518,7 @@ module doltswarm_verify {
   // ===========================================================================
 
   /// Network partition: disconnect two peers.
-  /// Events, heartbeats, and stale votes no longer flow between them.
+  /// Events and heartbeats no longer flow between them.
   action do_partition(p: PeerID, q: PeerID): bool = all {
     p != q,
     isConnected(connected, p, q),
@@ -942,8 +796,6 @@ module doltswarm_verify {
       nondet q = PEERS.oneOf()
       do_heartbeat(p, q),
       do_finalize(p),
-      nondet q2 = PEERS.oneOf()
-      do_stale_vote(p, q2),
       // Partition and membership actions
       nondet q3 = PEERS.oneOf()
       do_partition(p, q3),
@@ -983,12 +835,6 @@ module doltswarm_verify {
       (s1.finalized_root == s2.finalized_root)
   }))
 
-  /// No event is both finalized and rejected (INV9).
-  val inv_no_finalized_rejected_overlap = PEERS.forall(p => {
-    val st = nodes.get(p)
-    st.finalized_events.intersect(st.rejected_events) == Set()
-  })
-
   /// Data convergence: peers with the same events and single head agree on latest_root.
   /// (After reconciliation, peers with same clock should converge.)
   val inv_data_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
@@ -1016,43 +862,19 @@ module doltswarm_verify {
   })
 
   /// No silent data loss (INV5, safety approximation): every event that any peer
-  /// has ever seen is accounted for — still in the clock (pending finalization),
-  /// already finalized, or explicitly rejected. No event disappears silently.
+  /// has ever seen is accounted for — still in the clock (pending finalization)
+  /// or already finalized. No event disappears silently.
   ///
-  /// The full INV5 ("every event *eventually* enters finalized or rejected") is
-  /// a liveness property that cannot be checked as a state invariant. This safety
+  /// The full INV5 ("every event *eventually* enters finalized set") is a
+  /// liveness property that cannot be checked as a state invariant. This safety
   /// version ensures the precondition: events are never dropped without a trace.
   val inv_no_silent_data_loss = PEERS.forall(p => {
     val st = nodes.get(p)
     // Every finalized event is still in the clock (not silently removed)
-    st.finalized_events.forall(cid => st.clock.has(cid)) and
-    // Every event in the clock is either pending, finalized, or rejected — never orphaned
-    // (rejected events are removed from clock, so clock ∩ rejected = ∅ by construction;
-    //  this checks the dual: rejected events are NOT in the clock)
-    st.rejected_events.forall(cid => not(st.clock.has(cid)))
+    st.finalized_events.forall(cid => st.clock.has(cid))
   })
 
-  /// Rejection threshold: any rejected event must have accumulated enough votes.
-  /// (Non-vacuous: do_stale_vote actually rejects events.)
-  val inv_rejection_threshold = PEERS.forall(p => {
-    val st = nodes.get(p)
-    st.rejected_events.forall(cid =>
-      // Either it was voted stale with enough votes, or votes were pruned
-      not(st.stale_votes.has(cid)) or
-      st.stale_votes.get(cid).size() >=
-        (st.active_peers.size() * REJECTION_RATIO + 99) / 100
-    )
-  })
-
-  /// NOTE on INV7 converse (enough votes → rejected): Not checkable as a safety
-  /// invariant. do_receive adds a self-vote but does not check the rejection
-  /// threshold — rejection is processed asynchronously via do_stale_vote (matching
-  /// the protocol's "staleness vote is asynchronous" in §2.4 RECEIVE_EVENT step 3).
-  /// There is a transient state where a peer has enough votes locally but the event
-  /// is not yet rejected. The safety direction (inv_rejection_threshold: rejected →
-  /// enough votes) is the checkable component.
-
-  /// No unhandled tentative conflict (INV8a): latest_root is never
+  /// No unhandled tentative conflict (INV7a): latest_root is never
   /// CONFLICT_HASH. Every conflict detected by mergeRoots during
   /// reconciliation is captured in parked_conflicts — none leaks
   /// into the working state.
@@ -1061,7 +883,7 @@ module doltswarm_verify {
     st.latest_root != CONFLICT_HASH
   })
 
-  /// No unhandled finalized conflict (INV8b): finalized_root is never
+  /// No unhandled finalized conflict (INV7b): finalized_root is never
   /// CONFLICT_HASH. Every conflict from MERGE_FINALIZED is captured
   /// in partition_conflict — none leaks into the finalized state.
   val inv_no_conflict_finalized_root = PEERS.forall(p => {
@@ -1069,14 +891,11 @@ module doltswarm_verify {
     st.finalized_root != CONFLICT_HASH
   })
 
-  /// Parked event integrity (INV8c): every parked conflict references
-  /// a known event in the clock or rejected set. No conflict is
-  /// silently discarded.
+  /// Parked event integrity (INV7c): every parked conflict references
+  /// a known event in the clock. No conflict is silently discarded.
   val inv_conflict_visibility = PEERS.forall(p => {
     val st = nodes.get(p)
-    st.parked_conflicts.forall(cid =>
-      st.clock.has(cid) or st.rejected_events.contains(cid)
-    )
+    st.parked_conflicts.forall(cid => st.clock.has(cid))
   })
 
   /// Stability monotonicity (INV6): stable_hlc never decreases.
@@ -1092,7 +911,7 @@ module doltswarm_verify {
     sameActivePeers implies leq(prev_stable_hlc.get(p), nodes.get(p).stable_hlc)
   })
 
-  /// Parking agreement (INV8d): peers with the same events and same
+  /// Parking agreement (INV7d): peers with the same events and same
   /// finalized_root deterministically agree on which events are parked.
   /// Parked set is a pure function of (heads, clock, finalized_root) via
   /// computeMergedRoot — no dependence on event receipt order.
@@ -1104,7 +923,7 @@ module doltswarm_verify {
       (s1.parked_conflicts == s2.parked_conflicts)
   }))
 
-  /// Partition merge convergence (INV10): peers that complete MERGE_FINALIZED
+  /// Partition merge convergence (INV8): peers that complete MERGE_FINALIZED
   /// with the same inputs (same finalized_events union) agree on finalized_root.
   /// This is a consequence of mergeRoots being deterministic and the ours/theirs
   /// assignment being deterministic.
@@ -1117,7 +936,7 @@ module doltswarm_verify {
       (s1.finalized_root == s2.finalized_root)
   }))
 
-  /// Finalization blocked during partition conflict (INV11): a peer with an
+  /// Finalization blocked during partition conflict (INV9): a peer with an
   /// active partition conflict cannot have gained new finalized events since
   /// the previous step. Uses prev_finalized_events history variable.
   val inv_finalize_blocked_during_conflict = PEERS.forall(p => {
