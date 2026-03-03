@@ -125,6 +125,14 @@ StaleReason = TooOld | MalformedOp
 MergeResult =
   | Ok     { merged_root: Hash }
   | Conflict { tables: Set[string], details: string }
+
+PartitionConflict = {
+  ours:       Hash,                   -- our finalized_root before merge (earlier by HLC)
+  theirs:     Hash,                   -- their finalized_root before merge (later by HLC)
+  ancestor:   Hash,                   -- common pre-split finalized_root
+  tables:     Set[string],            -- conflicting tables
+  details:    string,
+}
 ```
 
 ### 2.2 Per-Peer State
@@ -144,6 +152,7 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 | `stale_votes` | `Map[EventCID, Set[PeerID]]` | Peers that voted to reject an event |
 | `rejected_events` | `Set[EventCID]` | Globally rejected events (≥30% voted stale) |
 | `parked_conflicts` | `Map[EventCID, MergeResult]` | Parked events (later in total order, conflicted at merge). Excluded from active heads, LOCAL_WRITE parents, reconciliation, and finalization. Awaiting human resolution. |
+| `partition_conflict` | `Option[PartitionConflict]` | Active finalized-layer conflict from partition recovery. When set, `ADVANCE_STABILITY` is blocked until resolved via `RESOLVE_PARTITION_CONFLICT`. `LOCAL_WRITE` and tentative reconciliation continue normally. |
 | `active_peers` | `Set[PeerID]` | Peers seen in the last heartbeat window |
 
 ### 2.3 Communication Model
@@ -155,7 +164,7 @@ Communication is via a **pluggable transport** abstraction. The reference implem
 | Topic | Message Type | Rate |
 |---|---|---|
 | `/doltswarm/events/1.0` | `Event` | On local write |
-| `/doltswarm/heartbeat/1.0` | `{ peer: PeerID, hlc: HLC, heads: Set[EventCID] }` | Periodic (every 2s) |
+| `/doltswarm/heartbeat/1.0` | `{ peer: PeerID, hlc: HLC, heads: Set[EventCID], finalized_root: Hash }` | Periodic (every 2s) |
 | `/doltswarm/stale/1.0` | `StaleVote` | Rare (only on staleness detection) |
 
 **Data plane (chunk sync)** — prolly tree data is synced via **libp2p direct streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks for the event's `root_hash` from the originating peer (or any peer that has them). The sync walks the prolly tree from the root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not gossip — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
@@ -195,7 +204,8 @@ No conflict precondition — writes are never blocked.
 1. If `e.cid ∈ clock ∪ rejected_events`: discard (idempotent).
 2. **Signature check:** If `IdentityResolver` is configured, verify `e.signature` against `e.peer`'s public key. If invalid, discard silently.
 3. **Staleness check:** If `now() - e.hlc.wall > 10 seconds`:
-   - Publish `StaleVote { event: e.cid, voter: self, reason: TooOld }` on `/doltswarm/stale/1.0`.
+   - **Lineage exemption:** If `e` is an ancestor of a non-stale event from the same peer already in `clock` (i.e., the peer sent a chain of events and a recent tip has arrived), skip the stale vote. The entire lineage is accepted as a unit — this prevents the staleness mechanism from punching holes in a reconnecting peer's event chain during partition recovery. See §6.1.
+   - Otherwise, publish `StaleVote { event: e.cid, voter: self, reason: TooOld }` on `/doltswarm/stale/1.0`.
    - The event is still added to `clock` and processed normally (steps 4–9 proceed). The staleness vote is asynchronous — if enough peers vote stale (≥30% of `active_peers`), the event is rejected via `RECEIVE_STALE_VOTE` and its effects are rolled back.
 4. `hlc ← merge(hlc, e.hlc)`.
 5. `clock[e.cid] ← e`.
@@ -246,7 +256,7 @@ User (typically the author of the parked event) provides `resolution_ops` (SQL t
 Every 2 seconds:
 
 1. `hlc ← tick(hlc)`.
-2. Publish `{ peer: self, hlc, heads }` on `/doltswarm/heartbeat/1.0`.
+2. Publish `{ peer: self, hlc, heads, finalized_root }` on `/doltswarm/heartbeat/1.0`.
 
 On receive from peer `q`:
 
@@ -255,11 +265,13 @@ On receive from peer `q`:
 3. `active_peers ← active_peers ∪ {q}`.
 4. `stable_hlc ← min(peer_hlc[p] for p in active_peers)`.
 5. If receiver is missing events referenced by sender's `heads`, request them (pull-on-demand).
+6. **Partition divergence detection:** If `received.finalized_root ≠ finalized_root` and neither root is an ancestor of the other (i.e., they diverged independently during a partition), trigger `MERGE_FINALIZED(peer, received.finalized_root)`. See §6.8.
 
 #### ADVANCE_STABILITY(peer) → unit
 
 Triggered when `stable_hlc` advances.
 
+0. If `partition_conflict` is set: **block**. No new finalization until the partition conflict is resolved via `RESOLVE_PARTITION_CONFLICT`. Return immediately.
 1. `newly_stable = { e ∈ clock | e.hlc < stable_hlc ∧ e ∉ finalized_events ∧ e ∉ rejected_events ∧ e ∉ parked_conflicts }`. Parked events cannot be finalized until resolved.
 2. Sort `newly_stable` by total order (causal → HLC → CID).
 3. Replay from `finalized_root` via `MergeRoots` → `new_finalized_root`.
@@ -283,6 +295,41 @@ Fallback: if `stable_hlc` hasn't advanced for `EPOCH_TIMEOUT` (60s) despite hear
 1. Evict the blocking peer(s).
 2. Recompute `stable_hlc`, call `ADVANCE_STABILITY`.
 
+#### MERGE_FINALIZED(peer, their_finalized_root) → unit
+
+Triggered when a peer detects a different `finalized_root` from a reconnecting peer (via heartbeat, step 6) and the two roots diverged independently during a network partition. Every peer that detects the divergence independently computes the same merge — deterministic, no coordination needed.
+
+1. **Identify common ancestor:** Exchange `finalized_events` sets with the remote peer. The intersection gives the common pre-split base: `common_events = our_finalized_events ∩ their_finalized_events`. Compute `common_root = computeFinalizedRoot(common_events)`. Both sides had this same `finalized_root` before the partition.
+2. **Fetch chunks:** Request prolly tree chunks for `their_finalized_root` via SwarmChunkStore/Puller.
+3. **Deterministic ours/theirs:** Compare the two finalized roots' associated tip events by HLC total order. The earlier one is "ours", the later one is "theirs". All peers make the same selection.
+4. `result = MergeRoots(ours_finalized_root, theirs_finalized_root, common_root)`.
+5. Match:
+   - `Ok(merged)`:
+     - `finalized_root ← merged`.
+     - `finalized_events ← our_finalized_events ∪ their_finalized_events`.
+     - Create a deterministic Dolt merge commit with both finalized tips as parents. All metadata fields derived deterministically from the two tip events (HLC, peer from "ours" side, deterministic description).
+     - **Re-anchor tentative events:** All post-finalization tentative events used the old `finalized_root` as their merge ancestor. With the new merged `finalized_root`, parking decisions may change. Replay all non-finalized, non-rejected events from the new `finalized_root` via `RECONCILE`. CPU-only — all chunks already local.
+   - `Conflict(tables, details)`:
+     - `partition_conflict ← PartitionConflict { ours: ours_finalized_root, theirs: theirs_finalized_root, ancestor: common_root, tables, details }`.
+     - `ADVANCE_STABILITY` is now blocked until resolved.
+     - `LOCAL_WRITE` and tentative reconciliation continue normally — peers are not blocked from writing.
+     - Surface conflict to user (which tables, which rows).
+
+> **Why a single three-way merge?** The current `computeFinalizedRoot` replays finalized events as a fast-forward fold: `mergeRoots(acc, x, acc) = x`. This works because each event's `root_hash` incorporates all previous state — the fold is just fast-forwarding to the latest. But after a partition, events from side A don't incorporate side B's state. Interleaving them in HLC order and fast-forward folding would silently lose one side's changes. A single `MergeRoots` call with the common ancestor correctly diffs both sides against their shared base and merges at the cell level.
+
+#### RESOLVE_PARTITION_CONFLICT(peer, resolution_ops) → unit
+
+User provides `resolution_ops` (SQL that fixes conflicting rows/schema from the partition merge). Any peer can resolve, though the author of "theirs" changes is in the best position since they know what they intended. Resolution is async — no peer is blocked from tentative writes while awaiting resolution.
+
+1. Apply `resolution_ops` to local Dolt → `resolved_root`.
+2. Create a deterministic Dolt merge commit with both partition tips as parents and `resolved_root` as tree. All metadata fields deterministic (HLC from resolution event, deterministic description).
+3. `finalized_root ← resolved_root`.
+4. `finalized_events ← partition_conflict.ours_events ∪ partition_conflict.theirs_events` (the union).
+5. `partition_conflict ← None`.
+6. **Re-anchor tentative events** against the new `finalized_root`. Replay all non-finalized, non-rejected events via `RECONCILE`.
+7. `ADVANCE_STABILITY` resumes.
+8. Broadcast resolution as a special event so all peers converge to the same `finalized_root`.
+
 #### PEER_JOIN(new_peer) → unit
 
 1. Subscribe to all three gossipsub topics.
@@ -300,25 +347,27 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 
 **INV2 — Data Convergence:** For any two peers that have processed the same set of non-rejected events in the same total order, `p.latest_root == q.latest_root`.
 
-**INV3 — Finalized History Agreement:** For any two peers, the finalized Dolt commit DAG is byte-identical: same hashes, same parents, same roots.
+**INV3 — Finalized History Agreement:** For any two peers with the same `finalized_events` set, the finalized Dolt commit DAG is byte-identical: same hashes, same parents, same roots. During a network partition, peers may have different `finalized_events` sets (each side finalizes independently under its reduced `active_peers`). When the partition heals, `MERGE_FINALIZED` reconciles the divergent histories into a shared fork-and-join DAG that is eventually identical across all peers.
 
 **INV4 — Causal Consistency:** If `e1` is an ancestor of `e2` in the clock DAG, then `e1` precedes `e2` in the total order.
 
 **INV5 — No Silent Data Loss:** Every event either enters the finalized set, is explicitly rejected, or is parked (awaiting human resolution). No event disappears silently. Parked events are never subsumed in the DAG without explicit resolution.
 
-**INV6 — Stability Monotonicity:** `stable_hlc` and `finalized_root` never move backward.
+**INV6 — Stability Monotonicity:** Within a continuous `active_peers` membership, `stable_hlc` never moves backward. `finalized_root` never moves backward (the partition merge point is strictly ahead of both sides' previous roots). When a peer is re-added to `active_peers` after partition recovery, `stable_hlc` may temporarily decrease if the returning peer's HLC is behind the current minimum — this is expected and does not compromise finalization safety.
 
 **INV7 — Rejection Consistency:** If ≥30% of `active_peers` vote stale on event `e`, then eventually all peers mark `e` as rejected.
 
-**INV8 — Conflict Visibility:** Every `MergeConflict` result parks the later event (by total order) and surfaces it to the user. All peers deterministically agree on which events are parked. No conflict is auto-resolved or silently discarded.
+**INV8 — Conflict Visibility:** Every `MergeConflict` result parks the later event (by total order) and surfaces it to the user. All peers deterministically agree on which events are parked. No conflict is auto-resolved or silently discarded. Every partition merge conflict (`MERGE_FINALIZED` returning `Conflict`) is surfaced to the user as a `PartitionConflict`. No partition conflict is auto-resolved or silently discarded.
 
-**INV9 — Finalization/Rejection Exclusivity:** No event is both finalized and rejected. `finalized_events ∩ rejected_events = ∅` on every peer.
+**INV9 — Finalization/Rejection Exclusivity:** No event is both finalized and rejected. `finalized_events ∩ rejected_events = ∅` on every peer. Events rejected during a partition remain rejected after reconnection — rejections propagate across partition boundaries.
+
+**INV10 — Partition Merge Convergence:** For any two peers that have completed `MERGE_FINALIZED` with the same inputs (same two `finalized_root` values and same `common_root`), the resulting `finalized_root` is identical. The merge is a deterministic function of its inputs.
 
 ---
 
 ## 3. Quint Formal Specification
 
-The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qnt` for the model-checkable specification with invariants. The spec is the source of truth for the **core state machine**: event write, receive, reconcile, heartbeat, finalize, and stale-vote/rejection. Membership actions (join, leave, eviction), signature verification, and data-plane transfer (chunk fetching) are specified only in this document — they are not yet modeled in the Quint spec.
+The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qnt` for the model-checkable specification with invariants. The spec is the source of truth for the **core state machine**: event write, receive, reconcile, heartbeat, finalize, stale-vote/rejection, **network partitions** (connectivity model, peer eviction), **partition recovery** (merge_finalized, resolve_partition_conflict), and **staleness lineage exemption**. Signature verification and data-plane transfer (chunk fetching) are specified only in this document — they are not yet modeled in the Quint spec. Membership actions (join, leave) are partially modeled: eviction and reconnection (via heartbeat re-adding to active_peers) are in the spec; graceful join/leave are document-only.
 
 To run the spec: `task quint:run`
 
@@ -418,6 +467,10 @@ RECEIVE_EVENT(e)
 
 Receiving peer votes stale, publishes on `/doltswarm/stale/1.0`. The event is still added to `clock` and processed normally (including reconciliation) — the staleness vote is asynchronous. If <30% vote stale, event remains accepted. If ≥30%, globally rejected: removed from clocks, originator notified. If already merged by some peers before rejection, those peers roll back by replaying non-rejected events from `finalized_root`. Already-finalized events cannot be rejected. All chunks already local — CPU-only, no network.
 
+**Lineage exemption for partition recovery:** The staleness mechanism is designed for individual straggler events during normal operation. During partition recovery, a reconnecting peer sends a chain of events spanning the entire partition duration — most are >10s old by wall time. Without an exemption, the staleness mechanism would reject most of the chain, leaving dangling references from surviving tip events to rejected ancestors.
+
+The exemption rule: an event is exempt from staleness voting if it is an ancestor of a non-stale event from the same peer already in the clock. The entire lineage is treated as a unit — either the chain is accepted or rejected, but holes cannot be punched in the middle. Implementation: when evaluating staleness for event `e`, check if any event `e'` in the clock satisfies `e'.peer == e.peer ∧ e.cid ∈ ancestors(e') ∧ (now() - e'.hlc.wall ≤ 10s)`. If so, skip the stale vote for `e`.
+
 ### 6.2 Conflicts (Data or Schema)
 
 All conflicts are resolved deterministically using the HLC total order. When `MergeRoots` detects a conflict between two events, the earlier event (by total order) wins and its root becomes the working state. The later event is "parked": it stays in the clock (it happened), its data is preserved, but it is excluded from the active lineage (`latest_root`, `LOCAL_WRITE` parents, finalization).
@@ -446,7 +499,29 @@ Replay all non-rejected events in total order from `finalized_root`. Chunks alre
 
 ### 6.8 Network Partition
 
-Peers in each partition continue operating independently. When partition heals, heartbeats resume, events flow, merges happen. If >10s elapsed, some cross-partition events may trigger staleness votes. If partitions operated concurrently for extended periods, conflicts are likely and surfaced to user.
+Peers in each partition continue operating independently. Each side evicts unreachable peers after `HEARTBEAT_TIMEOUT`, reduces `active_peers`, and finalizes independently under its reduced membership. Both sides' finalized histories diverge.
+
+**During partition:** Each partition operates as a fully functional cluster. Events flow within the partition, `stable_hlc` advances based on the reduced `active_peers`, and events finalize. Each side's `finalized_root` advances along its own lineage. No data loss — all writes are preserved.
+
+**When partition heals:** Heartbeats resume between previously-separated peers. Three things happen:
+
+1. **Staleness lineage exemption:** The reconnecting peer's event chain spans the partition duration. Most events are >10s old. The lineage exemption (§6.1) prevents the staleness mechanism from rejecting the chain — only the tip is evaluated for staleness. If the tip is fresh, the entire ancestor chain is accepted.
+
+2. **Clock merge:** Events from both sides flow via gossip. Each peer's clock grows to include all events from both partitions. Multiple heads emerge (at least one per partition lineage). Tentative `RECONCILE` runs normally against these heads.
+
+3. **Finalized root divergence detection and merge:** Heartbeats carry `finalized_root`. When a peer receives a heartbeat with a different `finalized_root` that isn't an ancestor of its own, it triggers `MERGE_FINALIZED`. This performs a single three-way `MergeRoots(ours, theirs, common_ancestor)` where the common ancestor is the pre-split finalized root (recovered from the intersection of both sides' `finalized_events` sets).
+
+**Fork-and-join topology:** The finalized Dolt commit DAG is no longer strictly linear after partition recovery. It has a fork at the point of partition and a join at the merge commit. Both sides' finalized commits are preserved as history — `dolt log` shows the full picture: pre-split linear chain, two parallel branches during partition, merge commit at reconnection.
+
+**Partition conflicts:** If both sides modified the same rows in their independently finalized events, `MERGE_FINALIZED` returns a `Conflict`. This creates a `PartitionConflict` — a new conflict surface distinct from tentative parked conflicts. Both sides already told their users the data is finalized. Resolution is via `RESOLVE_PARTITION_CONFLICT`: a peer (typically the author of "theirs" changes) provides SQL that resolves the conflicting rows. During the conflict period, `ADVANCE_STABILITY` is blocked but `LOCAL_WRITE` continues normally.
+
+**Re-anchoring:** After `MERGE_FINALIZED` completes (with or without conflict resolution), all tentative events are re-evaluated against the new `finalized_root`. Parking decisions may change since the ancestor for merge computations has changed. This is a CPU-only replay — all chunks are already local.
+
+**Cross-partition rejections:** Events rejected on one side of the partition (via stale votes within that partition's `active_peers`) remain rejected after reconnection. The rejection was valid within its context and propagates to the other side.
+
+**Nested partitions:** If a partition splits further (e.g., all three peers isolated), the same logic applies recursively. Each reconnection produces a merge commit in the Dolt DAG via `MERGE_FINALIZED`. The topology becomes more complex but remains well-defined and deterministic. Pairwise merges are computed in deterministic order (by HLC of finalized tips).
+
+**Determinism:** All peers independently compute the same partition merge result. The "ours" vs "theirs" assignment is deterministic (earlier finalized tip by HLC total order = "ours"). The merge commit metadata is deterministic (derived from the two tip events). INV3 holds after convergence.
 
 ---
 
@@ -700,6 +775,24 @@ The `transport/` package interfaces also need updates:
 - `GossipSubscription`/`GossipEvent`: carry Event/Heartbeat/StaleVote instead of CommitAd/Digest
 - `Provider` interface: keep `ChunkStore()`/`Downloader()` for data plane; may simplify
 - `ProviderPicker`: keep — used by SwarmChunkStore for peer selection
+
+### 7.10 Partition recovery: accept the fork
+
+When a network partition separates peers into independent groups, each group evicts unreachable peers, reduces `active_peers`, and finalizes independently. The two sides' `finalized_root` values diverge. On reconnection, the protocol must reconcile these divergent finalized histories.
+
+**Decision: accept the fork.** Both sides' finalized histories are treated as valid. The divergent finalized roots are merged via a single `MergeRoots` call to produce a new shared finalized base. The Dolt commit DAG gets a fork-and-join topology — a merge commit with both finalized tips as parents. No finalization is rolled back. No data is lost.
+
+**Why not "re-tentativize"?** The alternative — treating one side's post-split finalized events as tentative again — violates INV6 (Stability Monotonicity) and requires unwinding finalization, which is complex and breaks the user expectation that finalized data is settled. Accept-the-fork is simpler and preserves all invariants with minor scoping adjustments.
+
+**Why not "last-write-wins"?** Auto-resolving the partition merge by discarding one side's finalized data causes silent data loss — unacceptable for finalized content.
+
+**The staleness exemption is essential.** Without the lineage exemption (§6.1), the staleness mechanism would reject most of a reconnecting peer's event chain (events >10s old). This would leave the surviving tip events with dangling parent references, breaking the Merkle clock DAG. The lineage exemption treats a peer's chain as an atomic unit for staleness purposes.
+
+**Finalized-layer conflicts are a new surface.** During normal operation, conflicts only occur at the tentative layer (parked events). Partition recovery introduces conflicts at the finalized layer — both sides already told their users the data is settled. These require a dedicated resolution path (`RESOLVE_PARTITION_CONFLICT`) and are surfaced as `PartitionConflict` with explicit table/row details.
+
+**`computeFinalizedRoot` changes.** The existing fast-forward fold assumes finalized events form a linear causal chain. After a partition, the finalized event set contains two divergent lineages. The fold must be replaced with a single three-way merge for the partition case. Detection: if the finalized event set contains events from multiple partition contexts (disjoint causal chains), use `MERGE_FINALIZED` instead of the fold.
+
+**Deterministic merge commit.** The partition merge commit must be byte-identical across all peers for INV3. This requires: (1) deterministic ours/theirs assignment (earlier tip by HLC = ours), (2) deterministic metadata (HLC from the merge event, standard description), (3) deterministic parent ordering. Dolt's `CreateDeterministicCommit` provides this.
 
 ## 8. Repository Structure
 
