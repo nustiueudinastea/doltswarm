@@ -157,11 +157,11 @@ module doltswarm_verify {
     cidList.sortList((a, b) => less(clock.get(a).hlc, clock.get(b).hlc))
   }
 
-  /// Deterministic finalized root: pure function of finalized event set.
-  /// Sorts events by HLC total order and folds mergeRoots from EMPTY_ROOT.
-  /// Since mergeRoots(acc, x, acc) is a fast-forward (ours == ancestor → theirs),
-  /// the result equals the root_hash of the HLC-maximum event. The fold is kept
-  /// explicit to mirror the protocol's replay semantics.
+  /// Deterministic finalized root from a LINEAR event chain: pure function of
+  /// the event set. Sorts events by HLC total order and folds mergeRoots from
+  /// EMPTY_ROOT. Since mergeRoots(acc, x, acc) is a fast-forward (ours ==
+  /// ancestor → theirs), the result equals the root_hash of the HLC-maximum
+  /// event. The fold is kept explicit to mirror the protocol's replay semantics.
   ///
   /// Events that produce a conflict during the fold are skipped (§7.1.1):
   /// this handles formerly-parked events whose root_hash branches from an
@@ -170,9 +170,13 @@ module doltswarm_verify {
   /// mergeRoots(acc, x, acc) always fast-forwards, but it aligns with the
   /// protocol and provides defense in depth.
   ///
-  /// NOTE: After a network partition, finalized events may come from divergent
-  /// lineages. In that case, do_merge_finalized handles the merge via a single
-  /// three-way MergeRoots call instead of using this fold. See §7.10.
+  /// IMPORTANT: This function is ONLY used for computing the common ancestor
+  /// during MERGE_FINALIZED (where the input is a pre-split linear chain —
+  /// correct). It must NOT be used for general finalized root advancement,
+  /// because after a partition merge the finalized event set contains events
+  /// from divergent lineages whose merged result cannot be recovered by
+  /// replaying them in HLC order. do_finalize uses incremental mergeRoots
+  /// instead. See §7.10.
   pure def computeFinalizedRoot(events: Set[EventCID], clock: EventCID -> Event): Hash = {
     if (events.empty()) EMPTY_ROOT
     else {
@@ -441,9 +445,10 @@ module doltswarm_verify {
   }
 
   /// Finalize one event below stable_hlc (the one with the smallest HLC).
-  /// finalized_root is recomputed from scratch via computeFinalizedRoot to
-  /// guarantee that the same finalized_events always yield the same root,
-  /// regardless of the order peers finalize events.
+  /// Always picks the minimum-HLC candidate (deterministic — matches the
+  /// protocol's total-order replay). finalized_root is advanced incrementally
+  /// via mergeRoots(finalized_root, e.root_hash, finalized_root) to preserve
+  /// merge results from MERGE_FINALIZED. Never recomputed from scratch.
   action do_finalize(p: PeerID): bool = {
     val st = nodes.get(p)
     all {
@@ -455,9 +460,14 @@ module doltswarm_verify {
       )
       all {
         not(candidates.empty()),
-        nondet cid = candidates.oneOf()
+        // Pick the minimum-HLC candidate (deterministic — matches protocol's total-order replay)
+        val sorted = sortCIDsByHLC(candidates, st.clock)
+        val cid = sorted[0]
         val newFinalizedEvents = st.finalized_events.union(Set(cid))
-        val newFinRoot = computeFinalizedRoot(newFinalizedEvents, st.clock)
+        // Incremental fold: advance finalized_root by merging the new event
+        val merged = mergeRoots(st.finalized_root, st.clock.get(cid).root_hash, st.finalized_root)
+        // Skip events that conflict in the fold (§7.1.1)
+        val newFinRoot = if (merged == CONFLICT_HASH) st.finalized_root else merged
         all {
           nodes' = nodes.set(p, {
             ...st,
@@ -467,7 +477,7 @@ module doltswarm_verify {
           inbox' = inbox,
           prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
           prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-  
+
           connected' = connected,
         }
       }
