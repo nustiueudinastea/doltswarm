@@ -8,8 +8,8 @@
  *
  * Models the core protocol: Merkle clock events, MergeRoots-based reconcile,
  * heartbeats for stability, causal finalization, staleness/rejection,
- * merge conflicts, network partitions, and partition recovery via
- * accept-the-fork finalized merge (§7.10).
+ * merge conflicts, tentative conflict resolution, network partitions,
+ * and partition recovery via accept-the-fork finalized merge (§7.10).
  *
  * Reduced constants for tractable state space:
  *   - 3 peers
@@ -703,6 +703,62 @@ module doltswarm_verify {
     }
   }
 
+  /// Resolve a parked tentative conflict (§2.4 RESOLVE_CONFLICT).
+  ///
+  /// User (typically the parked event's author) provides resolution SQL
+  /// (modeled as nondeterministic content). Creates a new event whose parents
+  /// include ALL heads (including the parked one), subsuming it in the DAG.
+  /// The resolution flows through LOCAL_WRITE semantics (steps 2–10).
+  action do_resolve_conflict(p: PeerID, parkedCID: EventCID): bool = {
+    val st = nodes.get(p)
+    all {
+      st.parked_conflicts.contains(parkedCID),
+      st.clock.has(parkedCID),
+      st.localWall <= MAX_WALL,
+      st.clock.keys().size() < MAX_EVENTS,
+      nondet resolvedContent = CONTENTS.oneOf()
+      val newHLC = tick(st.hlc_clock, st.localWall, p)
+      val newCID = makeEventCID(p, newHLC.wall, newHLC.logical)
+      // Parents = ALL heads (including the parked one), subsuming it in the DAG
+      val allHeads = st.heads
+      val event: Event = {
+        cid: newCID,
+        root_hash: resolvedContent,
+        parents: allHeads,
+        hlc: newHLC,
+        peer: p,
+      }
+      val newClock = st.clock.put(newCID, event)
+      val newHeads = computeHeads(newClock)
+      // Recompute parking for the new head set
+      val postState: NodeState = {
+        ...st,
+        clock: newClock,
+        heads: newHeads,
+        hlc_clock: newHLC,
+      }
+      val reconcileResult = if (newHeads.size() > 1) {
+        computeMergedRoot(postState)
+      } else {
+        (resolvedContent, Set())
+      }
+      all {
+        nodes' = nodes.set(p, {
+          ...st,
+          clock: newClock,
+          heads: newHeads,
+          latest_root: resolvedContent,
+          hlc_clock: newHLC,
+          parked_conflicts: reconcileResult._2,
+        }),
+        inbox' = broadcastConnected(inbox, event, connected),
+        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
+        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
+        connected' = connected,
+      }
+    }
+  }
+
   /// Resolve a partition conflict (§2.4 RESOLVE_PARTITION_CONFLICT).
   ///
   /// User provides resolution (modeled as nondeterministic content choice).
@@ -764,6 +820,9 @@ module doltswarm_verify {
       nondet q6 = PEERS.oneOf()
       do_merge_finalized(p, q6),
       do_resolve_partition_conflict(p),
+      // Tentative conflict resolution (precondition in action guards empty set)
+      nondet parkedCID = nodes.get(p).parked_conflicts.oneOf()
+      do_resolve_conflict(p, parkedCID),
     }
   }
 

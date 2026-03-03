@@ -228,17 +228,19 @@ No conflict precondition — writes are never blocked.
 
 **Merges are deterministic local computations, not new information.** If peers A and B both have events `{e1, e2}` with two heads, they each independently call `MergeRoots` and arrive at the same `latest_root`. There is nothing to communicate — the merge result is fully determined by the inputs that all peers already have. No event is created, nothing is broadcast.
 
-1. `active_heads = heads \ parked_conflicts.keys()`.
-2. If `|active_heads| ≤ 1`: nothing to do.
-3. Sort `active_heads` by HLC total order (deterministic).
-4. For each head `h` (in sorted order), fold into the accumulated root:
+**Parking is a pure function of the full state.** Reconcile operates on ALL heads (not pre-filtered by existing `parked_conflicts`). It computes the **complete** parked set from scratch each invocation, making the result a deterministic function of `(heads, clock, finalized_root)` — independent of event receipt order. This ensures all peers with the same event set and finalized root agree on which events are parked, regardless of when or in what order they received events.
+
+1. If `|heads| ≤ 1`: nothing to do.
+2. Sort `heads` by HLC total order (deterministic).
+3. For each head `h` (in sorted order), fold into the accumulated root:
    a. **Ancestor selection:** Ideally, find the **LCA** in the Merkle clock DAG between the accumulated state and `h` → `ancestor_event`, then `ancestor_root = ancestor_event.root_hash`. If LCA is not found, fall back to `finalized_root`. **Current simplification:** both the Quint spec and Go implementation use `finalized_root` as the ancestor for all merges (no LCA computation). This is sound but may produce more conflicts than necessary.
    b. `result = MergeRoots(current_root, clock[h].root_hash, ancestor_root)`.
    c. Match:
       - `Ok(merged)`: `current_root ← merged`.
-      - `Conflict(tables, details)`: **Park `h`** (the later event in total order, since we fold in sorted order). Store in `parked_conflicts[h]`. `latest_root` not updated for this head. Notify `h.peer` that their event was parked due to conflict. All peers deterministically agree on which events are parked.
+      - `Conflict(tables, details)`: **Park `h`** (the later event in total order, since we fold in sorted order). Store in `parked_conflicts[h]`. `latest_root` not updated for this head. Notify `h.peer` that their event was parked due to conflict.
+4. `parked_conflicts ← { all heads parked in step 3 }` (complete replacement, not delta).
 5. `latest_root ← current_root` (the accumulated merge result).
-6. **`heads` are unchanged.** Heads are always derived from `computeHeads(clock)` — since reconcile does not add events to the clock, the head set cannot change. `active_heads = heads \ parked_conflicts` — shrinks as events are parked. Parked heads remain as persistent DAG forks until `RESOLVE_CONFLICT`.
+6. **`heads` are unchanged.** Heads are always derived from `computeHeads(clock)` — since reconcile does not add events to the clock, the head set cannot change. Parked heads remain as persistent DAG forks until `RESOLVE_CONFLICT`.
 
 > **Why no merge events?** Broadcasting merges would be pure redundancy — every peer holding the same events computes the same merged state. Worse, if merge events were broadcast, concurrent merges by different peers would create new DAG forks requiring further reconciliation (an infinite merge loop). Only three things produce gossipsub traffic: `LOCAL_WRITE` (new data), `RESOLVE_CONFLICT` (user resolution, which flows through `LOCAL_WRITE`), and `HEARTBEAT` (which naturally reflects the reduced head set after merge).
 
@@ -367,7 +369,7 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 
 ## 3. Quint Formal Specification
 
-The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qnt` for the model-checkable specification with invariants. The spec is the source of truth for the **core state machine**: event write, receive, reconcile, heartbeat, finalize, stale-vote/rejection, **network partitions** (connectivity model, peer eviction), **partition recovery** (merge_finalized, resolve_partition_conflict), and **staleness lineage exemption**. Signature verification and data-plane transfer (chunk fetching) are specified only in this document — they are not yet modeled in the Quint spec. Membership actions (join, leave) are partially modeled: eviction and reconnection (via heartbeat re-adding to active_peers) are in the spec; graceful join/leave are document-only.
+The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qnt` for the model-checkable specification with invariants. The spec is the source of truth for the **core state machine**: event write, receive, reconcile, heartbeat, finalize, stale-vote/rejection, **tentative conflict resolution** (resolve_conflict), **network partitions** (connectivity model, peer eviction), **partition recovery** (merge_finalized, resolve_partition_conflict), and **staleness lineage exemption**. Signature verification and data-plane transfer (chunk fetching) are specified only in this document — they are not yet modeled in the Quint spec. `EPOCH_FORCE_FINALIZE` is not modeled (timeout-based fallback, difficult to express as a model-checkable action). Membership actions (join, leave) are partially modeled: eviction and reconnection (via heartbeat re-adding to active_peers) are in the spec; graceful join/leave are document-only.
 
 To run the spec: `task quint:run`
 
@@ -535,7 +537,7 @@ Conflicts detected by `MergeRoots` are handled using the HLC total order to dete
 
 Parked events:
 - Stay in the clock (the event happened, it's preserved)
-- Are excluded from active_heads, `LOCAL_WRITE` parents, reconciliation, and finalization
+- Are excluded from `LOCAL_WRITE` parents and finalization (but are included in reconciliation — parking is recomputed from scratch each time)
 - Are surfaced to the user for resolution via `RESOLVE_CONFLICT`
 - Do not block any peer from writing
 
@@ -705,7 +707,7 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 
 **`reconciler_core.go` → Merkle clock reconciliation**
 - Current: `ReplayImportedEpochMerges` — epoch grouping, temp branch, HLC-sorted replay, FWW on conflict
-- New: `Reconcile` — pick two heads, find LCA in Merkle clock DAG, call `MergeRoots(h1.root_hash, h2.root_hash, ancestor.root_hash)`. On success: collapse heads, create tentative Dolt commit. On conflict: park later event (by HLC total order) in parked_conflicts, notify user. Repeat for remaining head pairs.
+- New: `Reconcile` — sort ALL heads by HLC, fold-merge via `MergeRoots` with `finalized_root` as ancestor (LCA as future optimization). Compute the complete parked set from scratch each invocation (pure function of heads, clock, finalized_root). On conflict: park the later event (by HLC total order), notify user. Create tentative Dolt commit for the merged result.
 - Remove: epoch metadata, FWW conflict resolution, parent chain collapsing, replay stall detection
 - Add: LCA computation (ancestor set intersection), conflict surfacing, conflict resolution path
 
