@@ -203,11 +203,16 @@ module doltswarm_verify {
   /// the result equals the root_hash of the HLC-maximum event. The fold is kept
   /// explicit to mirror the protocol's replay semantics.
   ///
-  /// NOTE: This fold assumes all finalized events form a linear causal chain
-  /// (each event's root_hash incorporates all previous state). After a network
-  /// partition, finalized events may come from divergent lineages. In that case,
-  /// do_merge_finalized handles the merge via a single three-way MergeRoots call
-  /// instead of using this fold. See §7.10.
+  /// Events that produce a conflict during the fold are skipped (§7.1.1):
+  /// this handles formerly-parked events whose root_hash branches from an
+  /// earlier state. The resolution event (later in HLC order) carries their
+  /// data. In this abstract model, the skip path is never exercised because
+  /// mergeRoots(acc, x, acc) always fast-forwards, but it aligns with the
+  /// protocol and provides defense in depth.
+  ///
+  /// NOTE: After a network partition, finalized events may come from divergent
+  /// lineages. In that case, do_merge_finalized handles the merge via a single
+  /// three-way MergeRoots call instead of using this fold. See §7.10.
   pure def computeFinalizedRoot(events: Set[EventCID], clock: EventCID -> Event): Hash = {
     if (events.empty()) EMPTY_ROOT
     else {
@@ -216,9 +221,13 @@ module doltswarm_verify {
       if (present.empty()) EMPTY_ROOT
       else {
         val sorted = sortCIDsByHLC(present, clock)
-        sorted.foldl(EMPTY_ROOT, (acc, cid) =>
-          mergeRoots(acc, clock.get(cid).root_hash, acc)
-        )
+        sorted.foldl(EMPTY_ROOT, (acc, cid) => {
+          val merged = mergeRoots(acc, clock.get(cid).root_hash, acc)
+          // Skip events that conflict in the fold (§7.1.1): handles
+          // formerly-parked events whose content was subsumed by a
+          // later resolution event.
+          if (merged == CONFLICT_HASH) acc else merged
+        })
       }
     }
   }
