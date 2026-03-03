@@ -54,9 +54,9 @@ From **Fireproof** we take the architecture: separate the ordering layer (Merkle
 
 From **Dolt** we keep everything valuable: the SQL interface, the prolly tree storage engine, the three-way merge with cell-level conflict detection, the chunk-level sync protocol, and the local commit DAG for `dolt log` / `dolt diff` on each peer.
 
-The protocol does not modify Dolt's commit model. Instead, it introduces a new Merkle clock layer that sits between the prolly tree data and the local commit DAG. Peers exchange clock events (small metadata) via libp2p gossipsub and prolly tree chunks via libp2p streams. The clock's causal ordering + HLC tiebreaker establishes a deterministic total order that all peers compute identically. `MergeRoots` is called with ancestor roots discovered from the clock, not from Dolt's commit parents. Local Dolt commits are created after reconciliation — they provide SQL tooling compatibility but their hashes are peer-specific in the tentative zone and byte-identical in the finalized zone (once causal stability confirms the ordering is settled).
+The protocol does not modify Dolt's commit model. Instead, it introduces a new Merkle clock layer that sits between the prolly tree data and the local commit DAG. Peers exchange clock events (small metadata) and prolly tree chunks over a direct mesh network. The clock's causal ordering + HLC tiebreaker establishes a deterministic total order that all peers compute identically. `MergeRoots` is called with ancestor roots discovered from the clock, not from Dolt's commit parents. Local Dolt commits are created after reconciliation — they provide SQL tooling compatibility but their hashes are peer-specific in the tentative zone and byte-identical in the finalized zone (once causal stability confirms the ordering is settled).
 
-The result: Dolt's full SQL merge semantics in a P2P setting, with coordination limited to gossip protocol message exchange, no consensus, and no central coordinator.
+The result: Dolt's full SQL merge semantics in a P2P setting, with coordination limited to broadcast message exchange over a direct mesh, no consensus, and no central coordinator.
 
 ---
 
@@ -68,7 +68,7 @@ Three layers, two provided by Dolt, one new:
 ┌──────────────────────────────────────────────────────┐
 │  Layer 3: Reconciliation (NEW — doltswarm Go)        │
 │  Merkle clock (in-memory), causal stability,         │
-│  merge orchestration, libp2p gossipsub transport     │
+│  merge orchestration, pluggable transport             │
 ├──────────────────────────────────────────────────────┤
 │  Layer 2: Commit DAG (EXISTING — Dolt, local-only)   │
 │  Local branch refs, working sets, dolt log           │
@@ -82,7 +82,7 @@ Three layers, two provided by Dolt, one new:
 
 **Layer 2 (Dolt, local-only):** Each peer creates Dolt commits locally after reconciliation. Commits have peer-specific hashes (parents, timestamps differ). Split into a **finalized zone** (deterministic, identical across peers) and a **tentative zone** (local convenience, rewritten on finalization).
 
-**Layer 3 (NEW — this protocol):** A Merkle clock DAG of events held in-memory and disseminated via libp2p gossipsub. Causal stability determines finalization (no voting). Merge orchestration calls into Layer 1. All conflicts — data and schema — are rejected and pushed back to the user.
+**Layer 3 (NEW — this protocol):** A Merkle clock DAG of events held in-memory and disseminated via broadcast over a direct peer mesh. Causal stability determines finalization (no voting). Merge orchestration calls into Layer 1. All conflicts — data and schema — are rejected and pushed back to the user.
 
 ---
 
@@ -92,7 +92,7 @@ Three layers, two provided by Dolt, one new:
 
 ```
 Hash        = byte[20]                    -- SHA-512/20
-PeerID      = libp2p.PeerID
+PeerID      = opaque peer identifier
 HLC         = { wall: uint64, logical: uint16, peer: PeerID }
 EventCID    = Hash                        -- hash of serialized Event
 
@@ -127,17 +127,19 @@ MergeResult =
   | Conflict { tables: Set[string], details: string }
 
 PartitionConflict = {
-  ours:       Hash,                   -- our finalized_root before merge (earlier by HLC)
-  theirs:     Hash,                   -- their finalized_root before merge (later by HLC)
-  ancestor:   Hash,                   -- common pre-split finalized_root
-  tables:     Set[string],            -- conflicting tables
-  details:    string,
+  ours:             Hash,                   -- our finalized_root before merge (earlier by HLC)
+  theirs:           Hash,                   -- their finalized_root before merge (later by HLC)
+  ancestor:         Hash,                   -- common pre-split finalized_root
+  ours_events:      Set[EventCID],          -- finalized events on "ours" side
+  theirs_events:    Set[EventCID],          -- finalized events on "theirs" side
+  tables:           Set[string],            -- conflicting tables
+  details:          string,
 }
 ```
 
 ### 2.2 Per-Peer State
 
-All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On crash recovery, a peer rejoins from a live peer via `PEER_JOIN` (explicit state transfer of finalized state + clock events), not from gossipsub message replay.
+All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On crash recovery, a peer rejoins from a live peer via `PEER_JOIN` (explicit state transfer of finalized state + clock events), not from message replay.
 
 | Variable | Type | Description |
 |---|---|---|
@@ -157,17 +159,17 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 
 ### 2.3 Communication Model
 
-Communication is via a **pluggable transport** abstraction. The reference implementation uses libp2p gossipsub, but the protocol is transport-agnostic.
+The protocol assumes a **direct mesh** network: every peer can send messages to every other peer. Communication is via a **pluggable transport** abstraction. The protocol is transport-agnostic — the transport must provide broadcast delivery and point-to-point streams, but the protocol does not depend on any specific networking library.
 
-**Control plane (gossip)** — three logical topics:
+**Control plane (broadcast)** — three message types, broadcast to all peers:
 
-| Topic | Message Type | Rate |
+| Message Type | Payload | Rate |
 |---|---|---|
-| `/doltswarm/events/1.0` | `Event` | On local write |
-| `/doltswarm/heartbeat/1.0` | `{ peer: PeerID, hlc: HLC, heads: Set[EventCID], finalized_root: Hash }` | Periodic (every 2s) |
-| `/doltswarm/stale/1.0` | `StaleVote` | Rare (only on staleness detection) |
+| `Event` | See §2.1 | On local write |
+| `Heartbeat` | `{ peer: PeerID, hlc: HLC, heads: Set[EventCID], finalized_root: Hash }` | Periodic (every 2s) |
+| `StaleVote` | See §2.1 | Rare (only on staleness detection) |
 
-**Data plane (chunk sync)** — prolly tree data is synced via **libp2p direct streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks for the event's `root_hash` from the originating peer (or any peer that has them). The sync walks the prolly tree from the root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not gossip — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
+**Data plane (chunk sync)** — prolly tree data is synced via **point-to-point streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks for the event's `root_hash` from the originating peer (or any peer that has them). The sync walks the prolly tree from the root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not broadcast — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
 
 > **Implementation note:** Chunk sync uses Dolt's `Puller` API with a `SwarmChunkStore` as the remote source (no `swarm://` remote or `DOLT_FETCH` — the data plane operates directly on chunk stores). See §7.4 for the complete design.
 
@@ -195,9 +197,10 @@ No conflict precondition — writes are never blocked.
 5. `e = Event { cid: hash(r, active_heads, hlc, peer), root_hash: r, parents: active_heads, hlc, peer, signature: sig }`.
 6. `clock[e.cid] ← e`.
 7. Recompute `heads` from clock. Note: `computeHeads` may still return parked CIDs as heads (since no event has them as parents). That's correct — they persist as forks until resolved.
-8. `latest_root ← r`.
-9. Create tentative local Dolt commit.
-10. Publish `e` on `/doltswarm/events/1.0`.
+8. If `|heads| > 1`: call `RECONCILE(peer)` — recomputes `latest_root` and `parked_conflicts` from the new head set.
+9. If `|heads| = 1`: `latest_root ← r`.
+10. Create tentative local Dolt commit.
+11. Publish `e` to all peers.
 
 #### RECEIVE_EVENT(peer, e) → Accept | Reject
 
@@ -205,13 +208,13 @@ No conflict precondition — writes are never blocked.
 2. **Signature check:** If `IdentityResolver` is configured, verify `e.signature` against `e.peer`'s public key. If invalid, discard silently.
 3. **Staleness check:** If `now() - e.hlc.wall > 10 seconds`:
    - **Lineage exemption:** If `e` is an ancestor of a non-stale event from the same peer already in `clock` (i.e., the peer sent a chain of events and a recent tip has arrived), skip the stale vote. The entire lineage is accepted as a unit — this prevents the staleness mechanism from punching holes in a reconnecting peer's event chain during partition recovery. See §6.1.
-   - Otherwise, publish `StaleVote { event: e.cid, voter: self, reason: TooOld }` on `/doltswarm/stale/1.0`.
+   - Otherwise, broadcast `StaleVote { event: e.cid, voter: self, reason: TooOld }` to all peers.
    - The event is still added to `clock` and processed normally (steps 4–9 proceed). The staleness vote is asynchronous — if enough peers vote stale (≥30% of `active_peers`), the event is rejected via `RECEIVE_STALE_VOTE` and its effects are rolled back.
 4. `hlc ← merge(hlc, e.hlc)`.
 5. `clock[e.cid] ← e`.
 6. Recompute `heads` from clock: `heads = { cid ∈ clock | cid is not a parent of any event in clock }`.
 7. If `|heads| = 1`: fast-forward `latest_root ← clock[head].root_hash`.
-8. Request prolly tree chunks for `e.root_hash` from originating peer via libp2p stream.
+8. Request prolly tree chunks for `e.root_hash` from originating peer via point-to-point stream.
 9. Call `RECONCILE(peer)` (if `|heads| > 1`).
 
 #### RECEIVE_STALE_VOTE(peer, vote) → unit
@@ -242,7 +245,7 @@ No conflict precondition — writes are never blocked.
 5. `latest_root ← current_root` (the accumulated merge result).
 6. **`heads` are unchanged.** Heads are always derived from `computeHeads(clock)` — since reconcile does not add events to the clock, the head set cannot change. Parked heads remain as persistent DAG forks until `RESOLVE_CONFLICT`.
 
-> **Why no merge events?** Broadcasting merges would be pure redundancy — every peer holding the same events computes the same merged state. Worse, if merge events were broadcast, concurrent merges by different peers would create new DAG forks requiring further reconciliation (an infinite merge loop). Only three things produce gossipsub traffic: `LOCAL_WRITE` (new data), `RESOLVE_CONFLICT` (user resolution, which flows through `LOCAL_WRITE`), and `HEARTBEAT` (which naturally reflects the reduced head set after merge).
+> **Why no merge events?** Broadcasting merges would be pure redundancy — every peer holding the same events computes the same merged state. Worse, if merge events were broadcast, concurrent merges by different peers would create new DAG forks requiring further reconciliation (an infinite merge loop). Only three things produce network traffic: `LOCAL_WRITE` (new data), `RESOLVE_CONFLICT` (user resolution, which flows through `LOCAL_WRITE`), and `HEARTBEAT` (which naturally reflects the reduced head set after merge).
 
 #### RESOLVE_CONFLICT(peer, event_cid, resolution_ops) → unit
 
@@ -258,7 +261,7 @@ User (typically the author of the parked event) provides `resolution_ops` (SQL t
 Every 2 seconds:
 
 1. `hlc ← tick(hlc)`.
-2. Publish `{ peer: self, hlc, heads, finalized_root }` on `/doltswarm/heartbeat/1.0`.
+2. Broadcast `{ peer: self, hlc, heads, finalized_root }` to all peers.
 
 On receive from peer `q`:
 
@@ -330,11 +333,11 @@ User provides `resolution_ops` (SQL that fixes conflicting rows/schema from the 
 5. `partition_conflict ← None`.
 6. **Re-anchor tentative events** against the new `finalized_root`. Replay all non-finalized, non-rejected events via `RECONCILE`.
 7. `ADVANCE_STABILITY` resumes.
-8. **Broadcast resolution:** Create a new `Event` with `root_hash = resolved_root`, `parents = current heads` (subsuming all active lineages), and publish on `/doltswarm/events/1.0`. This event flows through normal `RECEIVE_EVENT` on other peers. When a peer receives this event and detects it resolves their own `partition_conflict` (the event's root is from a peer that had the same conflict), it adopts the resolved `finalized_root` and `finalized_events` union, clearing its own `partition_conflict`. Peers without an active partition conflict process the event normally via `RECONCILE`.
+8. **Broadcast resolution:** Create a new `Event` with `root_hash = resolved_root`, `parents = current heads` (subsuming all active lineages), and broadcast to all peers. This event flows through normal `RECEIVE_EVENT` on other peers. When a peer receives this event and detects it resolves their own `partition_conflict` (the event's root is from a peer that had the same conflict), it adopts the resolved `finalized_root` and `finalized_events` union, clearing its own `partition_conflict`. Peers without an active partition conflict process the event normally via `RECONCILE`.
 
 #### PEER_JOIN(new_peer) → unit
 
-1. Subscribe to all three gossipsub topics.
+1. Join the peer mesh (begin receiving broadcast messages).
 2. Heartbeats from active peers provide current `heads`.
 3. Request from any active peer: `finalized_root` + finalized Dolt commits (shallow clone via `Puller`), all post-finalization clock events, chunks for `latest_root`.
 4. Reconstruct local state. Join `active_peers` via heartbeat.
@@ -374,7 +377,7 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 **Modeling notes (spec vs. this document):**
 
 - **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) specifies sorting all newly-stable events by total order and replaying them in a single batch. The Quint spec instead finalizes one nondeterministic candidate per step, then recomputes `computeFinalizedRoot` from scratch over the full finalized event set. Because `computeFinalizedRoot` is a pure function of the event set (it sorts internally), both approaches produce the same finalized root regardless of finalization order. The spec's approach is easier to model-check.
-- **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The Quint spec models this asymmetry: `do_merge_finalized` assigns ours/theirs deterministically (lower finalized root value = "ours") matching the protocol's HLC-based assignment (§2.4 MERGE_FINALIZED step 3).
+- **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The Quint spec models this asymmetry: `do_merge_finalized` assigns ours/theirs deterministically (lower finalized root value = "ours"), approximating the protocol's HLC-based tip comparison (§2.4 MERGE_FINALIZED step 3). Both methods produce a deterministic total order; the specific comparison differs but correctness (INV10) holds either way.
 
 To run the spec: `task quint:run`
 
@@ -399,14 +402,14 @@ To run the spec: `task quint:run`
 
 | Component | Storage | Transport |
 |---|---|---|
-| **Merkle Clock** | In-memory `map[EventCID]Event` | gossipsub `/doltswarm/events/1.0` |
+| **Merkle Clock** | In-memory `map[EventCID]Event` | Broadcast (Event messages) |
 | **HLC Module** | In-memory per peer | Embedded in events + heartbeats |
-| **Heartbeat** | In-memory peer tracking | gossipsub `/doltswarm/heartbeat/1.0` |
-| **Stale Vote** | In-memory vote tally | gossipsub `/doltswarm/stale/1.0` |
+| **Heartbeat** | In-memory peer tracking | Broadcast (Heartbeat messages) |
+| **Stale Vote** | In-memory vote tally | Broadcast (StaleVote messages) |
 | **Total Order** | Pure computation | N/A |
 | **LCA Finder** | Pure computation over clock | N/A |
 | **Event Signer** | N/A (pluggable `Signer`) | Signature embedded in events |
-| **Chunk Sync** | Calls ChunkStore APIs | libp2p direct streams for chunk requests |
+| **Chunk Sync** | Calls ChunkStore APIs | Point-to-point streams for chunk requests |
 | **Reconciliation Loop** | Calls Dolt Go APIs | N/A (local after chunk sync) |
 | **Stability Tracker** | In-memory `stable_hlc` | Derived from heartbeats |
 | **Finalization Engine** | Writes to Dolt Layer 2 | Local only |
@@ -423,7 +426,7 @@ RECEIVE_EVENT(e)
   ├─► Verify(e.signature, e.peer) ────► discard if invalid
   │
   ├─► ChunkSync(e.root_hash, e.peer) ► walk prolly tree from root
-  │     libp2p stream to e.peer            ChunkStore.HasMany (missing?)
+  │     p2p stream to e.peer               ChunkStore.HasMany (missing?)
   │                                        ChunkStore.PutMany (store)
   │
   ├─► find_lca(clock, h1, h2)
@@ -472,7 +475,7 @@ RECEIVE_EVENT(e)
 
 ### 6.1 Stale Event (>10s old)
 
-Receiving peer votes stale, publishes on `/doltswarm/stale/1.0`. The event is still added to `clock` and processed normally (including reconciliation) — the staleness vote is asynchronous. If <30% vote stale, event remains accepted. If ≥30%, globally rejected: removed from clocks, originator notified. If already merged by some peers before rejection, those peers roll back by replaying non-rejected events from `finalized_root`. Already-finalized events cannot be rejected. All chunks already local — CPU-only, no network.
+Receiving peer votes stale, broadcasts a `StaleVote` to all peers. The event is still added to `clock` and processed normally (including reconciliation) — the staleness vote is asynchronous. If <30% vote stale, event remains accepted. If ≥30%, globally rejected: removed from clocks, originator notified. If already merged by some peers before rejection, those peers roll back by replaying non-rejected events from `finalized_root`. Already-finalized events cannot be rejected. All chunks already local — CPU-only, no network.
 
 **Lineage exemption for partition recovery:** The staleness mechanism is designed for individual straggler events during normal operation. During partition recovery, a reconnecting peer sends a chain of events spanning the entire partition duration — most are >10s old by wall time. Without an exemption, the staleness mechanism would reject most of the chain, leaving dangling references from surviving tip events to rejected ancestors.
 
@@ -514,7 +517,7 @@ Peers in each partition continue operating independently. Each side evicts unrea
 
 1. **Staleness lineage exemption:** The reconnecting peer's event chain spans the partition duration. Most events are >10s old. The lineage exemption (§6.1) prevents the staleness mechanism from rejecting the chain — only the tip is evaluated for staleness. If the tip is fresh, the entire ancestor chain is accepted.
 
-2. **Clock merge:** Events from both sides flow via gossip. Each peer's clock grows to include all events from both partitions. Multiple heads emerge (at least one per partition lineage). Tentative `RECONCILE` runs normally against these heads.
+2. **Clock merge:** Events from both sides flow via broadcast and pull-on-demand. Each peer's clock grows to include all events from both partitions. Multiple heads emerge (at least one per partition lineage). Tentative `RECONCILE` runs normally against these heads.
 
 3. **Finalized root divergence detection and merge:** Heartbeats carry `finalized_root`. When a peer receives a heartbeat with a different `finalized_root` that isn't an ancestor of its own, it triggers `MERGE_FINALIZED`. This performs a single three-way `MergeRoots(ours, theirs, common_ancestor)` where the common ancestor is the pre-split finalized root (recovered from the intersection of both sides' `finalized_events` sets).
 
@@ -562,9 +565,9 @@ Events are processed individually via `MergeRoots`. There is no batching into wa
 
 ### 7.3.1 Merges are silent local state
 
-Merges (RECONCILE) are deterministic local computations derived entirely from the Merkle clock and `finalized_root`. They produce no events, no gossip traffic, and no DAG entries. Every peer holding the same event set independently computes the same `latest_root`.
+Merges (RECONCILE) are deterministic local computations derived entirely from the Merkle clock and `finalized_root`. They produce no events, no network traffic, and no DAG entries. Every peer holding the same event set independently computes the same `latest_root`.
 
-Only three protocol actions produce gossipsub messages:
+Only three protocol actions produce broadcast messages:
 - **LOCAL_WRITE** — new data (the event's `parents = heads` naturally reflects the post-merge state).
 - **RESOLVE_CONFLICT** — user resolution SQL, which flows through LOCAL_WRITE.
 - **HEARTBEAT** — periodic, carries current `heads` (which may reflect a post-merge single head if the peer has subsequently written).
@@ -683,7 +686,7 @@ The `LOCAL_WRITE` path does not include a pre-write sync pass. Peers write immed
 
 ### 7.8 Pluggable transport
 
-The core library uses abstract transport interfaces (`Transport`, `Gossip`, `Provider`). It does not depend on libp2p directly. The reference implementation uses libp2p GossipSub for the control plane and gRPC for the data plane, but other transports are possible. This enables testing with in-process transports and supports alternative network stacks.
+The core library uses abstract transport interfaces (`Transport`, `Gossip`, `Provider`). The protocol assumes a direct mesh (every peer can reach every other peer) but does not depend on any specific networking library. Transport implementations provide broadcast delivery for the control plane and point-to-point streams for the data plane. This enables testing with in-process transports and supports alternative network stacks (e.g., libp2p, gRPC, WebSocket).
 
 ### 7.9 Core package adaptation plan
 
@@ -722,8 +725,8 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 - Much simpler: no checkpoints, no slack duration, no commonly-known threshold
 
 **`node.go` → Merkle clock sync engine**
-- Current: CommitAd/Digest gossip → debounced sync → swarm:// fetch → epoch replay
-- New: Event/Heartbeat/StaleVote gossip → per-event chunk sync via Puller → Merkle clock reconcile
+- Current: CommitAd/Digest broadcast → debounced sync → swarm:// fetch → epoch replay
+- New: Event/Heartbeat/StaleVote broadcast → per-event chunk sync via Puller → Merkle clock reconcile
 - Major changes:
   - Replace `onCommitAd` with `onEvent`: add to Merkle clock, merge HLC, trigger chunk sync for `root_hash` via SwarmChunkStore/Puller, call reconcile
   - Replace `onDigest` with `onHeartbeat`: update `peer_hlc[sender]`, recompute `stable_hlc`, pull-on-demand for missing events
@@ -763,7 +766,7 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 **`aliases.go` → Update type re-exports**
 - Remove: `CommitAdV1`, `DigestV1`, `Checkpoint`, `BundleRequest`, `BundleHeader`, `BundledCommit`, `BundledChunk`, `CommitBundle`, `ChunkCodec`, `CommitKindEpochMerge`
 - Add: Event types from protocol (if defined there)
-- Update gossip types: `GossipEvent` changes to carry Event/Heartbeat/StaleVote instead of CommitAd/Digest
+- Update message types: `GossipEvent` changes to carry Event/Heartbeat/StaleVote instead of CommitAd/Digest
 
 #### Files to KEEP (unchanged or minimal changes)
 
@@ -778,7 +781,7 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 
 The `transport/` package interfaces also need updates:
 
-- `Gossip` interface: replace `PublishCommitAd`/`PublishDigest` with `PublishEvent`/`PublishHeartbeat`/`PublishStaleVote`
+- `Gossip` interface: replace `PublishCommitAd`/`PublishDigest` with `BroadcastEvent`/`BroadcastHeartbeat`/`BroadcastStaleVote`
 - `GossipSubscription`/`GossipEvent`: carry Event/Heartbeat/StaleVote instead of CommitAd/Digest
 - `Provider` interface: keep `ChunkStore()`/`Downloader()` for data plane; may simplify
 - `ProviderPicker`: keep — used by SwarmChunkStore for peer selection
@@ -812,13 +815,13 @@ protocol/             — wire- and identity-level types used across the system
   protocol/repo_id.go   — repo identity
   protocol/metadata.go  — commit metadata format + signing
   protocol/signer.go    — signing interface
-  protocol/messages.go  — gossip payload structs
+  protocol/messages.go  — broadcast message payload structs
 transport/            — pluggable networking boundary (no Dolt logic)
   transport/transport.go      — control plane interfaces
   transport/provider.go       — data plane provider interfaces
   transport/provider_hint.go  — best-effort provider hints + retry exclusions via context
 core/                 — synchronization engine and Dolt integration
-  core/node.go              — Node (gossip loop, heartbeat, fetch+reconcile orchestration)
+  core/node.go              — Node (message loop, heartbeat, fetch+reconcile orchestration)
   core/reconciler_core.go   — merge orchestration via Merkle clock LCA + MergeRoots
   core/db.go / core/sql.go  — Dolt SQL driver wrapper + commit helpers
   core/swarm_chunk_store.go  — SwarmChunkStore (swarm-level read-only chunk store, Puller source)
@@ -827,7 +830,7 @@ specs/                — Quint formal specification (model-checkable with Apala
 integration/          — demo + docker-based integration tests + transport implementations
   integration/main.go             — ddolt demo CLI used by tests
   integration/integration_test.go — container-per-peer test harness
-  integration/transport/          — sample transports (gossipsub, grpcswarm, overlay)
+  integration/transport/          — sample transports (libp2p gossipsub, grpcswarm, overlay)
 ```
 
 ## 9. Public Go API
@@ -836,7 +839,7 @@ Most consumers should use `Node` and treat transport as a plug-in.
 
 ### Core types
 
-- `OpenNode(cfg NodeConfig) (*Node, error)` and `(*Node).Run(ctx)` start the background gossip+heartbeat+sync loops.
+- `OpenNode(cfg NodeConfig) (*Node, error)` and `(*Node).Run(ctx)` start the background message+heartbeat+sync loops.
 - `(*Node).Commit(msg)` and `(*Node).ExecAndCommit(exec, msg)` perform local writes and automatically publish events.
 - `(*Node).Sync(ctx)` / `(*Node).SyncHint(ctx, hlc)` allow manual/one-shot sync passes (useful for CLIs/tests).
 
@@ -844,7 +847,7 @@ Most consumers should use `Node` and treat transport as a plug-in.
 - `Repo` (`RepoID{Org, RepoName}`): logical repo identity.
 - `Signer`: signs event metadata and provides `Verify` for remote signature checks.
 - `Identity` (optional): if set, incoming events are verified against peer public keys; unverifiable/invalid events are rejected.
-- `Transport`: provides (1) gossip message delivery (events, heartbeats, stale votes) and (2) a provider picker for the read-only data plane.
+- `Transport`: provides (1) broadcast message delivery (events, heartbeats, stale votes) and (2) a provider picker for the read-only data plane.
 
 ### Minimal usage (transport omitted)
 
@@ -869,7 +872,7 @@ _, _ = n.ExecAndCommit(func(tx *sql.Tx) error {
 
 Integration scaffolding lives in `integration/`:
 - `integration/main.go` contains the `ddolt` demo used by tests.
-- A libp2p GossipSub control-plane is implemented in `integration/transport/gossipsub/`.
+- A libp2p GossipSub control-plane transport is implemented in `integration/transport/gossipsub/`.
 - A data-plane is implemented in `integration/transport/grpcswarm/` by exposing Dolt's read-only chunk store for root-hash-based chunk fetching via the `SwarmChunkStore` + `Puller` pipeline.
 
 To run Docker-based integration tests, use the Taskfile (`Taskfile.yaml`):

@@ -428,7 +428,7 @@ module doltswarm_verify {
   }
 
   /// Propagate stale votes between peers.
-  /// Models the gossip of stale votes on the /doltswarm/stale/1.0 topic.
+  /// Models the broadcast of stale votes between peers.
   /// When enough peers vote stale (≥ REJECTION_RATIO%), the event is rejected.
   action do_stale_vote(p: PeerID, q: PeerID): bool = {
     val st_p = nodes.get(p)
