@@ -153,7 +153,7 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 | `finalized_events` | `Set[EventCID]` | Events that have been finalized |
 | `stale_votes` | `Map[EventCID, Set[PeerID]]` | Peers that voted to reject an event |
 | `rejected_events` | `Set[EventCID]` | Globally rejected events (≥30% voted stale) |
-| `parked_conflicts` | `Map[EventCID, MergeResult]` | Parked events (later in total order, conflicted at merge). Excluded from active heads, LOCAL_WRITE parents, reconciliation, and finalization. Awaiting human resolution. |
+| `parked_conflicts` | `Map[EventCID, MergeResult]` | Parked events (later in total order, conflicted at merge). Excluded from LOCAL_WRITE parents and finalization. Included in reconciliation (RECONCILE recomputes parking from all heads each invocation). Awaiting human resolution. |
 | `partition_conflict` | `Option[PartitionConflict]` | Active finalized-layer conflict from partition recovery. When set, `ADVANCE_STABILITY` is blocked until resolved via `RESOLVE_PARTITION_CONFLICT`. `LOCAL_WRITE` and tentative reconciliation continue normally. |
 | `active_peers` | `Set[PeerID]` | Peers seen in the last heartbeat window |
 
@@ -401,6 +401,7 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 - **`StaleVote`/`StaleReason` types:** The protocol defines `StaleVote` and `StaleReason` as explicit message types (§2.1). The spec does not model these as types — stale votes are entries in the `stale_votes` map, propagated between peers via `do_stale_vote`. The `StaleReason` enum is not needed since the spec only models the `TooOld` case (wall-time staleness).
 - **Stale vote delivery:** The protocol (§2.4 RECEIVE_EVENT step 3) broadcasts a `StaleVote` message to all peers. The spec's `do_receive` adds a self-vote to local `stale_votes` only. Cross-peer propagation happens asynchronously via `do_stale_vote(p, q)`, which copies vote sets between connected peers. The reachable states are the same — votes eventually propagate to all connected peers.
 - **Event-only inbox:** The spec's `inbox: PeerID → Set[Event]` carries only `Event` messages. Heartbeats use direct state reads (`do_heartbeat`) and stale votes use peer-to-peer propagation (`do_stale_vote`). This follows from the "heartbeat as direct state read" simplification above and avoids modeling three separate message types in the inbox.
+- **Partition-conflict resolution adoption:** The protocol (§2.4 RESOLVE_PARTITION_CONFLICT step 8) specifies that when a peer receives a resolution event from another peer that had the same `partition_conflict`, it adopts the resolved `finalized_root` and `finalized_events` union, clearing its own `partition_conflict`. The spec's `do_receive` does not implement this adoption path — it processes the resolution event as a normal event via reconciliation. In the spec, each peer's `partition_conflict` is only cleared by its own `do_resolve_partition_conflict` action. This is a safe under-approximation: each peer resolves independently, exercising more states. The adoption optimization (one peer resolves, others adopt) is document- and implementation-only.
 
 To run the spec: `task quint:run`
 
