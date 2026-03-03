@@ -73,6 +73,8 @@ module doltswarm_verify {
 
   var nodes: PeerID -> NodeState
   var inbox: PeerID -> Set[Event]
+  /// History variable: tracks previous stable_hlc per peer for monotonicity check.
+  var prev_stable_hlc: PeerID -> HLC
 
   // ===========================================================================
   // Helpers
@@ -192,6 +194,7 @@ module doltswarm_verify {
       localWall: 1,
     }),
     inbox' = PEERS.mapBy(_ => Set()),
+    prev_stable_hlc' = PEERS.mapBy(_ => ZERO),
   }
 
   /// A peer creates a local write event.
@@ -220,6 +223,7 @@ module doltswarm_verify {
           hlc_clock: newHLC,
         }),
         inbox' = broadcast(inbox, event),
+        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
       }
     }
   }
@@ -270,6 +274,7 @@ module doltswarm_verify {
           stale_votes: newStaleVotes,
         }),
         inbox' = inbox,
+        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
       }
     }
   }
@@ -328,12 +333,14 @@ module doltswarm_verify {
               pending_conflicts: st_p.pending_conflicts.setRemove(eventCID),
             }),
             inbox' = inbox,
+            prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
           }
         } else {
           // Not yet rejected, just update votes
           all {
             nodes' = nodes.set(p, { ...st_p, stale_votes: updatedVotes }),
             inbox' = inbox,
+            prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
           }
         }
       }
@@ -362,6 +369,7 @@ module doltswarm_verify {
           pending_conflicts: st.pending_conflicts.union(conflicts),
         }),
         inbox' = inbox,
+        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
       }
     }
   }
@@ -373,6 +381,7 @@ module doltswarm_verify {
       st.localWall < MAX_WALL,
       nodes' = nodes.set(p, { ...st, localWall: st.localWall + 1 }),
       inbox' = inbox,
+      prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
     }
   }
 
@@ -398,6 +407,7 @@ module doltswarm_verify {
           stable_hlc: newStable,
         }),
         inbox' = inbox,
+        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
       }
     }
   }
@@ -426,6 +436,7 @@ module doltswarm_verify {
           finalized_events: newFinalizedEvents,
         }),
         inbox' = inbox,
+        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
       }
     }
   }
@@ -509,6 +520,9 @@ module doltswarm_verify {
     )
   })
 
-  // Stability monotonicity: stable_hlc never decreases.
-  // (Checked implicitly by the heartbeat logic using hlcMax.)
+  /// Stability monotonicity (INV6): stable_hlc never decreases.
+  /// Uses the prev_stable_hlc history variable to compare across transitions.
+  val inv_stability_monotonicity = PEERS.forall(p => {
+    leq(prev_stable_hlc.get(p), nodes.get(p).stable_hlc)
+  })
 }

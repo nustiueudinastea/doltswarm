@@ -206,7 +206,8 @@ Precondition: `pending_conflicts[peer]` is empty.
 #### RECEIVE_STALE_VOTE(peer, vote) → unit
 
 1. `stale_votes[vote.event] ← stale_votes[vote.event] ∪ {vote.voter}`.
-2. If `|stale_votes[vote.event]| ≥ ceil(0.3 × |active_peers|)`:
+2. If `vote.event ∈ finalized_events`: ignore (already finalized, cannot be rejected).
+3. If `|stale_votes[vote.event]| ≥ ceil(0.3 × |active_peers|)`:
    - `rejected_events ← rejected_events ∪ {vote.event}`.
    - Remove event from `clock`, recompute `heads`.
    - If event was already merged, roll back: replay non-rejected events from `finalized_root`.
@@ -248,9 +249,10 @@ Every 2 seconds:
 On receive from peer `q`:
 
 1. `peer_hlc[q] ← max(peer_hlc[q], received.hlc)`.
-2. `active_peers ← active_peers ∪ {q}`.
-3. `stable_hlc ← min(peer_hlc[p] for p in active_peers)`.
-4. If receiver is missing events referenced by sender's `heads`, request them (pull-on-demand).
+2. `peer_hlc[self] ← max(peer_hlc[self], hlc)` (a peer always knows its own clock is at least this advanced; without this, `stable_hlc` could be held back by the peer's own stale entry).
+3. `active_peers ← active_peers ∪ {q}`.
+4. `stable_hlc ← min(peer_hlc[p] for p in active_peers)`.
+5. If receiver is missing events referenced by sender's `heads`, request them (pull-on-demand).
 
 #### ADVANCE_STABILITY(peer) → unit
 
@@ -307,6 +309,8 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 **INV7 — Rejection Consistency:** If ≥30% of `active_peers` vote stale on event `e`, then eventually all peers mark `e` as rejected.
 
 **INV8 — Conflict Visibility:** Every `MergeConflict` result is surfaced to the user. No conflict is auto-resolved or silently discarded.
+
+**INV9 — Finalization/Rejection Exclusivity:** No event is both finalized and rejected. `finalized_events ∩ rejected_events = ∅` on every peer.
 
 ---
 
