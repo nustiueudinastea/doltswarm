@@ -139,7 +139,10 @@ module doltswarm_verify {
     // are exercised in post-finalization and partition-recovery scenarios.
     else if (CONTENTS.contains(ours) and CONTENTS.contains(theirs))
       CONFLICT_HASH
-    else ours + theirs + ancestor  // deterministic combined hash
+    // Hash combination that cannot collide with sentinels:
+    // Result is always >= 1000, well above CONTENTS (100, 200),
+    // EMPTY_ROOT (0), and CONFLICT_HASH (-1).
+    else 1000 + ours * 31 + theirs * 17 + ancestor * 7
   }
 
   /// Compute heads from the clock structure (order-independent).

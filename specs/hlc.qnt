@@ -23,6 +23,11 @@ module hlc {
   pure val ZERO: HLC = { wall: 0, logical: 0, peer: 0 }
 
   /// Total order: (wall, logical, peer) lexicographic comparison.
+  /// NOTE: PeerID tiebreaker creates a static priority bias (lower PeerID
+  /// always wins ties). This is a fairness concern, not a correctness concern —
+  /// no invariant is affected. In practice, nanosecond-precision wall times
+  /// make ties rare. A hash-based tiebreaker could distribute bias randomly
+  /// at the cost of more expensive comparison.
   pure def less(a: HLC, b: HLC): bool =
     if (a.wall != b.wall) a.wall < b.wall
     else if (a.logical != b.logical) a.logical < b.logical
