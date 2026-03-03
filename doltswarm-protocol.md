@@ -330,7 +330,7 @@ User provides `resolution_ops` (SQL that fixes conflicting rows/schema from the 
 5. `partition_conflict ← None`.
 6. **Re-anchor tentative events** against the new `finalized_root`. Replay all non-finalized, non-rejected events via `RECONCILE`.
 7. `ADVANCE_STABILITY` resumes.
-8. Broadcast resolution as a special event so all peers converge to the same `finalized_root`.
+8. **Broadcast resolution:** Create a new `Event` with `root_hash = resolved_root`, `parents = current heads` (subsuming all active lineages), and publish on `/doltswarm/events/1.0`. This event flows through normal `RECEIVE_EVENT` on other peers. When a peer receives this event and detects it resolves their own `partition_conflict` (the event's root is from a peer that had the same conflict), it adopts the resolved `finalized_root` and `finalized_events` union, clearing its own `partition_conflict`. Peers without an active partition conflict process the event normally via `RECONCILE`.
 
 #### PEER_JOIN(new_peer) → unit
 
@@ -370,6 +370,11 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 ## 3. Quint Formal Specification
 
 The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qnt` for the model-checkable specification with invariants. The spec is the source of truth for the **core state machine**: event write, receive, reconcile, heartbeat, finalize, stale-vote/rejection, **tentative conflict resolution** (resolve_conflict), **network partitions** (connectivity model, peer eviction), **partition recovery** (merge_finalized, resolve_partition_conflict), and **staleness lineage exemption**. Signature verification and data-plane transfer (chunk fetching) are specified only in this document — they are not yet modeled in the Quint spec. `EPOCH_FORCE_FINALIZE` is not modeled (timeout-based fallback, difficult to express as a model-checkable action). Membership actions (join, leave) are partially modeled: eviction and reconnection (via heartbeat re-adding to active_peers) are in the spec; graceful join/leave are document-only.
+
+**Modeling notes (spec vs. this document):**
+
+- **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) specifies sorting all newly-stable events by total order and replaying them in a single batch. The Quint spec instead finalizes one nondeterministic candidate per step, then recomputes `computeFinalizedRoot` from scratch over the full finalized event set. Because `computeFinalizedRoot` is a pure function of the event set (it sorts internally), both approaches produce the same finalized root regardless of finalization order. The spec's approach is easier to model-check.
+- **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The Quint spec models this asymmetry: `do_merge_finalized` assigns ours/theirs deterministically (lower finalized root value = "ours") matching the protocol's HLC-based assignment (§2.4 MERGE_FINALIZED step 3).
 
 To run the spec: `task quint:run`
 
