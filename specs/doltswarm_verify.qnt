@@ -122,13 +122,8 @@ module doltswarm_verify {
   /// partition conflicts and post-finalization tentative conflicts are
   /// exercised realistically.
   ///
-  /// NOTE: This uses finalized_root as the merge ancestor, not an LCA-derived
-  /// ancestor from the Merkle clock DAG. The protocol doc (§2.4 step 3a)
-  /// specifies LCA-based ancestors, but implementing LCA in the model checker
-  /// would significantly increase the state space. Using finalized_root is a
-  /// sound over-approximation: it may produce more conflicts than LCA would
-  /// (since finalized_root is always an ancestor of or equal to the LCA),
-  /// but it will not miss conflicts that LCA would detect.
+  /// The merge ancestor for all reconciliation merges is finalized_root,
+  /// matching the protocol (§2.4 RECONCILE step 3a).
   pure def mergeRoots(ours: Hash, theirs: Hash, ancestor: Hash): Hash = {
     if (ours == theirs) ours
     else if (ours == ancestor) theirs

@@ -201,7 +201,7 @@ No conflict precondition — writes are never blocked.
 1. If `|heads| ≤ 1`: nothing to do.
 2. Sort `heads` by HLC total order (deterministic).
 3. For each head `h` (in sorted order), fold into the accumulated root:
-   a. **Ancestor selection:** Ideally, find the **LCA** in the Merkle clock DAG between the accumulated state and `h` → `ancestor_event`, then `ancestor_root = ancestor_event.root_hash`. If LCA is not found, fall back to `finalized_root`. **Current simplification:** both the Quint spec and Go implementation use `finalized_root` as the ancestor for all merges (no LCA computation). This is sound but may produce more conflicts than necessary.
+   a. `ancestor_root = finalized_root`. The merge ancestor for all reconciliation merges is the current `finalized_root`.
    b. `result = MergeRoots(current_root, clock[h].root_hash, ancestor_root)`.
    c. Match:
       - `Ok(merged)`: `current_root ← merged`.
@@ -235,7 +235,7 @@ On receive from peer `q`:
 3. `active_peers ← active_peers ∪ {q}`.
 4. `stable_hlc ← min(peer_hlc[p] for p in active_peers)`.
 5. If receiver is missing events referenced by sender's `heads`, request them (pull-on-demand).
-6. **Partition divergence detection:** If `received.finalized_root ≠ finalized_root` and neither root is an ancestor of the other (i.e., they diverged independently during a partition), trigger `MERGE_FINALIZED(peer, received.finalized_root)`. See §6.8.
+6. **Partition divergence detection:** If `received.finalized_root ≠ finalized_root` and neither root is an ancestor of the other (i.e., they diverged independently during a partition), trigger `MERGE_FINALIZED(peer, received.finalized_root)`. See §6.6.
 
 #### ADVANCE_STABILITY(peer) → unit
 
@@ -362,7 +362,6 @@ To run the spec: `task quint:run`
 | **HLC Module** | In-memory per peer | Embedded in events + heartbeats |
 | **Heartbeat** | In-memory peer tracking | Broadcast (Heartbeat messages) |
 | **Total Order** | Pure computation | N/A |
-| **LCA Finder** | Pure computation over clock | N/A |
 | **Event Signer** | N/A (pluggable `Signer`) | Signature embedded in events |
 | **Chunk Sync** | Calls ChunkStore APIs | Point-to-point streams for chunk requests |
 | **Reconciliation Loop** | Calls Dolt Go APIs | N/A (local after chunk sync) |
@@ -383,9 +382,6 @@ RECEIVE_EVENT(e)
   ├─► ChunkSync(e.root_hash, e.peer) ► walk prolly tree from root
   │     p2p stream to e.peer               ChunkStore.HasMany (missing?)
   │                                        ChunkStore.PutMany (store)
-  │
-  ├─► find_lca(clock, h1, h2)
-  │     walks in-memory Merkle clock
   │
   ├─► MergeRoots(ours, theirs, anc) ──► merge/merge.go
   │     Ok  → latest_root = merged
@@ -440,23 +436,19 @@ All conflicts are resolved deterministically using the HLC total order. When `Me
 
 All peers independently compute the same parked set from the same events — no coordination needed. No peer is blocked from writing. Parked events surface as conflicts for human resolution via `RESOLVE_CONFLICT`. The author of the parked event is in the best position to resolve, since they know what they intended.
 
-### 6.3 No Common Ancestor
-
-`find_lca` returns nothing. Use `finalized_root` as ancestor (or `EMPTY_ROOT`). All rows treated as insertions. Identical rows auto-merge. Schema clashes on same table → conflict per §6.2.
-
-### 6.4 Peer Goes Offline
+### 6.3 Peer Goes Offline
 
 Heartbeats stop. After `HEARTBEAT_TIMEOUT` (10s), each remaining peer independently evicts. `stable_hlc` recomputes, finalization resumes. No coordination. When peer returns: `PEER_JOIN` — shallow clone from finalized state, catch up clock, re-enter via heartbeat.
 
-### 6.5 Forced Epoch Finalization
+### 6.4 Forced Epoch Finalization
 
 `stable_hlc` stuck for `EPOCH_TIMEOUT` (60s). Evict blocking peer(s). Recompute, advance stability. Fallback only — causal stability handles normal case.
 
-### 6.6 Concurrent Schema Changes
+### 6.5 Concurrent Schema Changes
 
 Same pipeline as data conflicts. `SchemaMerge` auto-resolves where possible (e.g., both add different columns). Non-resolvable cases → conflict → user.
 
-### 6.7 Network Partition
+### 6.6 Network Partition
 
 Peers in each partition continue operating independently. Each side evicts unreachable peers after `HEARTBEAT_TIMEOUT`, reduces `active_peers`, and finalizes independently under its reduced membership. Both sides' finalized histories diverge.
 
@@ -520,7 +512,7 @@ When an `IdentityResolver` is configured on a peer, incoming events are verified
 
 ### 7.3 No epoch grouping
 
-Events are processed individually via `MergeRoots`. There is no batching into wall-time epochs. Each event triggers its own merge operation with the ancestor discovered via LCA in the Merkle clock. This is simpler than epoch-based batching and avoids epoch boundary edge cases.
+Events are processed individually via `MergeRoots`. There is no batching into wall-time epochs. Each event triggers its own merge operation with `finalized_root` as the merge ancestor. This is simpler than epoch-based batching and avoids epoch boundary edge cases.
 
 ### 7.3.1 Merges are silent local state
 
@@ -665,8 +657,8 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 
 **`index.go` → Merkle clock interface**
 - Current: `CommitIndex` with HLC-keyed entries, checkpoints, finalized base
-- New: `MerkleClock` interface with event DAG, heads tracking, LCA computation
-- Key methods: `AddEvent(e Event)`, `Heads() []EventCID`, `LCA(h1, h2 EventCID) (EventCID, bool)`, `GetEvent(cid EventCID) (Event, bool)`, `AllEvents() map[EventCID]Event`
+- New: `MerkleClock` interface with event DAG, heads tracking
+- Key methods: `AddEvent(e Event)`, `Heads() []EventCID`, `GetEvent(cid EventCID) (Event, bool)`, `AllEvents() map[EventCID]Event`
 
 **`index_mem.go` → In-memory Merkle clock**
 - Current: `MemoryCommitIndex` with LRU map of HLC→entry
@@ -674,9 +666,9 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 
 **`reconciler_core.go` → Merkle clock reconciliation**
 - Current: `ReplayImportedEpochMerges` — epoch grouping, temp branch, HLC-sorted replay, FWW on conflict
-- New: `Reconcile` — sort ALL heads by HLC, fold-merge via `MergeRoots` with `finalized_root` as ancestor (LCA as future optimization). Compute the complete parked set from scratch each invocation (pure function of heads, clock, finalized_root). On conflict: park the later event (by HLC total order), notify user. Create tentative Dolt commit for the merged result.
+- New: `Reconcile` — sort ALL heads by HLC, fold-merge via `MergeRoots` with `finalized_root` as ancestor. Compute the complete parked set from scratch each invocation (pure function of heads, clock, finalized_root). On conflict: park the later event (by HLC total order), notify user. Create tentative Dolt commit for the merged result.
 - Remove: epoch metadata, FWW conflict resolution, parent chain collapsing, replay stall detection
-- Add: LCA computation (ancestor set intersection), conflict surfacing, conflict resolution path
+- Add: conflict surfacing, conflict resolution path
 
 **`finalization.go` → Causal stability finalization**
 - Current: Checkpoint-based watermarks with slack, `ComputeWatermark` from peer activity
@@ -778,10 +770,10 @@ transport/            — pluggable networking boundary (no Dolt logic)
   transport/provider_hint.go  — best-effort provider hints + retry exclusions via context
 core/                 — synchronization engine and Dolt integration
   core/node.go              — Node (message loop, heartbeat, fetch+reconcile orchestration)
-  core/reconciler_core.go   — merge orchestration via Merkle clock LCA + MergeRoots
+  core/reconciler_core.go   — merge orchestration via MergeRoots with finalized_root ancestor
   core/db.go / core/sql.go  — Dolt SQL driver wrapper + commit helpers
   core/swarm_chunk_store.go  — SwarmChunkStore (swarm-level read-only chunk store, Puller source)
-  core/index.go / core/index_mem.go — in-memory Merkle clock (event DAG, heads, LCA)
+  core/index.go / core/index_mem.go — in-memory Merkle clock (event DAG, heads)
 specs/                — Quint formal specification (model-checkable with Apalache)
 integration/          — demo + docker-based integration tests + transport implementations
   integration/main.go             — ddolt demo CLI used by tests
