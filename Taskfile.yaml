@@ -173,7 +173,8 @@ tasks:
         {{if .INVARIANT}}
           quint run doltswarm_verify.qnt --invariant={{.INVARIANT}} --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
         {{else}}
-          for inv in inv_clock_convergence inv_finalized_agreement inv_no_finalized_rejected_overlap inv_data_convergence inv_rejection_threshold inv_conflict_visibility inv_stability_monotonicity; do
+          INVS=$(grep -o 'val inv_[a-z_]*' doltswarm_verify.qnt | sed 's/val //')
+          for inv in $INVS; do
             echo "=== Checking $inv ==="
             quint run doltswarm_verify.qnt --invariant=$inv --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
           done

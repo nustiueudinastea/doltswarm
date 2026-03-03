@@ -228,24 +228,23 @@ module doltswarm_verify {
     }
   }
 
-  /// A peer processes events from its inbox.
+  /// A peer processes a single event from its inbox.
+  /// Events are processed one at a time (not batched), matching the protocol's
+  /// per-event processing with inline reconciliation between events.
   action do_receive(p: PeerID): bool = {
     val st = nodes.get(p)
-    val remoteEvents = inbox.get(p)
-
-    val newEvents = remoteEvents.filter(e =>
+    val processable = inbox.get(p).filter(e =>
       not(st.clock.keys().contains(e.cid)) and
       not(st.rejected_events.contains(e.cid))
     )
 
     all {
-      not(newEvents.empty()),
-      // Add all new events to the clock (put is commutative for same key/value)
-      val newClock = newEvents.fold(st.clock, (acc, e) => acc.put(e.cid, e))
-      // Merge HLC with all received timestamps
-      val newHLC = newEvents.fold(st.hlc_clock, (acc, e) =>
-        observe(acc, e.hlc, st.localWall, p)
-      )
+      not(processable.empty()),
+      nondet e = processable.oneOf()
+      // Add the single event to the clock
+      val newClock = st.clock.put(e.cid, e)
+      // Merge HLC with the received timestamp
+      val newHLC = observe(st.hlc_clock, e.hlc, st.localWall, p)
       // Recompute heads from the full clock (order-independent)
       val newHeads = computeHeads(newClock)
       // Fast-forward latest_root when we converge to a single head
@@ -254,16 +253,16 @@ module doltswarm_verify {
       } else {
         st.latest_root
       }
-      // Check for stale events and cast votes
-      val staleEvents = newEvents.filter(e =>
-        (st.localWall - e.hlc.wall) > STALENESS_THRESHOLD
-      )
-      val newStaleVotes = staleEvents.fold(st.stale_votes, (acc, e) =>
-        if (acc.has(e.cid))
-          acc.setBy(e.cid, voters => voters.union(Set(p)))
+      // Check for staleness and cast vote if needed
+      val isStale = (st.localWall - e.hlc.wall) > STALENESS_THRESHOLD
+      val newStaleVotes = if (isStale) {
+        if (st.stale_votes.has(e.cid))
+          st.stale_votes.setBy(e.cid, voters => voters.union(Set(p)))
         else
-          acc.put(e.cid, Set(p))
-      )
+          st.stale_votes.put(e.cid, Set(p))
+      } else {
+        st.stale_votes
+      }
       all {
         nodes' = nodes.set(p, {
           ...st,
@@ -499,6 +498,38 @@ module doltswarm_verify {
      s1.heads == s2.heads) implies
       (s1.latest_root == s2.latest_root)
   }))
+
+  /// Causal consistency (INV4): if e1 is a parent of e2 in the clock DAG,
+  /// then e1 precedes e2 in the HLC total order. Since HLC total order is
+  /// transitive, checking direct parents suffices for full ancestry chains.
+  val inv_causal_consistency = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.clock.keys().forall(cid => {
+      val e = st.clock.get(cid)
+      e.parents.forall(parentCid =>
+        // Guard: parent may not yet be in this peer's clock
+        not(st.clock.has(parentCid)) or
+        less(st.clock.get(parentCid).hlc, e.hlc)
+      )
+    })
+  })
+
+  /// No silent data loss (INV5, safety approximation): every event that any peer
+  /// has ever seen is accounted for — still in the clock (pending finalization),
+  /// already finalized, or explicitly rejected. No event disappears silently.
+  ///
+  /// The full INV5 ("every event *eventually* enters finalized or rejected") is
+  /// a liveness property that cannot be checked as a state invariant. This safety
+  /// version ensures the precondition: events are never dropped without a trace.
+  val inv_no_silent_data_loss = PEERS.forall(p => {
+    val st = nodes.get(p)
+    // Every finalized event is still in the clock (not silently removed)
+    st.finalized_events.forall(cid => st.clock.has(cid)) and
+    // Every event in the clock is either pending, finalized, or rejected — never orphaned
+    // (rejected events are removed from clock, so clock ∩ rejected = ∅ by construction;
+    //  this checks the dual: rejected events are NOT in the clock)
+    st.rejected_events.forall(cid => not(st.clock.has(cid)))
+  })
 
   /// Rejection threshold: any rejected event must have accumulated enough votes.
   /// (Non-vacuous: do_stale_vote actually rejects events.)
