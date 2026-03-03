@@ -62,7 +62,7 @@ module doltswarm_verify {
     finalized_events: Set[EventCID],
     stale_votes: EventCID -> Set[PeerID],
     rejected_events: Set[EventCID],
-    pending_conflicts: Set[EventCID],
+    parked_conflicts: Set[EventCID],
     active_peers: Set[PeerID],
     localWall: int,
   }
@@ -149,9 +149,11 @@ module doltswarm_verify {
   }
 
   /// Deterministic merged root for a set of heads.
+  /// Operates on ALL heads (not pre-filtered by existing parked_conflicts).
   /// Sorts heads by HLC and folds mergeRoots left-to-right.
-  /// Returns (merged_root, conflict_cids) where conflict_cids is the set
-  /// of head CIDs that produced a conflict during merge.
+  /// Returns (merged_root, parked_set) where parked_set is the COMPLETE set
+  /// of parked events (not a delta). This makes parking a pure function of
+  /// (heads, clock, finalized_root), independent of event receipt order.
   pure def computeMergedRoot(st: NodeState): (Hash, Set[EventCID]) = {
     if (st.heads.size() <= 1) {
       val root = st.heads.fold(st.finalized_root, (_, cid) => st.clock.get(cid).root_hash)
@@ -189,7 +191,7 @@ module doltswarm_verify {
       finalized_events: Set(),
       stale_votes: Map(),
       rejected_events: Set(),
-      pending_conflicts: Set(),
+      parked_conflicts: Set(),
       active_peers: PEERS,
       localWall: 1,
     }),
@@ -198,29 +200,42 @@ module doltswarm_verify {
   }
 
   /// A peer creates a local write event.
+  /// Parents are active_heads (excluding parked). After writing, parked_conflicts
+  /// are recomputed from the new head set to maintain the invariant that parking
+  /// is a pure function of (heads, clock, finalized_root).
   action do_write(p: PeerID, content: int): bool = {
     val st = nodes.get(p)
     all {
       st.localWall <= MAX_WALL,
       st.clock.keys().size() < MAX_EVENTS,
-      st.pending_conflicts == Set(),  // no write during conflict
       val newHLC = tick(st.hlc_clock, st.localWall, p)
       val newCID = makeEventCID(p, newHLC.wall, newHLC.logical)
+      val activeHeads = st.heads.exclude(st.parked_conflicts)
       val event: Event = {
         cid: newCID,
         root_hash: content,
-        parents: st.heads,
+        parents: activeHeads,
         hlc: newHLC,
         peer: p,
       }
       val newClock = st.clock.put(newCID, event)
+      val newHeads = computeHeads(newClock)
+      // Recompute parking for the new head set
+      val postWriteState: NodeState = { ...st, clock: newClock, heads: newHeads, hlc_clock: newHLC }
+      val reconcileResult = if (newHeads.size() > 1) {
+        computeMergedRoot(postWriteState)
+      } else {
+        (content, Set())
+      }
+      val newParkedConflicts = reconcileResult._2
       all {
         nodes' = nodes.set(p, {
           ...st,
           clock: newClock,
-          heads: computeHeads(newClock),
+          heads: newHeads,
           latest_root: content,
           hlc_clock: newHLC,
+          parked_conflicts: newParkedConflicts,
         }),
         inbox' = broadcast(inbox, event),
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
@@ -231,6 +246,9 @@ module doltswarm_verify {
   /// A peer processes a single event from its inbox.
   /// Events are processed one at a time (not batched), matching the protocol's
   /// per-event processing with inline reconciliation between events.
+  /// Reconciliation is inlined here (matching §2.4 RECEIVE_EVENT step 9):
+  /// when receiving creates multiple active heads, immediately compute the
+  /// merged root and park any conflicts.
   action do_receive(p: PeerID): bool = {
     val st = nodes.get(p)
     val processable = inbox.get(p).filter(e =>
@@ -247,12 +265,6 @@ module doltswarm_verify {
       val newHLC = observe(st.hlc_clock, e.hlc, st.localWall, p)
       // Recompute heads from the full clock (order-independent)
       val newHeads = computeHeads(newClock)
-      // Fast-forward latest_root when we converge to a single head
-      val newLatestRoot = if (newHeads.size() == 1) {
-        newHeads.fold(EMPTY_ROOT, (_, cid) => newClock.get(cid).root_hash)
-      } else {
-        st.latest_root
-      }
       // Check for staleness and cast vote if needed
       val isStale = (st.localWall - e.hlc.wall) > STALENESS_THRESHOLD
       val newStaleVotes = if (isStale) {
@@ -263,14 +275,31 @@ module doltswarm_verify {
       } else {
         st.stale_votes
       }
+      // Inline reconciliation (§2.4 step 9): if multiple heads,
+      // compute merged root and park any conflicts. computeMergedRoot
+      // operates on ALL heads and returns the complete parked set,
+      // making parking a pure function of (heads, clock, finalized_root).
+      val tempState: NodeState = {
+        ...st,
+        clock: newClock,
+        heads: newHeads,
+        hlc_clock: newHLC,
+        stale_votes: newStaleVotes,
+      }
+      val reconcileResult = if (newHeads.size() > 1) {
+        computeMergedRoot(tempState)
+      } else {
+        // Single or zero heads: no reconciliation needed
+        val root = newHeads.fold(st.finalized_root, (_, cid) => newClock.get(cid).root_hash)
+        (root, Set())
+      }
+      val newLatestRoot = reconcileResult._1
+      val newParkedConflicts = reconcileResult._2
       all {
         nodes' = nodes.set(p, {
-          ...st,
-          clock: newClock,
-          heads: newHeads,
-          hlc_clock: newHLC,
+          ...tempState,
           latest_root: newLatestRoot,
-          stale_votes: newStaleVotes,
+          parked_conflicts: newParkedConflicts,
         }),
         inbox' = inbox,
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
@@ -308,19 +337,26 @@ module doltswarm_verify {
           not(st_p.rejected_events.contains(eventCID)) and
           not(st_p.finalized_events.contains(eventCID))
         if (shouldReject and st_p.clock.has(eventCID)) {
-          // Reject: remove from clock, recompute heads and latest_root
+          // Reject: remove from clock, recompute heads, latest_root, and parking
           val evt = st_p.clock.get(eventCID)
           val cleanedClock = st_p.clock.mapRemove(eventCID)
           val cleanedHeads = computeHeads(cleanedClock)
-          // Recompute latest_root: if single head remains, use its root_hash;
-          // if no events remain, fall back to finalized_root.
-          val newLatestRoot = if (cleanedHeads.size() == 1) {
-            cleanedHeads.fold(EMPTY_ROOT, (_, cid) => cleanedClock.get(cid).root_hash)
-          } else if (cleanedHeads.size() == 0) {
-            st_p.finalized_root
-          } else {
-            st_p.latest_root  // multiple heads: reconcile will fix it
+          // Recompute parking and latest_root from the cleaned state
+          val cleanedState: NodeState = {
+            ...st_p,
+            clock: cleanedClock,
+            heads: cleanedHeads,
           }
+          val reconcileResult = if (cleanedHeads.size() > 1) {
+            computeMergedRoot(cleanedState)
+          } else if (cleanedHeads.size() == 1) {
+            val root = cleanedHeads.fold(EMPTY_ROOT, (_, cid) => cleanedClock.get(cid).root_hash)
+            (root, Set())
+          } else {
+            (st_p.finalized_root, Set())
+          }
+          val newLatestRoot = reconcileResult._1
+          val newParkedConflicts = reconcileResult._2
           all {
             nodes' = nodes.set(p, {
               ...st_p,
@@ -329,7 +365,7 @@ module doltswarm_verify {
               latest_root: newLatestRoot,
               stale_votes: updatedVotes,
               rejected_events: st_p.rejected_events.union(Set(eventCID)),
-              pending_conflicts: st_p.pending_conflicts.setRemove(eventCID),
+              parked_conflicts: newParkedConflicts,
             }),
             inbox' = inbox,
             prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
@@ -350,22 +386,23 @@ module doltswarm_verify {
   /// Merges are deterministic local computations — no event is created,
   /// nothing is broadcast. Every peer with the same event set independently
   /// computes the same merged root. The next LOCAL_WRITE will have
-  /// parents = all current heads, which collapses them in the DAG.
+  /// parents = active_heads (excluding parked), which collapses them in the DAG.
   ///
-  /// If mergeRoots returns a conflict, the conflicting head is added to
-  /// pending_conflicts and latest_root is not updated for that head.
+  /// computeMergedRoot operates on ALL heads and returns the complete parked
+  /// set (not a delta), making parking a pure function of (heads, clock,
+  /// finalized_root). No peer is blocked from writing.
   action do_reconcile(p: PeerID): bool = {
     val st = nodes.get(p)
     all {
       st.heads.size() > 1,
       val result = computeMergedRoot(st)
       val merged = result._1
-      val conflicts = result._2
+      val parked = result._2
       all {
         nodes' = nodes.set(p, {
           ...st,
           latest_root: merged,
-          pending_conflicts: st.pending_conflicts.union(conflicts),
+          parked_conflicts: parked,
         }),
         inbox' = inbox,
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
@@ -421,7 +458,8 @@ module doltswarm_verify {
       val e = st.clock.get(cid)
       less(e.hlc, st.stable_hlc) and
       not(st.finalized_events.contains(cid)) and
-      not(st.rejected_events.contains(cid))
+      not(st.rejected_events.contains(cid)) and
+      not(st.parked_conflicts.contains(cid))
     )
     all {
       not(candidates.empty()),
@@ -482,12 +520,6 @@ module doltswarm_verify {
     st.finalized_events.intersect(st.rejected_events) == Set()
   })
 
-  // No write during pending conflict: enforced by do_write's precondition
-  // `st.pending_conflicts == Set()`. This is a temporal property (action
-  // ordering) that cannot be expressed as a state invariant without ghost
-  // variables. The precondition prevents do_write from firing when conflicts
-  // exist, so the property holds by construction.
-
   /// Data convergence: peers with the same events and single head agree on latest_root.
   /// (After reconciliation, peers with same clock should converge.)
   val inv_data_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
@@ -543,10 +575,10 @@ module doltswarm_verify {
     )
   })
 
-  /// Conflict visibility: every pending conflict references a known event.
+  /// Conflict visibility: every parked conflict references a known event.
   val inv_conflict_visibility = PEERS.forall(p => {
     val st = nodes.get(p)
-    st.pending_conflicts.forall(cid =>
+    st.parked_conflicts.forall(cid =>
       st.clock.has(cid) or st.rejected_events.contains(cid)
     )
   })
@@ -556,4 +588,16 @@ module doltswarm_verify {
   val inv_stability_monotonicity = PEERS.forall(p => {
     leq(prev_stable_hlc.get(p), nodes.get(p).stable_hlc)
   })
+
+  /// Parking agreement (strengthens INV8): peers with the same events and
+  /// same finalized_root deterministically agree on which events are parked.
+  /// Parked set is a pure function of (heads, clock, finalized_root) via
+  /// computeMergedRoot — no dependence on event receipt order.
+  val inv_parking_agreement = PEERS.forall(p1 => PEERS.forall(p2 => {
+    val s1 = nodes.get(p1)
+    val s2 = nodes.get(p2)
+    (s1.clock.keys() == s2.clock.keys() and
+     s1.finalized_root == s2.finalized_root) implies
+      (s1.parked_conflicts == s2.parked_conflicts)
+  }))
 }

@@ -143,7 +143,7 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 | `finalized_events` | `Set[EventCID]` | Events that have been finalized |
 | `stale_votes` | `Map[EventCID, Set[PeerID]]` | Peers that voted to reject an event |
 | `rejected_events` | `Set[EventCID]` | Globally rejected events (≥30% voted stale) |
-| `pending_conflicts` | `Map[EventCID, MergeResult]` | Unresolved conflicts awaiting user |
+| `parked_conflicts` | `Map[EventCID, MergeResult]` | Parked events (later in total order, conflicted at merge). Excluded from active heads, LOCAL_WRITE parents, reconciliation, and finalization. Awaiting human resolution. |
 | `active_peers` | `Set[PeerID]` | Peers seen in the last heartbeat window |
 
 ### 2.3 Communication Model
@@ -177,17 +177,18 @@ On event receipt:
 
 #### LOCAL_WRITE(peer, sql_ops) → Event
 
-Precondition: `pending_conflicts[peer]` is empty.
+No conflict precondition — writes are never blocked.
 
 1. Apply `sql_ops` to local Dolt instance → new `RootValue` with hash `r`.
 2. `hlc ← tick(hlc)`.
-3. `sig = Sign(r, heads, hlc, peer, op_summary)`.
-4. `e = Event { cid: hash(r, heads, hlc, peer), root_hash: r, parents: heads, hlc, peer, signature: sig }`.
-5. `clock[e.cid] ← e`.
-6. Recompute `heads` from clock (= `{e.cid}`, since all prior heads are parents of `e`).
-7. `latest_root ← r`.
-8. Create tentative local Dolt commit.
-9. Publish `e` on `/doltswarm/events/1.0`.
+3. `active_heads = heads \ parked_conflicts.keys()`.
+4. `sig = Sign(r, active_heads, hlc, peer, op_summary)`.
+5. `e = Event { cid: hash(r, active_heads, hlc, peer), root_hash: r, parents: active_heads, hlc, peer, signature: sig }`.
+6. `clock[e.cid] ← e`.
+7. Recompute `heads` from clock. Note: `computeHeads` may still return parked CIDs as heads (since no event has them as parents). That's correct — they persist as forks until resolved.
+8. `latest_root ← r`.
+9. Create tentative local Dolt commit.
+10. Publish `e` on `/doltswarm/events/1.0`.
 
 #### RECEIVE_EVENT(peer, e) → Accept | Reject
 
@@ -217,27 +218,28 @@ Precondition: `pending_conflicts[peer]` is empty.
 
 **Merges are deterministic local computations, not new information.** If peers A and B both have events `{e1, e2}` with two heads, they each independently call `MergeRoots` and arrive at the same `latest_root`. There is nothing to communicate — the merge result is fully determined by the inputs that all peers already have. No event is created, nothing is broadcast.
 
-1. If `|heads| ≤ 1`: nothing to do.
-2. Sort heads by HLC total order (deterministic).
-3. For each head `h` (in sorted order), fold into the accumulated root:
+1. `active_heads = heads \ parked_conflicts.keys()`.
+2. If `|active_heads| ≤ 1`: nothing to do.
+3. Sort `active_heads` by HLC total order (deterministic).
+4. For each head `h` (in sorted order), fold into the accumulated root:
    a. **Ancestor selection:** Ideally, find the **LCA** in the Merkle clock DAG between the accumulated state and `h` → `ancestor_event`, then `ancestor_root = ancestor_event.root_hash`. If LCA is not found, fall back to `finalized_root`. **Current simplification:** both the Quint spec and Go implementation use `finalized_root` as the ancestor for all merges (no LCA computation). This is sound but may produce more conflicts than necessary.
    b. `result = MergeRoots(current_root, clock[h].root_hash, ancestor_root)`.
    c. Match:
       - `Ok(merged)`: `current_root ← merged`.
-      - `Conflict(tables, details)`: **Reject merge. Do not apply.** Store in `pending_conflicts[h]`. Notify user.
-4. `latest_root ← current_root` (the accumulated merge result).
-5. **`heads` are unchanged.** Heads are always derived from `computeHeads(clock)` — since reconcile does not add events to the clock, the head set cannot change. Heads remain multi-valued until the next `LOCAL_WRITE`, whose `parents = heads` collapses them all in the DAG.
+      - `Conflict(tables, details)`: **Park `h`** (the later event in total order, since we fold in sorted order). Store in `parked_conflicts[h]`. `latest_root` not updated for this head. Notify `h.peer` that their event was parked due to conflict. All peers deterministically agree on which events are parked.
+5. `latest_root ← current_root` (the accumulated merge result).
+6. **`heads` are unchanged.** Heads are always derived from `computeHeads(clock)` — since reconcile does not add events to the clock, the head set cannot change. `active_heads = heads \ parked_conflicts` — shrinks as events are parked. Parked heads remain as persistent DAG forks until `RESOLVE_CONFLICT`.
 
 > **Why no merge events?** Broadcasting merges would be pure redundancy — every peer holding the same events computes the same merged state. Worse, if merge events were broadcast, concurrent merges by different peers would create new DAG forks requiring further reconciliation (an infinite merge loop). Only three things produce gossipsub traffic: `LOCAL_WRITE` (new data), `RESOLVE_CONFLICT` (user resolution, which flows through `LOCAL_WRITE`), and `HEARTBEAT` (which naturally reflects the reduced head set after merge).
 
 #### RESOLVE_CONFLICT(peer, event_cid, resolution_ops) → unit
 
-User provides `resolution_ops` (SQL that fixes conflicting rows/schema).
+User (typically the author of the parked event) provides `resolution_ops` (SQL that fixes conflicting rows/schema). Resolution is async — no peer is blocked waiting for it.
 
 1. Apply `resolution_ops` to local Dolt → `resolved_root`.
-2. Remove `event_cid` from `pending_conflicts`.
-3. Create new `Event` with `resolved_root`, parents = current heads.
-4. Normal `LOCAL_WRITE` flow from step 3.
+2. Remove `event_cid` from `parked_conflicts`.
+3. Create new `Event` with `resolved_root`, parents = heads (ALL heads, including the formerly-parked `event_cid` — this subsumes it in the DAG).
+4. Normal `LOCAL_WRITE` flow from step 4.
 
 #### HEARTBEAT(peer) → unit
 
@@ -258,7 +260,7 @@ On receive from peer `q`:
 
 Triggered when `stable_hlc` advances.
 
-1. `newly_stable = { e ∈ clock | e.hlc < stable_hlc ∧ e ∉ finalized_events ∧ e ∉ rejected_events }`.
+1. `newly_stable = { e ∈ clock | e.hlc < stable_hlc ∧ e ∉ finalized_events ∧ e ∉ rejected_events ∧ e ∉ parked_conflicts }`. Parked events cannot be finalized until resolved.
 2. Sort `newly_stable` by total order (causal → HLC → CID).
 3. Replay from `finalized_root` via `MergeRoots` → `new_finalized_root`.
 4. Materialize deterministic Dolt commits (all fields from event metadata, HLC timestamp, deterministic parents).
@@ -302,13 +304,13 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 
 **INV4 — Causal Consistency:** If `e1` is an ancestor of `e2` in the clock DAG, then `e1` precedes `e2` in the total order.
 
-**INV5 — No Silent Data Loss:** Every event either enters the finalized set, or is explicitly rejected with originator notified.
+**INV5 — No Silent Data Loss:** Every event either enters the finalized set, is explicitly rejected, or is parked (awaiting human resolution). No event disappears silently. Parked events are never subsumed in the DAG without explicit resolution.
 
 **INV6 — Stability Monotonicity:** `stable_hlc` and `finalized_root` never move backward.
 
 **INV7 — Rejection Consistency:** If ≥30% of `active_peers` vote stale on event `e`, then eventually all peers mark `e` as rejected.
 
-**INV8 — Conflict Visibility:** Every `MergeConflict` result is surfaced to the user. No conflict is auto-resolved or silently discarded.
+**INV8 — Conflict Visibility:** Every `MergeConflict` result parks the later event (by total order) and surfaces it to the user. All peers deterministically agree on which events are parked. No conflict is auto-resolved or silently discarded.
 
 **INV9 — Finalization/Rejection Exclusivity:** No event is both finalized and rejected. `finalized_events ∩ rejected_events = ∅` on every peer.
 
@@ -373,7 +375,7 @@ RECEIVE_EVENT(e)
   │
   ├─► MergeRoots(ours, theirs, anc) ──► merge/merge.go
   │     Ok  → latest_root = merged
-  │     Conflict → pending_conflicts
+  │     Conflict → parked_conflicts
   │
   ├─► [tentative] CommitDangling ──────► local Dolt commit
   │
@@ -418,7 +420,9 @@ Receiving peer votes stale, publishes on `/doltswarm/stale/1.0`. The event is st
 
 ### 6.2 Conflicts (Data or Schema)
 
-All conflicts rejected at merge step. Conflicting event stays in clock (it happened) but `latest_root` not updated. Stored in `pending_conflicts`. User provides `resolution_ops` via `RESOLVE_CONFLICT`. Peer with unresolved conflicts cannot `LOCAL_WRITE` (precondition blocks).
+All conflicts are resolved deterministically using the HLC total order. When `MergeRoots` detects a conflict between two events, the earlier event (by total order) wins and its root becomes the working state. The later event is "parked": it stays in the clock (it happened), its data is preserved, but it is excluded from the active lineage (`latest_root`, `LOCAL_WRITE` parents, finalization).
+
+All peers independently compute the same parked set from the same events — no coordination needed. No peer is blocked from writing. Parked events surface as conflicts for human resolution via `RESOLVE_CONFLICT`. The author of the parked event is in the best position to resolve, since they know what they intended.
 
 ### 6.3 No Common Ancestor
 
@@ -450,11 +454,19 @@ Peers in each partition continue operating independently. When partition heals, 
 
 These decisions refine the abstract protocol for the doltswarm implementation.
 
-### 7.1 Conflict handling: user-resolved (not FWW)
+### 7.1 Conflict handling: park later event, block nobody
 
-Conflicts detected by `MergeRoots` are **rejected and surfaced to the user**. The conflicting event stays in the clock (it happened) but `latest_root` is not updated. The peer cannot perform `LOCAL_WRITE` until all conflicts are resolved via `RESOLVE_CONFLICT`. This preserves data integrity at the cost of requiring user intervention.
+Conflicts detected by `MergeRoots` are handled using the HLC total order to deterministically select which event is "parked." The earlier event in total order wins; the later event is parked. All peers independently compute the same parking decision.
 
-An earlier design used First-Write-Wins (FWW), which auto-resolved conflicts by dropping the later commit. FWW is simpler but causes silent data loss.
+Parked events:
+- Stay in the clock (the event happened, it's preserved)
+- Are excluded from active_heads, `LOCAL_WRITE` parents, reconciliation, and finalization
+- Are surfaced to the user for resolution via `RESOLVE_CONFLICT`
+- Do not block any peer from writing
+
+Resolution is async: any peer (typically the parked event's author) issues `RESOLVE_CONFLICT` with SQL that merges the parked data into the current state. The resolution event's parents include ALL heads (including the parked one), subsuming it in the DAG.
+
+Earlier designs blocked the conflicting peer from `LOCAL_WRITE` until resolution. This was too restrictive — a single conflict could stall a peer indefinitely. An even earlier design used First-Write-Wins (FWW), which auto-resolved by dropping the later commit. FWW causes silent data loss.
 
 ### 7.2 Event signing: required
 
@@ -614,11 +626,11 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 
 **`index_mem.go` → In-memory Merkle clock**
 - Current: `MemoryCommitIndex` with LRU map of HLC→entry
-- New: `MemMerkleClock` with `map[EventCID]Event`, heads set, peer_hlc map, stable_hlc, finalized/rejected event sets, pending conflicts
+- New: `MemMerkleClock` with `map[EventCID]Event`, heads set, peer_hlc map, stable_hlc, finalized/rejected event sets, parked conflicts
 
 **`reconciler_core.go` → Merkle clock reconciliation**
 - Current: `ReplayImportedEpochMerges` — epoch grouping, temp branch, HLC-sorted replay, FWW on conflict
-- New: `Reconcile` — pick two heads, find LCA in Merkle clock DAG, call `MergeRoots(h1.root_hash, h2.root_hash, ancestor.root_hash)`. On success: collapse heads, create tentative Dolt commit. On conflict: reject merge, store in pending_conflicts, notify user. Repeat for remaining head pairs.
+- New: `Reconcile` — pick two heads, find LCA in Merkle clock DAG, call `MergeRoots(h1.root_hash, h2.root_hash, ancestor.root_hash)`. On success: collapse heads, create tentative Dolt commit. On conflict: park later event (by HLC total order) in parked_conflicts, notify user. Repeat for remaining head pairs.
 - Remove: epoch metadata, FWW conflict resolution, parent chain collapsing, replay stall detection
 - Add: LCA computation (ancestor set intersection), conflict surfacing, conflict resolution path
 
