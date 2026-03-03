@@ -10,6 +10,8 @@
  * heartbeats for stability, causal finalization,
  * merge conflicts, tentative conflict resolution, network partitions,
  * and partition recovery via accept-the-fork finalized merge (§7.10).
+ * Partition conflicts are handled inline by MERGE_FINALIZED using the
+ * ours-side root — no blocking, no separate resolution action.
  *
  * Reduced constants for tractable state space:
  *   - 3 peers
@@ -50,22 +52,6 @@ module doltswarm_verify {
     peer: PeerID,
   }
 
-  /// Record type for partition conflict data.
-  type ConflictData = {
-    ours_finalized_events: Set[EventCID],
-    theirs_finalized_events: Set[EventCID],
-    ours_root: Hash,
-    theirs_root: Hash,
-    common_root: Hash,
-  }
-
-  /// Partition conflict payload: stores both sides' finalized state so that
-  /// do_resolve_partition_conflict can union the finalized_events sets.
-  /// NONE when no partition conflict is active.
-  type PartitionConflict =
-    | NoConflict
-    | ActiveConflict(ConflictData)
-
   type NodeState = {
     clock: EventCID -> Event,
     heads: Set[EventCID],
@@ -78,7 +64,6 @@ module doltswarm_verify {
     parked_conflicts: Set[EventCID],
     active_peers: Set[PeerID],
     localWall: int,
-    partition_conflict: PartitionConflict,
   }
 
   // ===========================================================================
@@ -91,8 +76,6 @@ module doltswarm_verify {
   var prev_stable_hlc: PeerID -> HLC
   /// History variable: tracks previous active_peers per peer for monotonicity guard.
   var prev_active_peers: PeerID -> Set[PeerID]
-  /// History variable: tracks previous finalized_events per peer for finalize-blocked check.
-  var prev_finalized_events: PeerID -> Set[EventCID]
   /// Network connectivity: set of directed (a, b) pairs meaning a can send to b.
   /// Symmetric: (a, b) ∈ connected ⟺ (b, a) ∈ connected.
   /// Models network partitions: removing pairs isolates peers.
@@ -104,29 +87,6 @@ module doltswarm_verify {
 
   pure def makeEventCID(peer: PeerID, wall: int, logical: int): EventCID =
     (peer, wall, logical)
-
-  /// Check if a partition conflict is active.
-  pure def hasPartitionConflict(st: NodeState): bool =
-    match st.partition_conflict {
-      | NoConflict => false
-      | ActiveConflict(_) => true
-    }
-
-  /// Sentinel for extracting conflict data (never actually used — guard ensures ActiveConflict).
-  pure val EMPTY_CONFLICT_DATA: ConflictData = {
-    ours_finalized_events: Set(),
-    theirs_finalized_events: Set(),
-    ours_root: 0,
-    theirs_root: 0,
-    common_root: 0,
-  }
-
-  /// Extract conflict data from a PartitionConflict (safe when hasPartitionConflict is true).
-  pure def getConflictData(pc: PartitionConflict): ConflictData =
-    match pc {
-      | NoConflict => EMPTY_CONFLICT_DATA
-      | ActiveConflict(data) => data
-    }
 
   /// All directed pairs between peers (symmetric).
   pure def allPairs(peers: Set[PeerID]): Set[(PeerID, PeerID)] =
@@ -159,8 +119,8 @@ module doltswarm_verify {
   /// The conflict condition is: both ours and theirs are raw content values
   /// (from CONTENTS) that each differ from the ancestor. This fires with
   /// any ancestor, including post-finalization merged roots, so that
-  /// partition conflicts (INV8b, INV11) and post-finalization tentative
-  /// conflicts (INV8a, INV8d) are exercised realistically.
+  /// partition conflicts and post-finalization tentative conflicts are
+  /// exercised realistically.
   ///
   /// NOTE: This uses finalized_root as the merge ancestor, not an LCA-derived
   /// ancestor from the Merkle clock DAG. The protocol doc (§2.4 step 3a)
@@ -276,12 +236,10 @@ module doltswarm_verify {
       parked_conflicts: Set(),
       active_peers: PEERS,
       localWall: 1,
-      partition_conflict: NoConflict,
     }),
     inbox' = PEERS.mapBy(_ => Set()),
     prev_stable_hlc' = PEERS.mapBy(_ => ZERO),
     prev_active_peers' = PEERS.mapBy(_ => PEERS),
-    prev_finalized_events' = PEERS.mapBy(_ => Set()),
     connected' = allPairs(PEERS),
   }
 
@@ -327,7 +285,7 @@ module doltswarm_verify {
         inbox' = broadcastConnected(inbox, event, connected),
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-        prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
+
         connected' = connected,
       }
     }
@@ -382,7 +340,7 @@ module doltswarm_verify {
         inbox' = inbox,
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-        prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
+
         connected' = connected,
       }
     }
@@ -413,7 +371,7 @@ module doltswarm_verify {
         inbox' = inbox,
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-        prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
+
         connected' = connected,
       }
     }
@@ -428,7 +386,6 @@ module doltswarm_verify {
       inbox' = inbox,
       prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
       prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-      prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
       connected' = connected,
     }
   }
@@ -477,7 +434,7 @@ module doltswarm_verify {
         inbox' = inbox.set(p, inbox.get(p).union(pulledEvents)),
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-        prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
+
         connected' = connected,
       }
     }
@@ -487,14 +444,9 @@ module doltswarm_verify {
   /// finalized_root is recomputed from scratch via computeFinalizedRoot to
   /// guarantee that the same finalized_events always yield the same root,
   /// regardless of the order peers finalize events.
-  ///
-  /// Blocked when partition_conflict is active — no new finalization
-  /// until the partition conflict is resolved (§7.10).
   action do_finalize(p: PeerID): bool = {
     val st = nodes.get(p)
     all {
-      // Block finalization during partition conflict (§2.4 ADVANCE_STABILITY step 0)
-      not(hasPartitionConflict(st)),
       val candidates = st.clock.keys().filter(cid =>
         val e = st.clock.get(cid)
         less(e.hlc, st.stable_hlc) and
@@ -515,7 +467,7 @@ module doltswarm_verify {
           inbox' = inbox,
           prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
           prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-          prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
+  
           connected' = connected,
         }
       }
@@ -536,7 +488,6 @@ module doltswarm_verify {
     connected' = connected.exclude(Set((p, q), (q, p))),
     prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
     prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-    prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
   }
 
   /// Network heal: reconnect two peers.
@@ -550,7 +501,6 @@ module doltswarm_verify {
     connected' = connected.union(Set((p, q), (q, p))),
     prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
     prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-    prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
   }
 
   /// Peer eviction: p removes q from its active_peers.
@@ -575,7 +525,7 @@ module doltswarm_verify {
         inbox' = inbox,
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-        prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
+
         connected' = connected,
       }
     }
@@ -588,9 +538,9 @@ module doltswarm_verify {
   /// must have finalized at least one event (non-EMPTY_ROOT).
   ///
   /// Computes common ancestor from intersection of finalized_events.
-  /// Performs a single three-way MergeRoots call. On success: updates
-  /// finalized_root and re-anchors tentative events. On conflict: sets
-  /// partition_conflict, blocking further finalization.
+  /// Performs a single three-way MergeRoots call. On conflict, uses the
+  /// "ours" root (earlier by HLC, deterministic) as finalized_root and
+  /// surfaces the conflict — no blocking, no separate resolution action.
   ///
   /// Deterministic ours/theirs assignment: the finalized tip with the earlier
   /// HLC is "ours", the later is "theirs". All peers make the same selection.
@@ -605,7 +555,6 @@ module doltswarm_verify {
       st_p.finalized_root != st_q.finalized_root,
       st_p.finalized_root != EMPTY_ROOT,
       st_q.finalized_root != EMPTY_ROOT,
-      not(hasPartitionConflict(st_p)),
       // Neither side's finalized_events is a subset of the other
       // (if one is a subset, the other is simply ahead — not a partition)
       not(st_p.finalized_events.subseteq(st_q.finalized_events)),
@@ -619,57 +568,35 @@ module doltswarm_verify {
         st_p.finalized_root else st_q.finalized_root
       val theirsRoot = if (st_p.finalized_root < st_q.finalized_root)
         st_q.finalized_root else st_p.finalized_root
-      val oursEvents = if (st_p.finalized_root < st_q.finalized_root)
-        st_p.finalized_events else st_q.finalized_events
-      val theirsEvents = if (st_p.finalized_root < st_q.finalized_root)
-        st_q.finalized_events else st_p.finalized_events
       val merged = mergeRoots(oursRoot, theirsRoot, commonRoot)
       val mergedEvents = st_p.finalized_events.union(st_q.finalized_events)
-      if (merged == CONFLICT_HASH) {
-        // Partition conflict — store full payload, block finalization until resolved
-        all {
-          nodes' = nodes.set(p, {
-            ...st_p,
-            partition_conflict: ActiveConflict({
-              ours_finalized_events: oursEvents,
-              theirs_finalized_events: theirsEvents,
-              ours_root: oursRoot,
-              theirs_root: theirsRoot,
-              common_root: commonRoot,
-            }),
-          }),
-          inbox' = inbox,
-          prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-          prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-          prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
-          connected' = connected,
-        }
+      // Unified path: on conflict, use ours root (deterministic, no blocking).
+      // On clean merge, use the merged root. Either way, continue finalizing.
+      val effectiveRoot = if (merged == CONFLICT_HASH) oursRoot else merged
+      val postMergeState: NodeState = {
+        ...st_p,
+        finalized_root: effectiveRoot,
+        finalized_events: mergedEvents,
+      }
+      // Re-anchor tentative events against the new finalized_root
+      val reconcileResult = if (postMergeState.heads.size() > 1) {
+        computeMergedRoot(postMergeState)
       } else {
-        // Clean merge — update finalized root and events, re-anchor tentative
-        val postMergeState: NodeState = {
-          ...st_p,
-          finalized_root: merged,
-          finalized_events: mergedEvents,
-        }
-        val reconcileResult = if (postMergeState.heads.size() > 1) {
-          computeMergedRoot(postMergeState)
-        } else {
-          val root = postMergeState.heads.fold(merged, (_, cid) =>
-            postMergeState.clock.get(cid).root_hash)
-          (root, Set())
-        }
-        all {
-          nodes' = nodes.set(p, {
-            ...postMergeState,
-            latest_root: reconcileResult._1,
-            parked_conflicts: reconcileResult._2,
-          }),
-          inbox' = inbox,
-          prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-          prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-          prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
-          connected' = connected,
-        }
+        val root = postMergeState.heads.fold(effectiveRoot, (_, cid) =>
+          postMergeState.clock.get(cid).root_hash)
+        (root, Set())
+      }
+      all {
+        nodes' = nodes.set(p, {
+          ...postMergeState,
+          latest_root: reconcileResult._1,
+          parked_conflicts: reconcileResult._2,
+        }),
+        inbox' = inbox,
+        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
+        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
+
+        connected' = connected,
       }
     }
   }
@@ -726,68 +653,7 @@ module doltswarm_verify {
         inbox' = broadcastConnected(inbox, event, connected),
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-        prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
-        connected' = connected,
-      }
-    }
-  }
 
-  /// Resolve a partition conflict (§2.4 RESOLVE_PARTITION_CONFLICT).
-  ///
-  /// User provides resolution (modeled as nondeterministic content choice).
-  /// Sets the resolved root as finalized_root, unions both sides' finalized
-  /// events, clears partition_conflict, broadcasts a resolution event, and
-  /// re-anchors tentative events. Finalization resumes.
-  action do_resolve_partition_conflict(p: PeerID): bool = {
-    val st = nodes.get(p)
-    val pc = getConflictData(st.partition_conflict)
-    all {
-      hasPartitionConflict(st),
-      st.localWall <= MAX_WALL,
-      st.clock.keys().size() < MAX_EVENTS,
-      nondet resolvedContent = CONTENTS.oneOf()
-      // Union both sides' finalized events (protocol step 4)
-      val mergedFinalizedEvents = pc.ours_finalized_events.union(pc.theirs_finalized_events)
-      // Create a resolution event and broadcast it (protocol step 8)
-      val newHLC = tick(st.hlc_clock, st.localWall, p)
-      val newCID = makeEventCID(p, newHLC.wall, newHLC.logical)
-      val resolutionEvent: Event = {
-        cid: newCID,
-        root_hash: resolvedContent,
-        parents: st.heads,
-        hlc: newHLC,
-        peer: p,
-      }
-      val newClock = st.clock.put(newCID, resolutionEvent)
-      val newHeads = computeHeads(newClock)
-      val postResolveState: NodeState = {
-        ...st,
-        clock: newClock,
-        heads: newHeads,
-        hlc_clock: newHLC,
-        finalized_root: resolvedContent,
-        finalized_events: mergedFinalizedEvents,
-        partition_conflict: NoConflict,
-      }
-      // Re-anchor tentative events against the new finalized_root
-      val reconcileResult = if (postResolveState.heads.size() > 1) {
-        computeMergedRoot(postResolveState)
-      } else {
-        val root = postResolveState.heads.fold(resolvedContent, (_, cid) =>
-          postResolveState.clock.get(cid).root_hash)
-        (root, Set())
-      }
-      all {
-        nodes' = nodes.set(p, {
-          ...postResolveState,
-          latest_root: reconcileResult._1,
-          parked_conflicts: reconcileResult._2,
-        }),
-        // Broadcast resolution event so all peers converge (protocol step 8)
-        inbox' = broadcastConnected(inbox, resolutionEvent, connected),
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-        prev_finalized_events' = PEERS.mapBy(pp => nodes.get(pp).finalized_events),
         connected' = connected,
       }
     }
@@ -814,7 +680,6 @@ module doltswarm_verify {
       do_evict(p, q5),
       nondet q6 = PEERS.oneOf()
       do_merge_finalized(p, q6),
-      do_resolve_partition_conflict(p),
       // Tentative conflict resolution (precondition in action guards empty set)
       nondet parkedCID = nodes.get(p).parked_conflicts.oneOf()
       do_resolve_conflict(p, parkedCID),
@@ -835,12 +700,13 @@ module doltswarm_verify {
   /// Finalized agreement (INV3): same finalized events → same finalized root.
   /// During a partition, peers may have different finalized_events sets.
   /// After MERGE_FINALIZED, they converge to the same fork-and-join state.
+  /// Unconditional: also covers partition merge convergence (formerly INV8).
+  /// MERGE_FINALIZED handles conflicts by using ours-side root (deterministic),
+  /// so same finalized_events always implies same finalized_root.
   val inv_finalized_agreement = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
-    (s1.finalized_events == s2.finalized_events and
-     not(hasPartitionConflict(s1)) and
-     not(hasPartitionConflict(s2))) implies
+    (s1.finalized_events == s2.finalized_events) implies
       (s1.finalized_root == s2.finalized_root)
   }))
 
@@ -893,8 +759,9 @@ module doltswarm_verify {
   })
 
   /// No unhandled finalized conflict (INV7b): finalized_root is never
-  /// CONFLICT_HASH. Every conflict from MERGE_FINALIZED is captured
-  /// in partition_conflict — none leaks into the finalized state.
+  /// CONFLICT_HASH. MERGE_FINALIZED handles conflicts by using the
+  /// ours-side root (deterministic) — no conflict sentinel leaks into
+  /// the finalized state.
   val inv_no_conflict_finalized_root = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_root != CONFLICT_HASH
@@ -932,25 +799,4 @@ module doltswarm_verify {
       (s1.parked_conflicts == s2.parked_conflicts)
   }))
 
-  /// Partition merge convergence (INV8): peers that complete MERGE_FINALIZED
-  /// with the same inputs (same finalized_events union) agree on finalized_root.
-  /// This is a consequence of mergeRoots being deterministic and the ours/theirs
-  /// assignment being deterministic.
-  val inv_partition_merge_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
-    val s1 = nodes.get(p1)
-    val s2 = nodes.get(p2)
-    (s1.finalized_events == s2.finalized_events and
-     not(hasPartitionConflict(s1)) and
-     not(hasPartitionConflict(s2))) implies
-      (s1.finalized_root == s2.finalized_root)
-  }))
-
-  /// Finalization blocked during partition conflict (INV9): a peer with an
-  /// active partition conflict cannot have gained new finalized events since
-  /// the previous step. Uses prev_finalized_events history variable.
-  val inv_finalize_blocked_during_conflict = PEERS.forall(p => {
-    val st = nodes.get(p)
-    hasPartitionConflict(st) implies
-      (st.finalized_events == prev_finalized_events.get(p))
-  })
 }
