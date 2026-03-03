@@ -335,13 +335,14 @@ module doltswarm_verify {
       } else {
         (content, Set())
       }
+      val newLatestRoot = reconcileResult._1
       val newParkedConflicts = reconcileResult._2
       all {
         nodes' = nodes.set(p, {
           ...st,
           clock: newClock,
           heads: newHeads,
-          latest_root: content,
+          latest_root: newLatestRoot,
           hlc_clock: newHLC,
           parked_conflicts: newParkedConflicts,
         }),
@@ -835,12 +836,13 @@ module doltswarm_verify {
       } else {
         (resolvedContent, Set())
       }
+      val newLatestRoot = reconcileResult._1
       all {
         nodes' = nodes.set(p, {
           ...st,
           clock: newClock,
           heads: newHeads,
-          latest_root: resolvedContent,
+          latest_root: newLatestRoot,
           hlc_clock: newHLC,
           parked_conflicts: reconcileResult._2,
         }),
@@ -1028,7 +1030,34 @@ module doltswarm_verify {
     )
   })
 
-  /// Conflict visibility: every parked conflict references a known event.
+  /// NOTE on INV7 converse (enough votes → rejected): Not checkable as a safety
+  /// invariant. do_receive adds a self-vote but does not check the rejection
+  /// threshold — rejection is processed asynchronously via do_stale_vote (matching
+  /// the protocol's "staleness vote is asynchronous" in §2.4 RECEIVE_EVENT step 3).
+  /// There is a transient state where a peer has enough votes locally but the event
+  /// is not yet rejected. The safety direction (inv_rejection_threshold: rejected →
+  /// enough votes) is the checkable component.
+
+  /// No unhandled tentative conflict (INV8a): latest_root is never
+  /// CONFLICT_HASH. Every conflict detected by mergeRoots during
+  /// reconciliation is captured in parked_conflicts — none leaks
+  /// into the working state.
+  val inv_no_conflict_latest_root = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.latest_root != CONFLICT_HASH
+  })
+
+  /// No unhandled finalized conflict (INV8b): finalized_root is never
+  /// CONFLICT_HASH. Every conflict from MERGE_FINALIZED is captured
+  /// in partition_conflict — none leaks into the finalized state.
+  val inv_no_conflict_finalized_root = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.finalized_root != CONFLICT_HASH
+  })
+
+  /// Parked event integrity (INV8c): every parked conflict references
+  /// a known event in the clock or rejected set. No conflict is
+  /// silently discarded.
   val inv_conflict_visibility = PEERS.forall(p => {
     val st = nodes.get(p)
     st.parked_conflicts.forall(cid =>
@@ -1049,8 +1078,8 @@ module doltswarm_verify {
     sameActivePeers implies leq(prev_stable_hlc.get(p), nodes.get(p).stable_hlc)
   })
 
-  /// Parking agreement (strengthens INV8): peers with the same events and
-  /// same finalized_root deterministically agree on which events are parked.
+  /// Parking agreement (INV8d): peers with the same events and same
+  /// finalized_root deterministically agree on which events are parked.
   /// Parked set is a pure function of (heads, clock, finalized_root) via
   /// computeMergedRoot — no dependence on event receipt order.
   val inv_parking_agreement = PEERS.forall(p1 => PEERS.forall(p2 => {
@@ -1074,9 +1103,9 @@ module doltswarm_verify {
       (s1.finalized_root == s2.finalized_root)
   }))
 
-  /// Finalization blocked during partition conflict: a peer with an active
-  /// partition conflict cannot have gained new finalized events since the
-  /// previous step. Uses prev_finalized_events history variable.
+  /// Finalization blocked during partition conflict (INV11): a peer with an
+  /// active partition conflict cannot have gained new finalized events since
+  /// the previous step. Uses prev_finalized_events history variable.
   val inv_finalize_blocked_during_conflict = PEERS.forall(p => {
     val st = nodes.get(p)
     hasPartitionConflict(st) implies

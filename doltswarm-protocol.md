@@ -362,11 +362,18 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 
 **INV7 — Rejection Consistency:** If ≥30% of `active_peers` vote stale on event `e`, then eventually all peers mark `e` as rejected.
 
-**INV8 — Conflict Visibility:** Every `MergeConflict` result parks the later event (by total order) and surfaces it to the user. All peers deterministically agree on which events are parked. No conflict is auto-resolved or silently discarded. Every partition merge conflict (`MERGE_FINALIZED` returning `Conflict`) is surfaced to the user as a `PartitionConflict`. No partition conflict is auto-resolved or silently discarded.
+**INV8 — Conflict Visibility:** All merge conflicts are captured and surfaced — none leak into working or finalized state, none are silently discarded. Four sub-properties:
+
+- **INV8a — No Unhandled Tentative Conflict:** `latest_root` is never a conflict sentinel. Every conflict detected by `MergeRoots` during reconciliation is captured in `parked_conflicts` (the later event by total order is parked). No conflict result propagates into the working state.
+- **INV8b — No Unhandled Finalized Conflict:** `finalized_root` is never a conflict sentinel. Every conflict from `MERGE_FINALIZED` is captured in `partition_conflict`. No conflict result propagates into the finalized state.
+- **INV8c — Parked Event Integrity:** Every parked event references a known event in the clock or rejected set. No conflict is silently discarded — parked events persist until explicitly resolved via `RESOLVE_CONFLICT`.
+- **INV8d — Parking Agreement:** For any two peers with the same clock and the same `finalized_root`, `parked_conflicts` is identical. Parking is a pure function of `(heads, clock, finalized_root)` via `computeMergedRoot` — independent of event receipt order.
 
 **INV9 — Finalization/Rejection Exclusivity:** No event is both finalized and rejected. `finalized_events ∩ rejected_events = ∅` on every peer. Events rejected during a partition remain rejected after reconnection — rejections propagate across partition boundaries.
 
 **INV10 — Partition Merge Convergence:** For any two peers that have completed `MERGE_FINALIZED` with the same inputs (same two `finalized_root` values and same `common_root`), the resulting `finalized_root` is identical. The merge is a deterministic function of its inputs.
+
+**INV11 — Finalization Blocked During Partition Conflict:** A peer with an active `partition_conflict` cannot finalize new events. `ADVANCE_STABILITY` is blocked until `RESOLVE_PARTITION_CONFLICT` clears the conflict.
 
 ---
 
@@ -378,6 +385,16 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 
 - **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) specifies sorting all newly-stable events by total order and replaying them in a single batch. The Quint spec instead finalizes one nondeterministic candidate per step, then recomputes `computeFinalizedRoot` from scratch over the full finalized event set. Because `computeFinalizedRoot` is a pure function of the event set (it sorts internally), both approaches produce the same finalized root regardless of finalization order. The spec's approach is easier to model-check.
 - **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The Quint spec models this asymmetry: `do_merge_finalized` assigns ours/theirs deterministically (lower finalized root value = "ours"), approximating the protocol's HLC-based tip comparison (§2.4 MERGE_FINALIZED step 3). Both methods produce a deterministic total order; the specific comparison differs but correctness (INV10) holds either way.
+- **EventCID representation:** The protocol defines `EventCID = Hash` (a content hash of the serialized event). The spec uses `EventCID = (peer, wall, logical)` — a tuple derived from the HLC. This avoids modeling hash functions while preserving uniqueness (HLC tick guarantees unique CIDs per peer). The spec's CID does not depend on `root_hash` or `parents`.
+- **Event fields:** The spec's `Event` omits `op_summary` and `signature`. `op_summary` is metadata that does not affect core state machine logic. `signature` omission is noted above (signature verification is document-only).
+- **`parked_conflicts` type:** The protocol defines `parked_conflicts: Map[EventCID, MergeResult]`, mapping parked events to conflict details (tables, description). The spec uses `Set[EventCID]` — tracking only which events are parked, not conflict presentation details.
+- **`PartitionConflict` payload:** The protocol's `PartitionConflict` includes `tables: Set[string]` and `details: string` for user-facing conflict information. The spec's `ConflictData` stores only the roots and finalized event sets needed for resolution logic.
+- **Heartbeat HLC tick:** The protocol ticks the sender's HLC on heartbeat send (`hlc ← tick(hlc)`, §2.4 HEARTBEAT step 1). The spec's `do_heartbeat` models only the receiver side and does not tick `hlc_clock`. Wall-time advancement is provided by the separate `do_tick` action. This may cause `stable_hlc` to advance slightly slower in the spec than in the protocol — a liveness concern, not a safety issue.
+- **Heartbeat as direct state read:** The protocol broadcasts heartbeat messages; receivers process the payload. The spec's `do_heartbeat` reads the sender's node state directly (no message inbox). This is a standard model-checking simplification and does not model heartbeat message loss or reordering.
+- **Pull-on-demand scope:** The protocol (§2.4 HEARTBEAT step 5) pulls events "referenced by sender's heads." The spec pulls all missing events from the remote peer's clock — a sound over-approximation that transfers more events than strictly required.
+- **Partition divergence detection:** The protocol (§2.4 HEARTBEAT step 6) checks whether "neither root is an ancestor of the other" using the commit DAG. The spec uses finalized-event subset checks (`not(A ⊆ B) ∧ not(B ⊆ A)`), which directly captures independent divergence without requiring DAG ancestry computation.
+- **Staleness threshold:** The protocol uses a 10-second wall-time threshold. The spec uses `STALENESS_THRESHOLD = 3` with `MAX_WALL = 6` — reduced abstract time units for tractable model checking.
+- **INV7 (Rejection Consistency):** The protocol states eventual consistency ("eventually all peers mark `e` as rejected") — a liveness property. The spec checks the safety direction via `inv_rejection_threshold` (rejected events had enough votes). The converse (enough votes → rejected) is not checkable as a safety invariant: `do_receive` adds a self-vote but does not check the rejection threshold — rejection is processed asynchronously via `do_stale_vote`, matching the protocol's "staleness vote is asynchronous" (§2.4 RECEIVE_EVENT step 3). Cross-peer propagation convergence is a liveness property not checkable as a state invariant.
 
 To run the spec: `task quint:run`
 
