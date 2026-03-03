@@ -178,8 +178,8 @@ module doltswarm_verify {
   /// correct). It must NOT be used for general finalized root advancement,
   /// because after a partition merge the finalized event set contains events
   /// from divergent lineages whose merged result cannot be recovered by
-  /// replaying them in HLC order. do_finalize uses incremental mergeRoots
-  /// instead. See §7.10.
+  /// replaying them in HLC order. do_finalize uses a fixed-anchor batch fold
+  /// over stable frontier heads instead. See §7.10.
   pure def computeFinalizedRoot(events: Set[EventCID], clock: EventCID -> Event): Hash = {
     if (events.empty()) EMPTY_ROOT
     else {
@@ -223,6 +223,43 @@ module doltswarm_verify {
           (merged, conflicts)
         }
       })
+    }
+  }
+
+  /// Eligible events for finalization at the current stability boundary.
+  pure def finalizationCandidates(st: NodeState): Set[EventCID] =
+    st.clock.keys().filter(cid =>
+      val e = st.clock.get(cid)
+      less(e.hlc, st.stable_hlc) and
+      not(st.finalized_events.contains(cid)) and
+      not(st.parked_conflicts.contains(cid))
+    )
+
+  /// Stable frontier heads: candidates that have no child in the same
+  /// candidate set. Finalization merges only these frontier roots.
+  pure def stableFrontier(candidates: Set[EventCID], clock: EventCID -> Event): Set[EventCID] =
+    candidates.filter(cid =>
+      not(candidates.exists(child => clock.get(child).parents.contains(cid)))
+    )
+
+  /// Advance finalized state in one deterministic batch:
+  /// 1) snapshot anchor = finalized_root at batch start
+  /// 2) merge stable frontier heads in HLC order with fixed ancestor = anchor
+  /// 3) mark all candidates finalized for bookkeeping
+  pure def finalizeBatch(st: NodeState): (Hash, Set[EventCID]) = {
+    val candidates = finalizationCandidates(st)
+    if (candidates.empty()) {
+      (st.finalized_root, st.finalized_events)
+    } else {
+      val frontier = stableFrontier(candidates, st.clock)
+      val sortedFrontier = sortCIDsByHLC(frontier, st.clock)
+      val anchor = st.finalized_root
+      val newRoot = sortedFrontier.foldl(st.finalized_root, (acc, cid) => {
+        val merged = mergeRoots(acc, st.clock.get(cid).root_hash, anchor)
+        // Skip frontier heads that still conflict at finalized layer (§7.1.1).
+        if (merged == CONFLICT_HASH) acc else merged
+      })
+      (newRoot, st.finalized_events.union(candidates))
     }
   }
 
@@ -452,43 +489,27 @@ module doltswarm_verify {
     }
   }
 
-  /// Finalize one event below stable_hlc (the one with the smallest HLC).
-  /// Always picks the minimum-HLC candidate (deterministic — matches the
-  /// protocol's total-order replay). finalized_root is advanced incrementally
-  /// via mergeRoots(finalized_root, e.root_hash, finalized_root) to preserve
-  /// merge results from MERGE_FINALIZED. Never recomputed from scratch.
+  /// Finalize all currently-stable candidates in one deterministic batch.
+  /// Uses a fixed anchor = finalized_root at batch start and merges only
+  /// stable frontier heads (candidates with no stable descendants).
+  /// This avoids fast-forward overwrite of concurrent writes while preserving
+  /// incremental advancement on top of MERGE_FINALIZED outputs.
   action do_finalize(p: PeerID): bool = {
     val st = nodes.get(p)
+    val candidates = finalizationCandidates(st)
     all {
-      val candidates = st.clock.keys().filter(cid =>
-        val e = st.clock.get(cid)
-        less(e.hlc, st.stable_hlc) and
-        not(st.finalized_events.contains(cid)) and
-        not(st.parked_conflicts.contains(cid))
-      )
-      all {
-        not(candidates.empty()),
-        // Pick the minimum-HLC candidate (deterministic — matches protocol's total-order replay)
-        val sorted = sortCIDsByHLC(candidates, st.clock)
-        val cid = sorted[0]
-        val newFinalizedEvents = st.finalized_events.union(Set(cid))
-        // Incremental fold: advance finalized_root by merging the new event
-        val merged = mergeRoots(st.finalized_root, st.clock.get(cid).root_hash, st.finalized_root)
-        // Skip events that conflict in the fold (§7.1.1)
-        val newFinRoot = if (merged == CONFLICT_HASH) st.finalized_root else merged
-        all {
-          nodes' = nodes.set(p, {
-            ...st,
-            finalized_root: newFinRoot,
-            finalized_events: newFinalizedEvents,
-          }),
-          inbox' = inbox,
-          prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-          prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
+      not(candidates.empty()),
+      val batch = finalizeBatch(st)
+      nodes' = nodes.set(p, {
+        ...st,
+        finalized_root: batch._1,
+        finalized_events: batch._2,
+      }),
+      inbox' = inbox,
+      prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
+      prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
 
-          connected' = connected,
-        }
-      }
+      connected' = connected,
     }
   }
 
@@ -816,5 +837,17 @@ module doltswarm_verify {
      s1.finalized_root == s2.finalized_root) implies
       (s1.parked_conflicts == s2.parked_conflicts)
   }))
+
+  /// Heads are always derived from clock structure (no hidden divergence).
+  val inv_heads_consistent = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.heads == computeHeads(st.clock)
+  })
+
+  /// Finalization and parking are disjoint: parked events are never finalized.
+  val inv_finalized_parked_disjoint = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.finalized_events.intersect(st.parked_conflicts).empty()
+  })
 
 }

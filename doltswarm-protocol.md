@@ -263,10 +263,17 @@ On receive from peer `q`:
 Triggered when `stable_hlc` advances.
 
 1. `newly_stable = { e ∈ clock | e.hlc < stable_hlc ∧ e ∉ finalized_events ∧ e ∉ parked_conflicts }`. Parked events cannot be finalized until resolved.
-2. Sort `newly_stable` by total order (causal → HLC → CID).
-3. Incremental fold from the current `finalized_root`: for each event in order, `finalized_root ← MergeRoots(finalized_root, e.root_hash, finalized_root)`. If `MergeRoots` returns a conflict for any event, **skip it** — do not incorporate its `root_hash` into the accumulator. This handles formerly-parked events whose content was subsumed by a later resolution event (see §7.1.1). `finalized_root` is never recomputed from the full finalized event set; it is advanced incrementally to preserve merge results from `MERGE_FINALIZED`.
-4. Materialize deterministic Dolt commits (all fields from event metadata, HLC timestamp, deterministic parents).
-5. Replace tentative commits. `finalized_root ← new_finalized_root`.
+2. `stable_frontier = { e ∈ newly_stable | no child of e is in newly_stable }` (the maximal stable events by causality).
+3. Sort `stable_frontier` by HLC total order (deterministic).
+4. Snapshot batch anchor once: `anchor = finalized_root`, `acc = finalized_root`.
+5. For each frontier event `e` in order: `merged = MergeRoots(acc, e.root_hash, anchor)`.
+   - If `merged` is `Ok`: `acc ← merged`.
+   - If `merged` is `Conflict`: skip `e`'s root for finalized-root advancement (do not update `acc`), but continue the batch.
+6. Bookkeeping finalization: `finalized_events ← finalized_events ∪ newly_stable`.
+7. Materialize deterministic Dolt commits (all fields from event metadata, HLC timestamp, deterministic parents).
+8. Replace tentative commits. `finalized_root ← acc`.
+
+> **Why frontier-only?** Replaying every stable event root can re-apply causal chains in the same batch and create false conflicts (e.g., parent then child over the same row). Merging only stable frontier heads applies each stable branch exactly once, while `finalized_events` still records all stabilized events for accounting.
 
 #### EVICT_PEER(peer) → unit
 
@@ -338,16 +345,20 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 
 **INV4 — Causal Consistency:** If `e1` is an ancestor of `e2` in the clock DAG, then `e1` precedes `e2` in the total order.
 
-**INV5 — No Silent Data Loss:** Every event either enters the finalized set or is parked (awaiting human resolution). No event disappears silently. Formerly-parked events whose content was subsumed by a resolution event are finalized (they enter `finalized_events`) but their `root_hash` is not replayed in `computeFinalizedRoot` — the resolution event carries their data.
+**INV5 — No Silent Data Loss:** Every event either enters the finalized set or is parked (awaiting human resolution). No event disappears silently. Formerly-parked events whose content is subsumed by a later resolution event are still accounted for in `finalized_events`; finalized-root advancement is driven by stable frontier roots, so subsumed intermediate roots are not re-applied.
 
 **INV6 — Stability Monotonicity:** Within a continuous `active_peers` membership, `stable_hlc` never moves backward. `finalized_root` never moves backward (the partition merge point is strictly ahead of both sides' previous roots). When a peer is re-added to `active_peers` after partition recovery, `stable_hlc` may temporarily decrease if the returning peer's HLC is behind the current minimum — this is expected and does not compromise finalization safety.
 
 **INV7 — Conflict Visibility:** All merge conflicts are captured and surfaced — none leak into working or finalized state, none are silently discarded. Four sub-properties:
 
 - **INV7a — No Unhandled Tentative Conflict:** `latest_root` is never a conflict sentinel. Every conflict detected by `MergeRoots` during reconciliation is captured in `parked_conflicts` (the later event by total order is parked). No conflict result propagates into the working state.
-- **INV7b — No Unhandled Finalized Conflict:** `finalized_root` is never a conflict sentinel. `computeFinalizedRoot` skips events that conflict during the fold (§7.1.1), and `MERGE_FINALIZED` handles conflicts by using the ours-side root (deterministic). No conflict result propagates into the finalized state.
+- **INV7b — No Unhandled Finalized Conflict:** `finalized_root` is never a conflict sentinel. `ADVANCE_STABILITY` skips conflicting stable-frontier roots during the fixed-anchor fold (§7.1.1), and `MERGE_FINALIZED` handles conflicts by using the ours-side root (deterministic). No conflict result propagates into the finalized state.
 - **INV7c — Parked Event Integrity:** Every parked event references a known event in the clock. No conflict is silently discarded — parked events persist until explicitly resolved via `RESOLVE_CONFLICT`.
 - **INV7d — Parking Agreement:** For any two peers with the same clock and the same `finalized_root`, `parked_conflicts` is identical. Parking is a pure function of `(heads, clock, finalized_root)` via `computeMergedRoot` — independent of event receipt order.
+
+**INV8 — Heads Derivation Consistency:** For every peer `p`, `p.heads == computeHeads(p.clock)`. Heads are a derived view of clock structure, never an independently-authoritative data source.
+
+**INV9 — Finalized/Parked Disjointness:** For every peer `p`, `p.finalized_events ∩ p.parked_conflicts.keys() == ∅`. An event cannot be both parked (unresolved conflict) and finalized.
 
 ---
 
@@ -357,8 +368,8 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 
 **Modeling notes (spec vs. this document):**
 
-- **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) specifies sorting all newly-stable events by total order and replaying them in a single batch. The Quint spec finalizes one event at a time, always picking the minimum-HLC candidate, and advances `finalized_root` incrementally via `mergeRoots(finalized_root, e.root_hash, finalized_root)`. This matches the protocol's total-order replay semantics while being easier to model-check. The incremental approach is essential: recomputing `finalized_root` from scratch via `computeFinalizedRoot` would overwrite merge results from `MERGE_FINALIZED`, violating INV3.
-- **`computeFinalizedRoot` scope:** `computeFinalizedRoot` is only used for computing the common ancestor from the pre-split linear event chain during `do_merge_finalized`. It is NOT used for general finalized root advancement — `do_finalize` uses incremental `mergeRoots` instead. Both the protocol (§7.1.1) and the spec's `computeFinalizedRoot` skip events that produce a conflict during the fold. In the spec's abstract model this code path is never exercised because `mergeRoots(acc, x, acc)` always fast-forwards (`ours == ancestor → theirs`). The skip logic is present for alignment with the protocol and defense in depth.
+- **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) processes a full batch each time it runs: compute `newly_stable`, derive the stable frontier (maximal stable events), sort that frontier by HLC total order, and fold with a fixed batch ancestor `anchor = finalized_root_at_batch_start`. The Quint spec models the same batch semantics via `finalizeBatch`.
+- **`computeFinalizedRoot` scope:** `computeFinalizedRoot` is only used for computing the common ancestor from the pre-split linear event chain during `do_merge_finalized`. It is NOT used for general finalized root advancement — `do_finalize` uses fixed-anchor frontier folding. This is essential: replaying full finalized event sets in HLC order can overwrite merge results from `MERGE_FINALIZED` (violating INV3).
 - **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The Quint spec models this asymmetry: `do_merge_finalized` assigns ours/theirs deterministically (lower finalized root value = "ours"), approximating the protocol's HLC-based tip comparison (§2.4 MERGE_FINALIZED step 3). Both methods produce a deterministic total order; the specific comparison differs but correctness (INV3, finalized agreement) holds either way.
 - **EventCID representation:** The protocol defines `EventCID = hash(UnsignedEvent)` — a content hash of the canonical unsigned event bytes (`root_hash`, `parents`, `hlc`, `peer`, `op_summary`). The signature is excluded from the CID to avoid circularity. The spec uses `EventCID = (peer, wall, logical)` — a tuple derived from the HLC. This avoids modeling hash functions while preserving uniqueness (HLC tick guarantees unique CIDs per peer). The spec's CID does not depend on `root_hash` or `parents`.
 - **Event fields:** The spec's `Event` omits `op_summary` and `signature`. `op_summary` is optional in the protocol (nullable, with a sentinel empty summary when absent) and does not affect core state machine logic — no protocol action branches on it. The spec's omission is equivalent to all events having an empty summary. `signature` omission is noted above (signature verification is document-only).
@@ -528,15 +539,15 @@ Earlier designs blocked the conflicting peer from `LOCAL_WRITE` until resolution
 
 When a parked event is resolved via `RESOLVE_CONFLICT`, it leaves `parked_conflicts` (the resolution event references it as a parent, making it no longer a head). The event is then in the clock, not finalized, not parked — eligible for finalization.
 
-A formerly-parked event's `root_hash` branches from an earlier state — it does not incorporate concurrent changes that caused the parking. When `ADVANCE_STABILITY` replays the finalized event fold, merging this `root_hash` can produce the **same conflict** that caused parking originally.
+A formerly-parked event's `root_hash` branches from an earlier state — it does not incorporate concurrent changes that caused the parking. Replaying every stable event root can therefore re-introduce the same conflict at finalized layer.
 
-**Fix:** `computeFinalizedRoot` skips events that produce a conflict during the fold (step 3). This is safe because:
+**Fix:** `ADVANCE_STABILITY` merges only stable frontier heads using a fixed batch ancestor (`anchor = finalized_root` at batch start). If a frontier merge conflicts, that head is skipped for finalized-root advancement while bookkeeping still finalizes the stabilized event set. This is safe because:
 
-1. Events still in `parked_conflicts` are excluded from finalization candidates by step 1 — only resolved events reach the fold.
-2. Events that left `parked_conflicts` because the conflict no longer occurs (e.g., after re-anchoring from `MERGE_FINALIZED`) will merge cleanly — no skip needed.
-3. Events that left `parked_conflicts` because they were resolved have a corresponding resolution event later in HLC order whose `root_hash` incorporates their data. The resolution event merges cleanly, advancing the accumulator correctly. No data is lost.
+1. Events still in `parked_conflicts` are excluded from finalization candidates by step 1.
+2. Resolved histories are represented by later frontier roots that subsume earlier conflicting branches.
+3. Causal ancestors inside the stable set are accounted for in `finalized_events` but not re-applied as roots, avoiding duplicate application and false conflicts.
 
-This approach is **receipt-order independent**: the fold is a pure function of the finalized event set and clock. No additional state variable is needed.
+This approach is receipt-order independent: frontier selection and HLC ordering are pure functions of `(clock, stable_hlc, finalized_events, parked_conflicts, finalized_root)`.
 
 ### 7.2 Event signing: required
 
@@ -706,7 +717,7 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
 
 **`finalization.go` → Causal stability finalization**
 - Current: Checkpoint-based watermarks with slack, `ComputeWatermark` from peer activity
-- New: `stable_hlc = min(peer_hlc[p] for p in active_peers)`. When stable_hlc advances, identify events with `hlc < stable_hlc`, sort by total order (causal→HLC→CID), replay from `finalized_root` via `MergeRoots`, create deterministic Dolt commits
+- New: `stable_hlc = min(peer_hlc[p] for p in active_peers)`. When stable_hlc advances, identify `newly_stable` events (`hlc < stable_hlc`), compute stable frontier heads, merge those heads in HLC order using fixed batch ancestor `anchor = finalized_root_at_batch_start`, mark all `newly_stable` finalized, create deterministic Dolt commits
 - Much simpler: no checkpoints, no slack duration, no commonly-known threshold
 
 **`node.go` → Merkle clock sync engine**
@@ -718,7 +729,7 @@ The `core/` package currently implements the epoch-merge/FWW sync protocol. Belo
   - Replace `syncOnce` (fetch → epoch replay) with `syncEvent` (Puller chunk sync → reconcile)
   - Remove pull-first from `Commit`/`ExecAndCommit`
   - Add heartbeat publishing loop (every 2s)
-  - `Commit`/`ExecAndCommit`: check no pending conflicts, create Event, add to clock, publish
+  - `Commit`/`ExecAndCommit`: create Event with `parents = active_heads` (`heads \ parked_conflicts`), add to clock, publish (writes are never blocked by pending conflicts)
   - Remove swarm:// remote setup (`EnsureSwarmRemote`, `RegisterSwarmProviders`)
 - Remove: hint providers, sync debounce, repair interval, digest publishing, epoch config
 - Add: heartbeat interval config
@@ -782,7 +793,7 @@ When a network partition separates peers into independent groups, each group evi
 
 **Finalized-layer conflicts use the ours-side root.** During normal operation, conflicts only occur at the tentative layer (parked events). Partition recovery may introduce conflicts at the finalized layer — both sides already told their users the data is settled. Rather than blocking finalization and requiring a separate resolution action, `MERGE_FINALIZED` handles conflicts inline: the ours-side root (earlier by HLC, deterministic) becomes `finalized_root`, both sides' finalized events are unioned, the conflict is surfaced to the user, and finalization continues immediately. This preserves the "no peer is blocked" design principle while surfacing the conflict for eventual human attention. The ours-side root is a safe choice because it is deterministic (all peers agree) and preserves at least one side's data integrity.
 
-**`computeFinalizedRoot` scope.** `computeFinalizedRoot` (the from-scratch fold over the full finalized event set) is retained only for computing the common ancestor from the pre-split linear event chain during `MERGE_FINALIZED`. General finalized root advancement uses incremental `mergeRoots(finalized_root, e.root_hash, finalized_root)` in `ADVANCE_STABILITY`. This is essential because after a partition merge, the finalized event set contains events from divergent lineages — replaying them in HLC order via the from-scratch fold would overwrite the merged root computed by `MERGE_FINALIZED`, silently discarding one partition's changes (violating INV3). The incremental fold handles formerly-parked events whose `root_hash` branches from an earlier state by skipping conflicts (§7.1.1).
+**`computeFinalizedRoot` scope.** `computeFinalizedRoot` (the from-scratch fold over the full finalized event set) is retained only for computing the common ancestor from the pre-split linear event chain during `MERGE_FINALIZED`. General finalized root advancement uses a fixed-anchor frontier fold in `ADVANCE_STABILITY`: snapshot `anchor = finalized_root` at batch start, merge stable frontier heads via `mergeRoots(acc, head.root_hash, anchor)`, and mark all newly stable events finalized for bookkeeping. This preserves partition-merge outputs (no from-scratch overwrite), preserves concurrent non-conflicting writes, and avoids false conflicts from replaying full causal chains in the same batch.
 
 **Deterministic merge commit.** The partition merge commit must be byte-identical across all peers for INV3. This requires: (1) deterministic ours/theirs assignment (earlier tip by HLC = ours), (2) deterministic metadata (HLC from the merge event, standard description), (3) deterministic parent ordering. Dolt's `CreateDeterministicCommit` provides this.
 
