@@ -15,7 +15,7 @@
  * in heartbeats for bandwidth efficiency (§7.6). The spec reads full remote
  * state directly — a sound over-approximation that skips the digest-compare
  * optimization without affecting safety properties.
- * Partition conflicts are handled inline by MERGE_FINALIZED using the
+ * Partition conflicts are handled inline by SYNC_FINALIZED's divergence
  * ours-side root — no blocking, no separate resolution action.
  *
  * Reduced constants for tractable state space:
@@ -174,7 +174,7 @@ module doltswarm_verify {
   /// protocol and provides defense in depth.
   ///
   /// IMPORTANT: This function is ONLY used for computing the common ancestor
-  /// during MERGE_FINALIZED (where the input is a pre-split linear chain —
+  /// during SYNC_FINALIZED's divergence branch (where the input is a pre-split linear chain —
   /// correct). It must NOT be used for general finalized root advancement,
   /// because after a partition merge the finalized event set contains events
   /// from divergent lineages whose merged result cannot be recovered by
@@ -260,6 +260,96 @@ module doltswarm_verify {
         if (merged == CONFLICT_HASH) acc else merged
       })
       (newRoot, st.finalized_events.union(candidates))
+    }
+  }
+
+  // ===========================================================================
+  // SYNC_FINALIZED contract helpers
+  // ===========================================================================
+
+  /// SYNC_FINALIZED branch tags.
+  pure val SYNC_ADOPT: int = 1
+  pure val SYNC_NOOP: int = 2
+  pure val SYNC_MERGE: int = 3
+
+  /// Branch classifier for SYNC_FINALIZED.
+  pure def syncMode(st_local: NodeState, st_remote: NodeState): int = {
+    val localSubsetRemote = st_local.finalized_events.subseteq(st_remote.finalized_events)
+    val remoteSubsetLocal = st_remote.finalized_events.subseteq(st_local.finalized_events)
+    if (localSubsetRemote and not(remoteSubsetLocal)) SYNC_ADOPT
+    else if (remoteSubsetLocal and not(localSubsetRemote)) SYNC_NOOP
+    else SYNC_MERGE
+  }
+
+  /// Metadata-completeness gate used by SYNC_FINALIZED.
+  /// If local is behind and must adopt, it must already have remote finalized
+  /// events in its local clock metadata.
+  pure def syncAdoptionReady(st_local: NodeState, st_remote: NodeState): bool = {
+    if (syncMode(st_local, st_remote) == SYNC_ADOPT)
+      st_remote.finalized_events.subseteq(st_local.clock.keys())
+    else
+      true
+  }
+
+  /// Enable condition for SYNC_FINALIZED transition.
+  pure def syncEnabled(conn: Set[(PeerID, PeerID)], p: PeerID, q: PeerID,
+      st_local: NodeState, st_remote: NodeState): bool = all {
+    p != q,
+    isConnected(conn, p, q),
+    st_local.finalized_root != st_remote.finalized_root,
+    st_local.finalized_root != EMPTY_ROOT,
+    st_remote.finalized_root != EMPTY_ROOT,
+    syncAdoptionReady(st_local, st_remote),
+  }
+
+  /// Finalized-state update for SYNC_FINALIZED (without latest_root re-anchoring).
+  pure def syncFinalizedCore(st_local: NodeState, st_remote: NodeState): NodeState = {
+    val mode = syncMode(st_local, st_remote)
+    if (mode == SYNC_ADOPT) {
+      {
+        ...st_local,
+        finalized_root: st_remote.finalized_root,
+        finalized_events: st_remote.finalized_events,
+      }
+    } else if (mode == SYNC_NOOP) {
+      st_local
+    } else {
+      val commonEvents = st_local.finalized_events.intersect(st_remote.finalized_events)
+      val commonRoot = computeFinalizedRoot(commonEvents, st_local.clock)
+      // Deterministic ours/theirs: compare finalized roots by value.
+      val oursRoot = if (st_local.finalized_root < st_remote.finalized_root)
+        st_local.finalized_root else st_remote.finalized_root
+      val theirsRoot = if (st_local.finalized_root < st_remote.finalized_root)
+        st_remote.finalized_root else st_local.finalized_root
+      val merged = mergeRoots(oursRoot, theirsRoot, commonRoot)
+      val mergedEvents = st_local.finalized_events.union(st_remote.finalized_events)
+      // Unified path: on conflict, use ours root (deterministic, no blocking).
+      val effectiveRoot = if (merged == CONFLICT_HASH) oursRoot else merged
+      {
+        ...st_local,
+        finalized_root: effectiveRoot,
+        finalized_events: mergedEvents,
+      }
+    }
+  }
+
+  /// Full SYNC_FINALIZED local result, including latest_root re-anchoring.
+  pure def applySyncFinalized(st_local: NodeState, st_remote: NodeState): NodeState = {
+    val syncedState = syncFinalizedCore(st_local, st_remote)
+    val rootChanged = syncedState.finalized_root != st_local.finalized_root
+    val reconcileResult = if (rootChanged and syncedState.heads.size() > 1) {
+      computeMergedRoot(syncedState)
+    } else if (rootChanged) {
+      val root = syncedState.heads.fold(syncedState.finalized_root, (_, cid) =>
+        syncedState.clock.get(cid).root_hash)
+      (root, Set())
+    } else {
+      (st_local.latest_root, st_local.parked_conflicts)
+    }
+    {
+      ...syncedState,
+      latest_root: reconcileResult._1,
+      parked_conflicts: reconcileResult._2,
     }
   }
 
@@ -493,7 +583,7 @@ module doltswarm_verify {
   /// Uses a fixed anchor = finalized_root at batch start and merges only
   /// stable frontier heads (candidates with no stable descendants).
   /// This avoids fast-forward overwrite of concurrent writes while preserving
-  /// incremental advancement on top of MERGE_FINALIZED outputs.
+  /// incremental advancement on top of SYNC_FINALIZED outputs.
   action do_finalize(p: PeerID): bool = {
     val st = nodes.get(p)
     val candidates = finalizationCandidates(st)
@@ -531,7 +621,7 @@ module doltswarm_verify {
 
   /// Network heal: reconnect two peers.
   /// Heartbeats and events can flow again. Event exchange and partition
-  /// merge happen via subsequent do_heartbeat and do_merge_finalized.
+  /// merge happen via subsequent do_heartbeat and do_sync_finalized.
   action do_heal(p: PeerID, q: PeerID): bool = all {
     p != q,
     not(isConnected(connected, p, q)),
@@ -570,67 +660,29 @@ module doltswarm_verify {
     }
   }
 
-  /// Merge divergent finalized roots after partition recovery (§7.10).
+  /// Synchronize finalized state after partition recovery (§7.10).
   ///
   /// Triggered when peer p detects that peer q has a different finalized_root
-  /// (via heartbeat) and the two roots diverged independently. Both peers
-  /// must have finalized at least one event (non-EMPTY_ROOT).
+  /// (via heartbeat). Case split:
+  /// - p behind (p.finalized_events ⊂ q.finalized_events): adopt q's finalized state
+  /// - p ahead   (q.finalized_events ⊂ p.finalized_events): no-op
+  /// - incomparable sets: deterministic three-way merge (accept-the-fork)
   ///
-  /// Computes common ancestor from intersection of finalized_events.
-  /// Performs a single three-way MergeRoots call. On conflict, uses the
-  /// "ours" root (earlier by HLC, deterministic) as finalized_root and
-  /// surfaces the conflict — no blocking, no separate resolution action.
-  ///
-  /// Deterministic ours/theirs assignment: the finalized tip with the earlier
-  /// HLC is "ours", the later is "theirs". All peers make the same selection.
-  /// Every peer independently computes the same merge — deterministic.
-  action do_merge_finalized(p: PeerID, q: PeerID): bool = {
+  /// In the merge branch, deterministic ours/theirs assignment picks the
+  /// earlier finalized tip as "ours". On conflict, uses ours-side root
+  /// (deterministic) — no blocking, no separate resolution action.
+  action do_sync_finalized(p: PeerID, q: PeerID): bool = {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
+    val mode = syncMode(st_p, st_q)
     all {
-      p != q,
-      isConnected(connected, p, q),
-      // Both sides have finalized and their roots differ
-      st_p.finalized_root != st_q.finalized_root,
-      st_p.finalized_root != EMPTY_ROOT,
-      st_q.finalized_root != EMPTY_ROOT,
-      // Neither side's finalized_events is a subset of the other
-      // (if one is a subset, the other is simply ahead — not a partition)
-      not(st_p.finalized_events.subseteq(st_q.finalized_events)),
-      not(st_q.finalized_events.subseteq(st_p.finalized_events)),
-      // Compute common ancestor from intersection of finalized event sets
-      val commonEvents = st_p.finalized_events.intersect(st_q.finalized_events)
-      val commonRoot = computeFinalizedRoot(commonEvents, st_p.clock)
-      // Deterministic ours/theirs: compare finalized roots by value
-      // (models HLC-based tip comparison — lower hash = "ours", higher = "theirs")
-      val oursRoot = if (st_p.finalized_root < st_q.finalized_root)
-        st_p.finalized_root else st_q.finalized_root
-      val theirsRoot = if (st_p.finalized_root < st_q.finalized_root)
-        st_q.finalized_root else st_p.finalized_root
-      val merged = mergeRoots(oursRoot, theirsRoot, commonRoot)
-      val mergedEvents = st_p.finalized_events.union(st_q.finalized_events)
-      // Unified path: on conflict, use ours root (deterministic, no blocking).
-      // On clean merge, use the merged root. Either way, continue finalizing.
-      val effectiveRoot = if (merged == CONFLICT_HASH) oursRoot else merged
-      val postMergeState: NodeState = {
-        ...st_p,
-        finalized_root: effectiveRoot,
-        finalized_events: mergedEvents,
-      }
-      // Re-anchor tentative events against the new finalized_root
-      val reconcileResult = if (postMergeState.heads.size() > 1) {
-        computeMergedRoot(postMergeState)
-      } else {
-        val root = postMergeState.heads.fold(effectiveRoot, (_, cid) =>
-          postMergeState.clock.get(cid).root_hash)
-        (root, Set())
-      }
+      syncEnabled(connected, p, q, st_p, st_q),
+      val syncedState: NodeState = applySyncFinalized(st_p, st_q)
       all {
-        nodes' = nodes.set(p, {
-          ...postMergeState,
-          latest_root: reconcileResult._1,
-          parked_conflicts: reconcileResult._2,
-        }),
+        // Branch tag is kept here so any future change to the action still
+        // must satisfy the explicit SYNC_FINALIZED contract helpers.
+        mode == syncMode(st_p, st_q),
+        nodes' = nodes.set(p, syncedState),
         inbox' = inbox,
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
@@ -718,7 +770,7 @@ module doltswarm_verify {
       nondet q5 = PEERS.oneOf()
       do_evict(p, q5),
       nondet q6 = PEERS.oneOf()
-      do_merge_finalized(p, q6),
+      do_sync_finalized(p, q6),
       // Tentative conflict resolution (precondition in action guards empty set)
       nondet parkedCID = nodes.get(p).parked_conflicts.oneOf()
       do_resolve_conflict(p, parkedCID),
@@ -738,15 +790,86 @@ module doltswarm_verify {
 
   /// Finalized agreement (INV3): same finalized events → same finalized root.
   /// During a partition, peers may have different finalized_events sets.
-  /// After MERGE_FINALIZED, they converge to the same fork-and-join state.
+  /// After SYNC_FINALIZED, they converge to the same fork-and-join state.
   /// Unconditional: also covers partition merge convergence (formerly INV8).
-  /// MERGE_FINALIZED handles conflicts by using ours-side root (deterministic),
+  /// SYNC_FINALIZED divergence merges handle conflicts by using ours-side root
+  /// (deterministic),
   /// so same finalized_events always implies same finalized_root.
   val inv_finalized_agreement = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
     (s1.finalized_events == s2.finalized_events) implies
       (s1.finalized_root == s2.finalized_root)
+  }))
+
+  /// SYNC_FINALIZED contract (adopt branch): behind peer adopts remote
+  /// finalized state exactly once metadata is complete.
+  val inv_sync_contract_adopt = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_ADOPT) implies all {
+      st_q.finalized_events.subseteq(st_p.clock.keys()),
+      applySyncFinalized(st_p, st_q).finalized_events == st_q.finalized_events,
+      applySyncFinalized(st_p, st_q).finalized_root == st_q.finalized_root,
+    }
+  }))
+
+  /// SYNC_FINALIZED contract (no-op branch): ahead peer does not change
+  /// finalized or tentative state.
+  val inv_sync_contract_noop = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_NOOP) implies all {
+      applySyncFinalized(st_p, st_q).finalized_events == st_p.finalized_events,
+      applySyncFinalized(st_p, st_q).finalized_root == st_p.finalized_root,
+      applySyncFinalized(st_p, st_q).latest_root == st_p.latest_root,
+      applySyncFinalized(st_p, st_q).parked_conflicts == st_p.parked_conflicts,
+    }
+  }))
+
+  /// SYNC_FINALIZED contract (merge branch): divergence produces merged
+  /// finalized events and never leaks CONFLICT_HASH to finalized_root.
+  val inv_sync_contract_merge = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_MERGE) implies all {
+      applySyncFinalized(st_p, st_q).finalized_events == st_p.finalized_events.union(st_q.finalized_events),
+      applySyncFinalized(st_p, st_q).finalized_root != CONFLICT_HASH,
+    }
+  }))
+
+  /// Scenario check: strict-superset pair converges when the ahead peer no-ops
+  /// and the behind peer syncs back.
+  val inv_sync_subset_roundtrip_converges = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val pCanSync = syncEnabled(connected, p, q, st_p, st_q)
+    val qCanSync = syncEnabled(connected, q, p, st_q, st_p)
+    (pCanSync and qCanSync and
+      syncMode(st_p, st_q) == SYNC_NOOP and
+      syncMode(st_q, st_p) == SYNC_ADOPT) implies all {
+      applySyncFinalized(st_q, applySyncFinalized(st_p, st_q)).finalized_events
+        == applySyncFinalized(st_p, st_q).finalized_events,
+      applySyncFinalized(st_q, applySyncFinalized(st_p, st_q)).finalized_root
+        == applySyncFinalized(st_p, st_q).finalized_root,
+    }
+  }))
+
+  /// Scenario check: incomparable peers independently converge to the same
+  /// merged finalized state under deterministic merge tie-breaking.
+  val inv_sync_incomparable_pairwise_converges = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val pCanSync = syncEnabled(connected, p, q, st_p, st_q)
+    val qCanSync = syncEnabled(connected, q, p, st_q, st_p)
+    (pCanSync and qCanSync and
+      syncMode(st_p, st_q) == SYNC_MERGE and
+      syncMode(st_q, st_p) == SYNC_MERGE) implies all {
+      applySyncFinalized(st_p, st_q).finalized_events
+        == applySyncFinalized(st_q, st_p).finalized_events,
+      applySyncFinalized(st_p, st_q).finalized_root
+        == applySyncFinalized(st_q, st_p).finalized_root,
+    }
   }))
 
   /// Data convergence: peers with the same events and single head agree on latest_root.
@@ -798,7 +921,7 @@ module doltswarm_verify {
   })
 
   /// No unhandled finalized conflict (INV7b): finalized_root is never
-  /// CONFLICT_HASH. MERGE_FINALIZED handles conflicts by using the
+  /// CONFLICT_HASH. SYNC_FINALIZED divergence merges handle conflicts by using the
   /// ours-side root (deterministic) — no conflict sentinel leaks into
   /// the finalized state.
   val inv_no_conflict_finalized_root = PEERS.forall(p => {
