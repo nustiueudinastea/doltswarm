@@ -13,8 +13,8 @@
  *
  * NOTE: The protocol uses frontier digests (heads_digest = hash(sort(heads)))
  * in heartbeats for bandwidth efficiency (§7.6). The spec reads full remote
- * state directly — a sound over-approximation that skips the digest-compare
- * optimization without affecting safety properties.
+ * state directly (skipping message-level digest compare mechanics), but models
+ * the same closure-based pull target: remote heads plus recursive ancestors.
  * Partition conflicts are handled inline by SYNC_FINALIZED's divergence
  * ours-side root — no blocking, no separate resolution action.
  *
@@ -157,24 +157,79 @@ module doltswarm_verify {
     clock.keys().exclude(allParents)
   }
 
+  /// Ancestor-ID closure from a seed set by repeatedly following parent links.
+  ///
+  /// Includes missing parent IDs even if those CIDs are not yet present in
+  /// the local clock, so subset checks can detect orphan events.
+  /// The unfold is bounded by MAX_EVENTS for a finite-state model.
+  pure def ancestorIdClosure(seed: Set[EventCID], clock: EventCID -> Event): Set[EventCID] =
+    range(0, MAX_EVENTS).foldl(seed, (acc, _) => {
+      val parentStep = acc.fold(Set(), (parentsAcc, cid) => {
+        if (clock.has(cid)) parentsAcc.union(clock.get(cid).parents)
+        else parentsAcc
+      })
+      acc.union(parentStep)
+    })
+
+  /// Parent-closure gate: an event is mergeable only if all reachable ancestor
+  /// CIDs are present in the local clock.
+  pure def isParentClosed(clock: EventCID -> Event, cid: EventCID): bool =
+    clock.has(cid) and ancestorIdClosure(Set(cid), clock).subseteq(clock.keys())
+
+  /// Heads eligible for reconciliation (parent-closed in the local clock).
+  /// Chunk readiness is not modeled in Quint, so parent-closure is the explicit
+  /// mergeability gate.
+  pure def mergeableHeads(st: NodeState): Set[EventCID] =
+    st.heads.filter(cid => isParentClosed(st.clock, cid))
+
+  /// Pull target on heartbeat mismatch: remote heads plus recursive ancestor
+  /// closure, excluding CIDs already present locally.
+  pure def pullClosureCIDs(localClock: EventCID -> Event, remote: NodeState): Set[EventCID] = {
+    val remoteClosure = ancestorIdClosure(remote.heads, remote.clock)
+    remoteClosure.filter(cid =>
+      remote.clock.has(cid) and
+      not(localClock.has(cid))
+    )
+  }
+
+  /// Apply a set of remote event CIDs to a local clock map.
+  pure def applyRemoteEvents(localClock: EventCID -> Event, remoteClock: EventCID -> Event,
+      cids: Set[EventCID]): EventCID -> Event =
+    cids.fold(localClock, (acc, cid) =>
+      if (remoteClock.has(cid)) acc.put(cid, remoteClock.get(cid))
+      else acc
+    )
+
+  /// Bounded anti-entropy catchup projection: one heartbeat pull plus enough
+  /// receive steps to materialize all pulled events into local clock state.
+  pure def heartbeatClosureCatchupClock(st_local: NodeState, st_remote: NodeState): EventCID -> Event = {
+    val pulled = pullClosureCIDs(st_local.clock, st_remote)
+    applyRemoteEvents(st_local.clock, st_remote.clock, pulled)
+  }
+
   /// Sort CIDs by HLC (deterministic total order for multi-head merge).
   pure def sortCIDsByHLC(cids: Set[EventCID], clock: EventCID -> Event): List[EventCID] = {
     val cidList = cids.fold([], (acc, c) => acc.append(c))
     cidList.sortList((a, b) => less(clock.get(a).hlc, clock.get(b).hlc))
   }
 
-  /// Deterministic merged root for a set of heads.
-  /// Operates on ALL heads (not pre-filtered by existing parked_conflicts).
-  /// Sorts heads by HLC and folds mergeRoots left-to-right.
+  /// Deterministic merged root for mergeable heads.
+  /// Operates on parent-closed heads only (mergeableHeads).
+  /// Sorts mergeable heads by HLC and folds mergeRoots left-to-right.
   /// Returns (merged_root, parked_set) where parked_set is the COMPLETE set
   /// of parked events (not a delta). This makes parking a pure function of
   /// (heads, clock, finalized_root), independent of event receipt order.
   pure def computeMergedRoot(st: NodeState): (Hash, Set[EventCID]) = {
-    if (st.heads.size() <= 1) {
-      val root = st.heads.fold(st.finalized_root, (_, cid) => st.clock.get(cid).root_hash)
+    val readyHeads = mergeableHeads(st)
+    if (st.heads.empty()) {
+      (st.finalized_root, Set())
+    } else if (readyHeads.empty()) {
+      (st.latest_root, Set())
+    } else if (readyHeads.size() == 1) {
+      val root = readyHeads.fold(st.finalized_root, (_, cid) => st.clock.get(cid).root_hash)
       (root, Set())
     } else {
-      val sorted = sortCIDsByHLC(st.heads, st.clock)
+      val sorted = sortCIDsByHLC(readyHeads, st.clock)
       // Fold left, accumulating both the merged root and conflict set
       sorted.foldl((st.finalized_root, Set()), (acc, cid) => {
         val currentRoot = acc._1
@@ -196,7 +251,8 @@ module doltswarm_verify {
       val e = st.clock.get(cid)
       less(e.hlc, st.stable_hlc) and
       not(st.finalized_events.contains(cid)) and
-      not(st.parked_conflicts.contains(cid))
+      not(st.parked_conflicts.contains(cid)) and
+      isParentClosed(st.clock, cid)
     )
 
   /// Stable frontier heads: candidates that have no child in the same
@@ -412,16 +468,7 @@ module doltswarm_verify {
   /// Full SYNC_FINALIZED local result, including latest_root re-anchoring.
   pure def applySyncFinalized(st_local: NodeState, st_remote: NodeState): NodeState = {
     val syncedState = syncFinalizedCore(st_local, st_remote)
-    val rootChanged = syncedState.finalized_root != st_local.finalized_root
-    val reconcileResult = if (rootChanged and syncedState.heads.size() > 1) {
-      computeMergedRoot(syncedState)
-    } else if (rootChanged) {
-      val root = syncedState.heads.fold(syncedState.finalized_root, (_, cid) =>
-        syncedState.clock.get(cid).root_hash)
-      (root, Set())
-    } else {
-      (st_local.latest_root, st_local.parked_conflicts)
-    }
+    val reconcileResult = computeMergedRoot(syncedState)
     {
       ...syncedState,
       latest_root: reconcileResult._1,
@@ -479,11 +526,7 @@ module doltswarm_verify {
       val newHeads = computeHeads(newClock)
       // Recompute parking for the new head set
       val postWriteState: NodeState = { ...st, clock: newClock, heads: newHeads, hlc_clock: newHLC }
-      val reconcileResult = if (newHeads.size() > 1) {
-        computeMergedRoot(postWriteState)
-      } else {
-        (content, Set())
-      }
+      val reconcileResult = computeMergedRoot(postWriteState)
       val newLatestRoot = reconcileResult._1
       val newParkedConflicts = reconcileResult._2
       all {
@@ -507,9 +550,9 @@ module doltswarm_verify {
   /// A peer processes a single event from its inbox.
   /// Events are processed one at a time (not batched), matching the protocol's
   /// per-event processing with inline reconciliation between events.
-  /// Reconciliation is inlined here (matching §2.4 RECEIVE_EVENT step 9):
-  /// when receiving creates multiple active heads, immediately compute the
-  /// merged root and park any conflicts.
+  /// Reconciliation is inlined here (matching §2.4 RECEIVE_EVENT):
+  /// merge/parking is computed from parent-closed heads only. Orphan heads
+  /// stay announced until ancestors arrive via pull-on-demand.
   /// No local wall-time admission filter is modeled or permitted: any valid,
   /// non-duplicate received event is accepted into the clock (G-Set behavior).
   action do_receive(p: PeerID): bool = {
@@ -527,23 +570,16 @@ module doltswarm_verify {
       val newHLC = observe(st.hlc_clock, e.hlc, st.localWall, p)
       // Recompute heads from the full clock (order-independent)
       val newHeads = computeHeads(newClock)
-      // Inline reconciliation (§2.4 step 8): if multiple heads,
-      // compute merged root and park any conflicts. computeMergedRoot
-      // operates on ALL heads and returns the complete parked set,
-      // making parking a pure function of (heads, clock, finalized_root).
+      // Inline reconciliation: computeMergedRoot evaluates only parent-closed
+      // heads and returns the complete parked set, making parking a pure
+      // function of (heads, clock, finalized_root).
       val tempState: NodeState = {
         ...st,
         clock: newClock,
         heads: newHeads,
         hlc_clock: newHLC,
       }
-      val reconcileResult = if (newHeads.size() > 1) {
-        computeMergedRoot(tempState)
-      } else {
-        // Single or zero heads: no reconciliation needed
-        val root = newHeads.fold(st.finalized_root, (_, cid) => newClock.get(cid).root_hash)
-        (root, Set())
-      }
+      val reconcileResult = computeMergedRoot(tempState)
       val newLatestRoot = reconcileResult._1
       val newParkedConflicts = reconcileResult._2
       all {
@@ -567,9 +603,9 @@ module doltswarm_verify {
   /// computes the same merged root. The next LOCAL_WRITE will have
   /// parents = active_heads (excluding parked), which collapses them in the DAG.
   ///
-  /// computeMergedRoot operates on ALL heads and returns the complete parked
-  /// set (not a delta), making parking a pure function of (heads, clock,
-  /// finalized_root). No peer is blocked from writing.
+  /// computeMergedRoot operates on parent-closed heads only and returns the
+  /// complete parked set (not a delta), making parking a pure function of
+  /// (heads, clock, finalized_root). No peer is blocked from writing.
   action do_reconcile(p: PeerID): bool = {
     val st = nodes.get(p)
     all {
@@ -615,10 +651,10 @@ module doltswarm_verify {
   /// mismatch (§7.6). The spec reads full remote state directly as a sound
   /// over-approximation, skipping the digest-compare step.
   ///
-  /// Pull-on-demand (§2.4 HEARTBEAT step 5): if p is missing events that q
-  /// has in its clock, those events are added to p's inbox for later
-  /// processing via do_receive. This models the event exchange that happens
-  /// when peers reconnect after a partition.
+  /// Pull-on-demand (§2.4 HEARTBEAT step 5): on mismatch, p requests q's head
+  /// set and recursively fetches missing ancestor closure for those heads.
+  /// Fetched events are added to p's inbox for later processing via do_receive.
+  /// This models closure-based event exchange after partitions.
   action do_heartbeat(p: PeerID, q: PeerID): bool = {
     val st = nodes.get(p)
     val remote = nodes.get(q)
@@ -638,11 +674,9 @@ module doltswarm_verify {
       // stability monotonicity within the same active_peers set).
       val newActivePeers = st.active_peers.union(Set(q))
       val newStable = hlcMinOver(updatedPeerHLC, newActivePeers)
-      // Pull-on-demand: events q has that p is missing (§2.4 step 5)
-      val missingEvents = remote.clock.keys().filter(cid =>
-        not(st.clock.has(cid))
-      )
-      val pulledEvents = missingEvents.map(cid => remote.clock.get(cid))
+      // Pull-on-demand closure: remote heads + recursive ancestors (§2.4 step 5)
+      val pulledCIDs = pullClosureCIDs(st.clock, remote)
+      val pulledEvents = pulledCIDs.map(cid => remote.clock.get(cid))
       all {
         nodes' = nodes.set(p, {
           ...st,
@@ -650,7 +684,7 @@ module doltswarm_verify {
           stable_hlc: newStable,
           active_peers: newActivePeers,
         }),
-        // Add missing events to p's inbox for processing via do_receive
+        // Add pulled closure events to p's inbox for processing via do_receive
         inbox' = inbox.set(p, inbox.get(p).union(pulledEvents)),
         prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
         prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
@@ -693,8 +727,11 @@ module doltswarm_verify {
       } else {
         withBatch
       }
+      val reconcileResult = computeMergedRoot(withLineage)
       nodes' = nodes.set(p, {
         ...withLineage,
+        latest_root: reconcileResult._1,
+        parked_conflicts: reconcileResult._2,
       }),
       inbox' = inbox,
       prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
@@ -827,11 +864,7 @@ module doltswarm_verify {
         heads: newHeads,
         hlc_clock: newHLC,
       }
-      val reconcileResult = if (newHeads.size() > 1) {
-        computeMergedRoot(postState)
-      } else {
-        (resolvedContent, Set())
-      }
+      val reconcileResult = computeMergedRoot(postState)
       val newLatestRoot = reconcileResult._1
       all {
         nodes' = nodes.set(p, {
@@ -1117,14 +1150,20 @@ module doltswarm_verify {
     }
   }))
 
-  /// Data convergence: peers with the same events and single head agree on latest_root.
-  /// (After reconciliation, peers with same clock should converge.)
+  /// Data convergence: peers with the same events and the same single
+  /// parent-closed head agree on latest_root.
+  ///
+  /// Without parent-closure, an orphan single head may remain ANNOUNCED and
+  /// latest_root may still reflect the last mergeable state.
   val inv_data_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
     (s1.clock.keys() == s2.clock.keys() and
      s1.heads.size() == 1 and s2.heads.size() == 1 and
-     s1.heads == s2.heads) implies
+     s1.heads == s2.heads and
+     s1.heads.forall(cid =>
+       isParentClosed(s1.clock, cid) and
+       isParentClosed(s2.clock, cid))) implies
       (s1.latest_root == s2.latest_root)
   }))
 
@@ -1180,6 +1219,47 @@ module doltswarm_verify {
     val st = nodes.get(p)
     st.parked_conflicts.forall(cid => st.clock.has(cid))
   })
+
+  /// Parent-closure safety: only parent-closed heads may be parked by reconcile.
+  val inv_parked_parent_closed = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.parked_conflicts.subseteq(mergeableHeads(st))
+  })
+
+  /// Finalization safety: every finalized event is parent-closed in the local clock.
+  val inv_finalized_parent_closed = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.finalized_events.forall(cid => isParentClosed(st.clock, cid))
+  })
+
+  /// Reconcile fixed-point safety: latest_root is always equal to the
+  /// deterministic merged-root projection from current state.
+  val inv_latest_root_is_compute_merged_root = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.latest_root == computeMergedRoot(st)._1
+  })
+
+  /// Reconcile fixed-point safety: parked_conflicts is always equal to the
+  /// deterministic parked-set projection from current state.
+  val inv_parked_conflicts_is_compute_merged_root = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.parked_conflicts == computeMergedRoot(st)._2
+  })
+
+  /// Bounded anti-entropy scenario check: if p can heartbeat q and q's head has
+  /// full ancestry in q's local clock, then one closure pull plus enough
+  /// do_receive steps yields parent-closed remote heads in p's projected clock.
+  val inv_heartbeat_closure_catchup_bounded = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val caughtUpClock = heartbeatClosureCatchupClock(st_p, st_q)
+    (p != q and isConnected(connected, p, q)) implies
+      st_q.heads.forall(h =>
+        (st_q.clock.has(h) and
+          ancestorIdClosure(Set(h), st_q.clock).subseteq(st_q.clock.keys())) implies
+          isParentClosed(caughtUpClock, h)
+      )
+  }))
 
   /// Stability monotonicity (INV6): stable_hlc never decreases.
   /// Uses the prev_stable_hlc history variable to compare across transitions.

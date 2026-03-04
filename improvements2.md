@@ -148,17 +148,30 @@ RECEIVE_EVENT(peer, e):
 
 ---
 
-### 6. Anti-entropy pull-on-demand does not specify ancestor-closure fetch
+### 6. ~~Anti-entropy pull-on-demand does not specify ancestor-closure fetch~~ FIXED
 
-**Refs:** protocol §2.4 HEARTBEAT step 5 (line 258), protocol §2.4 RECEIVE_EVENT (line 206), spec `do_heartbeat` (line 434).
+**Refs:** protocol §2.4 HEARTBEAT step 5, protocol §2.4 RECEIVE_EVENT lifecycle/reconcile/finalize gates, spec `ancestorIdClosure`/`pullClosureCIDs`/`do_heartbeat`/`computeMergedRoot`/`finalizationCandidates`.
 
-**Problem.** On digest mismatch, the protocol says "request full head set from sender, then pull missing events." It doesn't specify *which* events to pull. A peer could receive head events without their ancestors, leaving orphaned events in the clock. The spec over-approximates by pulling ALL missing events from the remote clock — this masks the gap.
+**Status.** Fixed by defining pull-on-demand as explicit remote-head ancestor closure fetch and enforcing parent-closure gating in both protocol and Quint state machine.
 
-An event with missing parents cannot be correctly positioned in the causal order and may produce incorrect `computeHeads` results (an event might appear as a head when its actual parent just hasn't arrived yet).
+**Implemented protocol behavior.**
+- HEARTBEAT mismatch path now requests full remote head set, then recursively fetches missing ancestors for each remote head (head-to-ancestor closure), and pulls chunks for fetched events.
+- RECEIVE_EVENT lifecycle now includes `PARENTS_READY` (`ANNOUNCED → PARENTS_READY → CHUNKS_READY → MERGEABLE`).
+- RECONCILE now operates only on heads that are both parent-closed and chunk-ready.
+- ADVANCE_STABILITY finalization candidates now require parent-closure (`e is PARENTS_READY`).
+- Partition-recovery clock-merge text and heartbeat design notes now explicitly reference closure-based fetch.
 
-**Protocol fix.** Define pull-on-demand as recursive head-to-ancestor closure: "request the full head set, then for each head, recursively request all ancestors not present in the local clock." Gate RECONCILE and finalization on parent-closure: an event is only MERGEABLE if all its ancestors are present in the local clock (extends the ANNOUNCED → CHUNKS_READY → MERGEABLE lifecycle to include parent-closure).
+**Implemented spec behavior.**
+- Added `ancestorIdClosure(...)`, `isParentClosed(...)`, `mergeableHeads(...)`, and `pullClosureCIDs(...)`.
+- `do_heartbeat` now enqueues only closure-based pull targets (remote heads + recursive ancestors), not all missing remote-clock events.
+- `computeMergedRoot` now merges/parks only parent-closed heads.
+- `do_receive` now uses closure-gated `computeMergedRoot` directly (orphan heads remain announced until closure arrives).
+- `finalizationCandidates` now requires parent-closure.
+- Added guard invariants:
+  - `inv_parked_parent_closed`
+  - `inv_finalized_parent_closed`
 
-**Spec fix.** Model closure-based pull (not "all missing events" over-approximation). Add parent-closure as a precondition for reconciliation of an event.
+**Why this closes the issue.** The protocol no longer leaves pull scope ambiguous, and reconciliation/finalization cannot process orphan heads. The Quint model now exercises the same closure contract instead of masking gaps via pull-all over-approximation.
 
 ---
 
