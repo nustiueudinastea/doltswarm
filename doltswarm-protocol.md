@@ -338,11 +338,11 @@ State-transfer join: the new peer requests a consistent snapshot from any active
      finalized_parents: Map[Hash, Set[Hash]],
      finalized_ancestors: Map[Hash, Set[Hash]],
      finalized_depth:   Map[Hash, int],
-     clock:             Map[EventCID, Event],  -- all non-finalized events in the clock
+     clock:             Map[EventCID, Event],  -- complete event clock (finalized + non-finalized)
      parked_conflicts:  Set[EventCID],     -- currently parked events
    }
    ```
-   `finalized_root` must be transferred as an opaque value. `finalized_parents/finalized_ancestors/finalized_depth` are transferred with it so `SYNC_FINALIZED` can recover common ancestors via lineage LCA without event replay.
+   `finalized_root` must be transferred as an opaque value. `finalized_parents/finalized_ancestors/finalized_depth` are transferred with it so `SYNC_FINALIZED` can recover common ancestors via lineage LCA without event replay. `clock` is the full event G-Set and must include every CID referenced by `finalized_events` (`finalized_events ⊆ clock.keys()`).
 3. Fetch chunks for `finalized_root` and all event `root_hash` values via Puller (shallow clone — only chunks not already local).
 4. Initialize local state from snapshot:
    - `clock ← snapshot.clock` (union with any events already received via broadcast during join).
@@ -702,6 +702,8 @@ The key insight: `GetManyCompressed` and `HasMany` already have the right signat
 ### 7.5 In-memory Layer 3 state
 
 All Merkle clock state (events, heads, peer tracking) is held in-memory. There is no local persistence for Layer 3. On crash, a peer rejoins from a live peer via `PEER_JOIN` (shallow clone of finalized state + clock events). This requires at least one live peer for recovery.
+
+> **Current-model note (memory vs correctness):** The protocol/spec currently use a single-clock model where finalized-event CIDs remain present in `clock` (`finalized_events ⊆ clock.keys()`). This keeps `PEER_JOIN`/`SYNC_FINALIZED` contracts aligned with the current Quint invariants. The unbounded-memory cost is real but orthogonal and is deferred to a future GC design: once finalized event bodies are pruned from `clock`, the snapshot contract and INV5 safety approximation must be updated to use retained finalized metadata/CID accounting rather than `clock` membership for finalized events.
 
 ### 7.6 Frontier digest heartbeats
 
