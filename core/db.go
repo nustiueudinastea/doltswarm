@@ -333,6 +333,31 @@ func (db *DB) GetLastCommit(branch string) (Commit, error) {
 	return commits[0], nil
 }
 
+// GetLastUserCommit returns the most recent user commit (non-merge metadata) on a branch.
+func (db *DB) GetLastUserCommit(branch string) (Commit, *CommitMetadata, error) {
+	query := fmt.Sprintf("SELECT commit_hash, committer, email, date, message FROM dolt_log('%s');", escapeSQL(branch))
+	rows, err := db.sqldb.QueryContext(context.Background(), query)
+	if err != nil {
+		return Commit{}, nil, fmt.Errorf("failed to retrieve commits: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var c Commit
+		if err := rows.Scan(&c.Hash, &c.Committer, &c.Email, &c.Date, &c.Message); err != nil {
+			return Commit{}, nil, err
+		}
+		meta, err := ParseCommitMetadata(c.Message)
+		if err != nil || meta == nil {
+			continue
+		}
+		if meta.Kind == CommitKindUser {
+			return c, meta, nil
+		}
+	}
+	return Commit{}, nil, fmt.Errorf("no user commits found")
+}
+
 func (db *DB) DatabaseExists(name string) (bool, error) {
 	dbName := ""
 	err := db.sqldb.QueryRowContext(context.Background(), fmt.Sprintf("SHOW DATABASES LIKE '%s'", db.name)).Scan(&dbName)
@@ -381,6 +406,14 @@ func (db *DB) CheckIfCommitPresent(commitHash string) (bool, error) {
 }
 
 func (db *DB) GetAllCommits() ([]Commit, error) {
+	// Prefer a full reachable-graph traversal to avoid dropping commits that are not
+	// on the first-parent path (e.g. merged commits). Fall back to dolt_log if needed.
+	if db != nil && db.reconciler != nil && db.sqldb != nil {
+		if commits, err := db.reconciler.getCommitsSince(context.Background(), db.sqldb, "main", ""); err == nil {
+			return commits, nil
+		}
+	}
+
 	query := "SELECT commit_hash, committer, email, date, message FROM dolt_log('main');"
 	commits, err := sq.FetchAll(db.sqldb, sq.
 		Queryf(query).

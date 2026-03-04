@@ -8,8 +8,6 @@ import (
 
 // Re-export commonly-used protocol helpers so core can stay concise.
 
-const CommitMetadataVersion = protocol.CommitMetadataVersion
-
 func NewCommitMetadata(msg string, hlc HLCTimestamp, contentHash, author, email string, date time.Time) *CommitMetadata {
 	return protocol.NewCommitMetadata(msg, hlc, contentHash, author, email, date)
 }

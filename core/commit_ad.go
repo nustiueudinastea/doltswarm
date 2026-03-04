@@ -30,7 +30,7 @@ func (ad *CommitAd) Key() string {
 // ToMetadata converts a CommitAd to CommitMetadata
 func (ad *CommitAd) ToMetadata() *CommitMetadata {
 	return &CommitMetadata{
-		Version:     CommitMetadataVersion,
+		Kind:        CommitKindUser,
 		Message:     ad.Message,
 		HLC:         ad.HLC,
 		ContentHash: ad.ContentHash,
@@ -38,20 +38,5 @@ func (ad *CommitAd) ToMetadata() *CommitMetadata {
 		Email:       ad.Email,
 		Date:        ad.Date,
 		Signature:   ad.Signature,
-	}
-}
-
-// CommitAdFromMetadata creates a CommitAd from CommitMetadata
-func CommitAdFromMetadata(meta *CommitMetadata, commitHash string) *CommitAd {
-	return &CommitAd{
-		PeerID:      meta.HLC.PeerID,
-		HLC:         meta.HLC,
-		ContentHash: meta.ContentHash,
-		CommitHash:  commitHash,
-		Message:     meta.Message,
-		Author:      meta.Author,
-		Email:       meta.Email,
-		Date:        meta.Date,
-		Signature:   meta.Signature,
 	}
 }

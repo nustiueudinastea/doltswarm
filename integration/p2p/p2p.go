@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"math"
 	"os"
 	"strings"
 	"sync"
@@ -42,11 +41,8 @@ const (
 	// Connection stability settings
 	connGracePeriod = 30 * time.Second // Grace period for new connections
 
-	defaultMaxPeers            = 12
-	defaultMinPeers            = 8
-	defaultRejectBackoff       = 30 * time.Second
-	defaultRejectBackoffMax    = 5 * time.Minute
-	defaultConnectLoopInterval = 2 * time.Second
+	defaultRejectBackoff    = 30 * time.Second
+	defaultRejectBackoffMax = 5 * time.Minute
 )
 
 type P2PClient struct {
@@ -86,14 +82,9 @@ type P2P struct {
 	shuttingDown bool               // Flag to prevent new removals during shutdown
 	shutdownMu   sync.Mutex         // Mutex for shutdown flag
 
-	// Peer policy (gRPC clients are derived from gossip peers)
-	maxPeers            int
-	minPeers            int
-	rejectBackoff       time.Duration
-	rejectBackoffMax    time.Duration
-	connectLoopInterval time.Duration
-	allowlistedPeers    map[string]struct{}
-	unlimitedStart      bool
+	// Reject backoff (prevents reconnecting too fast after failures)
+	rejectBackoff    time.Duration
+	rejectBackoffMax time.Duration
 
 	knownPeersMu sync.Mutex
 	knownPeers   map[string]*knownPeer
@@ -244,74 +235,6 @@ func (p2p *P2P) peerDiscoveryProcessor() func() error {
 	return stopper
 }
 
-func (p2p *P2P) connectLoop() func() error {
-	stopSignal := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(p2p.connectLoopInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				p2p.ensureMinPeers()
-			case <-stopSignal:
-				return
-			}
-		}
-	}()
-	return func() error {
-		stopSignal <- struct{}{}
-		return nil
-	}
-}
-
-func (p2p *P2P) ensureMinPeers() {
-	if p2p == nil || p2p.host == nil {
-		return
-	}
-	if p2p.clients.Count() >= p2p.minPeers {
-		return
-	}
-
-	needed := p2p.minPeers - p2p.clients.Count()
-	candidates := p2p.selectDialCandidates(needed)
-	for _, info := range candidates {
-		p2p.tryConnectPeer(info)
-		if p2p.clients.Count() >= p2p.minPeers {
-			return
-		}
-	}
-}
-
-func (p2p *P2P) selectDialCandidates(limit int) []peer.AddrInfo {
-	p2p.knownPeersMu.Lock()
-	defer p2p.knownPeersMu.Unlock()
-
-	now := time.Now()
-	out := make([]peer.AddrInfo, 0, limit)
-	for _, kp := range p2p.knownPeers {
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-		if kp == nil || kp.info.ID == "" {
-			continue
-		}
-		if kp.info.ID == p2p.host.ID() {
-			continue
-		}
-		if kp.connected {
-			continue
-		}
-		if !kp.rejectedUntil.IsZero() && now.Before(kp.rejectedUntil) {
-			continue
-		}
-		if len(kp.info.Addrs) == 0 {
-			continue
-		}
-		out = append(out, kp.info)
-	}
-	return out
-}
-
 func (p2p *P2P) tryConnectPeer(peerInfo peer.AddrInfo) {
 	if p2p == nil || p2p.host == nil || peerInfo.ID == "" {
 		return
@@ -320,9 +243,6 @@ func (p2p *P2P) tryConnectPeer(peerInfo peer.AddrInfo) {
 		return
 	}
 	peerIDStr := peerInfo.ID.String()
-	if p2p.tooManyHostPeers(peerIDStr) {
-		return
-	}
 	if p2p.isRejected(peerIDStr) {
 		return
 	}
@@ -408,18 +328,12 @@ func (p2p *P2P) onGossipPeerJoin(pid peer.ID) {
 	if pid == p2p.host.ID() {
 		return
 	}
-	peerIDStr := pid.String()
 	p2p.recordKnownPeer(peer.AddrInfo{ID: pid, Addrs: p2p.host.Peerstore().Addrs(pid)})
-	if p2p.tooManyHostPeers(peerIDStr) {
-		p2p.markRejected(peerIDStr, "max peers reached")
+	if p2p.isRejected(pid.String()) {
 		_ = p2p.host.Network().ClosePeer(pid)
 		return
 	}
-	if p2p.isRejected(peerIDStr) {
-		_ = p2p.host.Network().ClosePeer(pid)
-		return
-	}
-	p2p.connectRPCPeer(peerIDStr)
+	p2p.connectRPCPeer(pid.String())
 }
 
 func (p2p *P2P) onGossipPeerLeave(pid peer.ID) {
@@ -434,13 +348,6 @@ func (p2p *P2P) connectRPCPeer(peerID string) {
 		return
 	}
 	if p2p.host != nil && peerID == p2p.host.ID().String() {
-		return
-	}
-	if p2p.maxPeers > 0 && p2p.clients.Count() >= p2p.maxPeers && !p2p.isAllowlisted(peerID) {
-		p2p.markRejected(peerID, "max peers reached")
-		if pid, err := peer.Decode(peerID); err == nil {
-			_ = p2p.host.Network().ClosePeer(pid)
-		}
 		return
 	}
 
@@ -495,14 +402,6 @@ func (p2p *P2P) connectRPCPeer(peerID string) {
 	p2p.protectPeer(pid)
 	p2p.log.Infof("Added P2P client for gossip peer %s (total clients: %d)", peerID, p2p.clients.Count())
 	p2p.setKnownPeerConnected(peerID, true)
-
-	if p2p.node != nil {
-		if hint := p2p.node.LatestHintForProvider(peerID); !hint.IsZero() {
-			go func(h doltswarm.HLCTimestamp) {
-				_, _ = p2p.node.SyncHint(context.Background(), h)
-			}(hint)
-		}
-	}
 
 	select {
 	case p2p.peerListChan <- p2p.host.Network().Peers():
@@ -589,7 +488,8 @@ func (p2p *P2P) markRejected(peerID string, reason string) {
 	kp.rejects++
 	backoff := p2p.rejectBackoff
 	if kp.rejects > 1 {
-		backoff = time.Duration(float64(backoff) * math.Pow(2, float64(kp.rejects-1)))
+		mult := 1 << (kp.rejects - 1)
+		backoff = time.Duration(int64(backoff) * int64(mult))
 	}
 	if backoff > p2p.rejectBackoffMax {
 		backoff = p2p.rejectBackoffMax
@@ -597,14 +497,6 @@ func (p2p *P2P) markRejected(peerID string, reason string) {
 	kp.rejectedUntil = time.Now().Add(backoff)
 	kp.lastRejectReason = reason
 	kp.connected = false
-}
-
-func (p2p *P2P) isAllowlisted(peerID string) bool {
-	if p2p == nil || peerID == "" {
-		return false
-	}
-	_, ok := p2p.allowlistedPeers[peerID]
-	return ok
 }
 
 func (p2p *P2P) isRejected(peerID string) bool {
@@ -623,31 +515,11 @@ func (p2p *P2P) isRejected(peerID string) bool {
 	return time.Now().Before(kp.rejectedUntil)
 }
 
-func (p2p *P2P) tooManyHostPeers(peerID string) bool {
-	if p2p == nil || p2p.host == nil {
-		return false
-	}
-	if p2p.maxPeers <= 0 {
-		return false
-	}
-	if p2p.isAllowlisted(peerID) {
-		return false
-	}
-	return len(p2p.host.Network().Peers()) > p2p.maxPeers
-}
-
 func (p2p *P2P) openConnectionHandler(netw network.Network, conn network.Conn) {
 	peerID := conn.RemotePeer()
 	peerIDStr := peerID.String()
 
 	p2p.recordKnownPeer(peer.AddrInfo{ID: peerID, Addrs: p2p.host.Peerstore().Addrs(peerID)})
-
-	if p2p.tooManyHostPeers(peerIDStr) {
-		p2p.markRejected(peerIDStr, "max peers reached")
-		_ = p2p.host.Network().ClosePeer(peerID)
-		return
-	}
-
 	p2p.setKnownPeerConnected(peerIDStr, true)
 	p2p.log.Infof("Incoming connection from %s", peerIDStr)
 }
@@ -694,48 +566,6 @@ func (p2p *P2P) SetNode(n *doltswarm.Node) {
 	p2p.node = n
 }
 
-// EnsurePeerConnected requests that the P2P layer establish a data-plane connection
-// to the specified peer if not already connected. This is best-effort and non-blocking.
-// It helps ensure data-plane connections are ready when gossip arrives from a peer.
-func (p2p *P2P) EnsurePeerConnected(peerID string) {
-	if p2p == nil || peerID == "" {
-		return
-	}
-	if p2p.host != nil && peerID == p2p.host.ID().String() {
-		// Never attempt to connect to ourselves.
-		return
-	}
-
-	// Parse peer ID and get addresses from the peerstore
-	pid, err := peer.Decode(peerID)
-	if err != nil {
-		p2p.log.Debugf("EnsurePeerConnected: failed to parse peer ID %s: %v", peerID, err)
-		return
-	}
-	if p2p.host.Network().Connectedness(pid) == network.Connected {
-		return
-	}
-
-	// Get known addresses for this peer from the peerstore
-	addrs := p2p.host.Peerstore().Addrs(pid)
-	if len(addrs) == 0 {
-		// No known addresses, can't connect proactively
-		p2p.log.Debugf("EnsurePeerConnected: no known addresses for peer %s", peerID)
-		return
-	}
-
-	p2p.recordKnownPeer(peer.AddrInfo{ID: pid, Addrs: addrs})
-
-	// Queue connection request (non-blocking)
-	select {
-	case p2p.PeerChan <- peer.AddrInfo{ID: pid, Addrs: addrs}:
-		p2p.log.Debugf("EnsurePeerConnected: queued connection request for peer %s", peerID)
-	default:
-		// Channel full, skip - the peer discovery processor is busy
-		p2p.log.Debugf("EnsurePeerConnected: channel full, skipping peer %s", peerID)
-	}
-}
-
 // IsPeerConnected reports whether we currently have a gRPC client for the peer.
 func (p2p *P2P) IsPeerConnected(peerID string) bool {
 	if p2p == nil || peerID == "" {
@@ -745,46 +575,6 @@ func (p2p *P2P) IsPeerConnected(peerID string) bool {
 		return true
 	}
 	return false
-}
-
-// SetPeerLimits updates the max/min peer limits at runtime.
-// If max <= 0, peer limits are disabled (unlimited).
-func (p2p *P2P) SetPeerLimits(maxPeers, minPeers int) {
-	if p2p == nil {
-		return
-	}
-	if maxPeers <= 0 {
-		p2p.maxPeers = 0
-		p2p.minPeers = 0
-		return
-	}
-	if minPeers < 0 {
-		minPeers = 0
-	}
-	if minPeers > maxPeers {
-		minPeers = maxPeers
-	}
-	p2p.maxPeers = maxPeers
-	p2p.minPeers = minPeers
-
-	if p2p.host == nil {
-		return
-	}
-	// Trim excess host connections if above the new max.
-	peers := p2p.host.Network().Peers()
-	if len(peers) <= maxPeers {
-		return
-	}
-	for _, pid := range peers {
-		id := pid.String()
-		if p2p.isAllowlisted(id) {
-			continue
-		}
-		_ = p2p.host.Network().ClosePeer(pid)
-		if len(p2p.host.Network().Peers()) <= maxPeers {
-			return
-		}
-	}
 }
 
 // PeerCounts returns the number of connected host peers, gRPC peers, and gossip peers.
@@ -805,7 +595,6 @@ func (p2p *P2P) PeerCounts() (hostPeers, grpcPeers, gossipPeers int) {
 // SnapshotConns returns a snapshot of currently connected gRPC conns keyed by peer ID.
 // Only returns Dolt-capable peers (those discovered through bootstrap/mDNS), filtering out
 // incoming connections from non-Dolt clients (like test orchestrators).
-// Used for provider-agnostic bundle exchange.
 func (p2p *P2P) SnapshotConns() map[string]grpc.ClientConnInterface {
 	out := make(map[string]grpc.ClientConnInterface)
 	if p2p == nil {
@@ -822,7 +611,6 @@ func (p2p *P2P) SnapshotConns() map[string]grpc.ClientConnInterface {
 }
 
 // NewGossipSub constructs a GossipSub-backed doltswarm.Gossip implementation.
-// This does not change any runtime behavior unless called by the application.
 func (p2p *P2P) NewGossipSub(ctx context.Context, topic string) (*gossipsub.GossipSubGossip, error) {
 	if p2p == nil {
 		return nil, fmt.Errorf("p2p manager is nil")
@@ -831,24 +619,7 @@ func (p2p *P2P) NewGossipSub(ctx context.Context, topic string) (*gossipsub.Goss
 		ctx = context.Background()
 	}
 
-	params := pubsub.DefaultGossipSubParams()
-	if p2p.maxPeers > 0 {
-		params.D = p2p.maxPeers
-		params.Dhi = p2p.maxPeers
-	}
-	if p2p.minPeers > 0 {
-		params.Dlo = p2p.minPeers
-	}
-	// Ensure Dout satisfies constraints.
-	if params.D > 0 {
-		maxDout := int(math.Max(1, float64(params.D/2-1)))
-		params.Dout = maxDout
-		if params.Dlo > 0 && params.Dout >= params.Dlo {
-			params.Dout = int(math.Max(1, float64(params.Dlo-1)))
-		}
-	}
-
-	gs, err := gossipsub.New(ctx, p2p.host, p2p.log.WithField("context", "gossip"), topic, pubsub.WithGossipSubParams(params))
+	gs, err := gossipsub.New(ctx, p2p.host, p2p.log.WithField("context", "gossip"), topic)
 	if err != nil {
 		return nil, err
 	}
@@ -863,7 +634,7 @@ func (p2p *P2P) StartServer() (func() error, error) {
 	ctx := context.TODO()
 
 	// register internal grpc servers
-	srv := &p2psrv.Server{DB: p2p.externalDB, Node: p2p.node, Limiter: p2p, Stats: p2p}
+	srv := &p2psrv.Server{DB: p2p.externalDB, Node: p2p.node, Stats: p2p}
 	p2pproto.RegisterPingerServer(p2p.grpcServer, srv)
 	p2pproto.RegisterTesterServer(p2p.grpcServer, srv)
 	if p2p.externalDB != nil {
@@ -894,7 +665,6 @@ func (p2p *P2P) StartServer() (func() error, error) {
 	}
 
 	peerDiscoveryStopper := p2p.peerDiscoveryProcessor()
-	connectLoopStopper := p2p.connectLoop()
 
 	mdnsService := mdns.NewMdnsService(p2p.host, "protos", p2p)
 	if err := mdnsService.Start(); err != nil {
@@ -914,7 +684,6 @@ func (p2p *P2P) StartServer() (func() error, error) {
 		p2p.shuttingDown = true
 		p2p.shutdownMu.Unlock()
 		peerDiscoveryStopper()
-		connectLoopStopper()
 		if p2p.gossipCancel != nil {
 			p2p.gossipCancel()
 		}
@@ -1048,20 +817,16 @@ func NewKey(workdir string) (*P2PKey, error) {
 
 // P2PConfig holds configuration for the P2P manager
 type P2PConfig struct {
-	Key                 *P2PKey
-	Port                int
-	ListenAddr          string // IP address to listen on (default: 127.0.0.1)
-	PeerListChan        chan peer.IDSlice
-	Logger              *logrus.Logger
-	ExternalDB          p2psrv.ExternalDB
-	BootstrapPeers      []string // List of bootstrap peer multiaddrs
-	MaxPeers            int
-	MinPeers            int
-	RejectBackoff       time.Duration
-	RejectBackoffMax    time.Duration
-	ConnectLoopInterval time.Duration
-	AllowlistedPeers    []string
-	UnlimitedStart      bool
+	Key            *P2PKey
+	Port           int
+	ListenAddr     string // IP address to listen on (default: 127.0.0.1)
+	PeerListChan   chan peer.IDSlice
+	Logger         *logrus.Logger
+	ExternalDB     p2psrv.ExternalDB
+	BootstrapPeers []string // List of bootstrap peer multiaddrs
+
+	RejectBackoff    time.Duration
+	RejectBackoffMax time.Duration
 }
 
 // NewManager creates and returns a new p2p manager
@@ -1081,66 +846,34 @@ func NewManagerWithConfig(cfg P2PConfig) (*P2P, error) {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = "127.0.0.1"
 	}
-	if cfg.UnlimitedStart {
-		cfg.MaxPeers = 0
-		cfg.MinPeers = 0
-	} else if cfg.MaxPeers == 0 {
-		cfg.MaxPeers = defaultMaxPeers
+	rejectBackoff := cfg.RejectBackoff
+	if rejectBackoff == 0 {
+		rejectBackoff = defaultRejectBackoff
 	}
-	if cfg.MinPeers == 0 {
-		cfg.MinPeers = defaultMinPeers
-	}
-	if cfg.MinPeers > cfg.MaxPeers {
-		cfg.MinPeers = cfg.MaxPeers
-	}
-	if cfg.RejectBackoff == 0 {
-		cfg.RejectBackoff = defaultRejectBackoff
-	}
-	if cfg.RejectBackoffMax == 0 {
-		cfg.RejectBackoffMax = defaultRejectBackoffMax
-	}
-	if cfg.ConnectLoopInterval == 0 {
-		cfg.ConnectLoopInterval = defaultConnectLoopInterval
+	rejectBackoffMax := cfg.RejectBackoffMax
+	if rejectBackoffMax == 0 {
+		rejectBackoffMax = defaultRejectBackoffMax
 	}
 
 	p2p := &P2P{
-		PeerChan:            make(chan peer.AddrInfo),
-		peerListChan:        cfg.PeerListChan,
-		clients:             cmap.New(),
-		log:                 cfg.Logger,
-		grpcServer:          grpc.NewServer(p2pgrpc.WithP2PCredentials()),
-		externalDB:          cfg.ExternalDB,
-		prvKey:              cfg.Key.PrivateKey(),
-		bootstrapPeers:      cfg.BootstrapPeers,
-		peerMu:              cmap.New(),
-		maxPeers:            cfg.MaxPeers,
-		minPeers:            cfg.MinPeers,
-		rejectBackoff:       cfg.RejectBackoff,
-		rejectBackoffMax:    cfg.RejectBackoffMax,
-		connectLoopInterval: cfg.ConnectLoopInterval,
-		knownPeers:          make(map[string]*knownPeer),
-		allowlistedPeers:    make(map[string]struct{}),
-		unlimitedStart:      cfg.UnlimitedStart,
-	}
-	for _, id := range cfg.AllowlistedPeers {
-		if id == "" {
-			continue
-		}
-		p2p.allowlistedPeers[id] = struct{}{}
+		PeerChan:         make(chan peer.AddrInfo),
+		peerListChan:     cfg.PeerListChan,
+		clients:          cmap.New(),
+		log:              cfg.Logger,
+		grpcServer:       grpc.NewServer(p2pgrpc.WithP2PCredentials()),
+		externalDB:       cfg.ExternalDB,
+		prvKey:           cfg.Key.PrivateKey(),
+		bootstrapPeers:   cfg.BootstrapPeers,
+		peerMu:           cmap.New(),
+		rejectBackoff:    rejectBackoff,
+		rejectBackoffMax: rejectBackoffMax,
+		knownPeers:       make(map[string]*knownPeer),
 	}
 
-	// Connection manager with grace period to avoid premature connection pruning
-	connLow := p2p.maxPeers
-	if p2p.minPeers > connLow {
-		connLow = p2p.minPeers
-	}
-	if p2p.maxPeers <= 0 {
-		connLow = 10000
-	}
-	connHigh := connLow + 4
+	// Full-mesh: high connection limits to allow all peers
 	con, err := connmgr.NewConnManager(
-		connLow,
-		connHigh,
+		10000,
+		10004,
 		connmgr.WithGracePeriod(connGracePeriod),
 	)
 	if err != nil {

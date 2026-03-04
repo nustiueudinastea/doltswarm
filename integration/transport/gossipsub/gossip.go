@@ -92,33 +92,20 @@ func (g *GossipSubGossip) PublishCommitAd(ctx context.Context, ad doltswarm.Comm
 	return g.topic.Publish(ctx, b)
 }
 
-func (g *GossipSubGossip) PublishDigest(ctx context.Context, d doltswarm.DigestV1) error {
-	cp := make([]*iproto.Checkpoint, 0, len(d.Checkpoints))
-	for _, c := range d.Checkpoints {
-		cp = append(cp, &iproto.Checkpoint{
-			Hlc: &iproto.HLCTimestamp{
-				Wall:    c.HLC.Wall,
-				Logical: c.HLC.Logical,
-				PeerId:  c.HLC.PeerID,
-			},
-			CommitHash: c.CommitHash,
-		})
-	}
-
+func (g *GossipSubGossip) PublishHeartbeat(ctx context.Context, hb doltswarm.HeartbeatV1) error {
 	msg := &iproto.GossipMessage{
-		Msg: &iproto.GossipMessage_Digest{
-			Digest: &iproto.DigestV1{
+		Msg: &iproto.GossipMessage_Heartbeat{
+			Heartbeat: &iproto.HeartbeatV1{
 				Repo: &iproto.RepoId{
-					Org:      d.Repo.Org,
-					RepoName: d.Repo.RepoName,
+					Org:      hb.Repo.Org,
+					RepoName: hb.Repo.RepoName,
 				},
-				HeadHlc: &iproto.HLCTimestamp{
-					Wall:    d.HeadHLC.Wall,
-					Logical: d.HeadHLC.Logical,
-					PeerId:  d.HeadHLC.PeerID,
+				Hlc: &iproto.HLCTimestamp{
+					Wall:    hb.HLC.Wall,
+					Logical: hb.HLC.Logical,
+					PeerId:  hb.HLC.PeerID,
 				},
-				HeadHash:    d.HeadHash,
-				Checkpoints: cp,
+				PeerId: hb.PeerID,
 			},
 		},
 	}
@@ -178,42 +165,25 @@ func (s *subscription) Next(ctx context.Context) (doltswarm.GossipEvent, error) 
 			ObservedAt:   time.Now(),
 		}
 		evt.CommitAd = &ad
-	case *iproto.GossipMessage_Digest:
-		d := it.Digest
-		if d == nil || d.Repo == nil || d.HeadHlc == nil {
-			return doltswarm.GossipEvent{}, fmt.Errorf("invalid digest message")
+	case *iproto.GossipMessage_Heartbeat:
+		hb := it.Heartbeat
+		if hb == nil || hb.Hlc == nil || hb.Repo == nil {
+			return doltswarm.GossipEvent{}, fmt.Errorf("invalid heartbeat message")
 		}
-		checkpoints := make([]doltswarm.Checkpoint, 0, len(d.Checkpoints))
-		for _, c := range d.Checkpoints {
-			if c == nil || c.Hlc == nil {
-				continue
-			}
-			checkpoints = append(checkpoints, doltswarm.Checkpoint{
-				HLC: doltswarm.HLCTimestamp{
-					Wall:    c.Hlc.Wall,
-					Logical: c.Hlc.Logical,
-					PeerID:  c.Hlc.PeerId,
-				},
-				CommitHash: c.CommitHash,
-			})
-		}
-		digest := doltswarm.DigestV1{
+		heartbeat := doltswarm.HeartbeatV1{
 			Repo: doltswarm.RepoID{
-				Org:      d.Repo.Org,
-				RepoName: d.Repo.RepoName,
+				Org:      hb.Repo.Org,
+				RepoName: hb.Repo.RepoName,
 			},
-			HeadHLC: doltswarm.HLCTimestamp{
-				Wall:    d.HeadHlc.Wall,
-				Logical: d.HeadHlc.Logical,
-				PeerID:  d.HeadHlc.PeerId,
+			HLC: doltswarm.HLCTimestamp{
+				Wall:    hb.Hlc.Wall,
+				Logical: hb.Hlc.Logical,
+				PeerID:  hb.Hlc.PeerId,
 			},
-			HeadHash:    d.HeadHash,
-			Checkpoints: checkpoints,
-			ObservedAt:  time.Now(),
+			PeerID: hb.PeerId,
 		}
-		evt.Digest = &digest
+		evt.Heartbeat = &heartbeat
 	default:
-		// Ignore unknown.
 		s.log.Debugf("ignoring unknown gossip message type from %s", msg.GetFrom().String())
 		return evt, nil
 	}

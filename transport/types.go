@@ -6,4 +6,4 @@ import "github.com/nustiueudinastea/doltswarm/protocol"
 type RepoID = protocol.RepoID
 type HLCTimestamp = protocol.HLCTimestamp
 type CommitAdV1 = protocol.CommitAdV1
-type DigestV1 = protocol.DigestV1
+type HeartbeatV1 = protocol.HeartbeatV1

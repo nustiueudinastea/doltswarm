@@ -17,21 +17,6 @@ func (db *DB) getContentHash() (string, error) {
 	return hash, err
 }
 
-// VerifyMetadataSignature verifies the metadata signature of a CommitAd.
-//
-// NOTE: Remote verification requires peer public-key lookup. Until that is wired,
-// remote commits are accepted to avoid false rejections.
-func (db *DB) VerifyMetadataSignature(ad *CommitAd) bool {
-	if ad == nil {
-		return false
-	}
-	if ad.HLC.PeerID == db.signer.GetID() {
-		meta := ad.ToMetadata()
-		return meta.Verify(db.signer, db.signer.PublicKey()) == nil
-	}
-	return true
-}
-
 func (db *DB) CreateCommitMetadata(msg string, hlc HLCTimestamp) (*CommitMetadata, error) {
 	contentHash, err := db.getContentHash()
 	if err != nil {

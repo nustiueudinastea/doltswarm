@@ -12,21 +12,13 @@ type MemoryCommitIndex struct {
 
 	entries map[string]CommitIndexEntry
 
-	headSet  bool
-	headHLC  HLCTimestamp
-	headHash string
-
-	checkpoints []Checkpoint // newest->oldest
-
 	// Finalization state
-	finalizedBase    *FinalizedBase
-	originEventIDMap map[string]HLCTimestamp // origin_event_id -> resubmission HLC
+	finalizedBase *FinalizedBase
 }
 
 func NewMemoryCommitIndex() *MemoryCommitIndex {
 	return &MemoryCommitIndex{
-		entries:          make(map[string]CommitIndexEntry),
-		originEventIDMap: make(map[string]HLCTimestamp),
+		entries: make(map[string]CommitIndexEntry),
 	}
 }
 
@@ -34,12 +26,8 @@ func (m *MemoryCommitIndex) Close() error { return nil }
 
 func (m *MemoryCommitIndex) resetForRebuild() {
 	m.entries = make(map[string]CommitIndexEntry)
-	m.headSet = false
-	m.headHLC = HLCTimestamp{}
-	m.headHash = ""
-	m.checkpoints = nil
-	// Note: finalizedBase and originEventIDMap are intentionally preserved across rebuilds
-	// as they represent durable finalization state that should not be lost.
+	// Note: finalizedBase is intentionally preserved across rebuilds
+	// as it represents durable finalization state that should not be lost.
 }
 
 func (m *MemoryCommitIndex) Upsert(_ context.Context, e CommitIndexEntry) error {
@@ -79,42 +67,6 @@ func (m *MemoryCommitIndex) ListAfter(_ context.Context, after HLCTimestamp, lim
 	return out, nil
 }
 
-func (m *MemoryCommitIndex) SetHead(_ context.Context, headHLC HLCTimestamp, headHash string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.headSet = true
-	m.headHLC = headHLC
-	m.headHash = headHash
-	return nil
-}
-
-func (m *MemoryCommitIndex) Head(_ context.Context) (HLCTimestamp, string, bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.headHLC, m.headHash, m.headSet, nil
-}
-
-func (m *MemoryCommitIndex) RecentCheckpoints(_ context.Context, limit int) ([]Checkpoint, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if limit <= 0 || len(m.checkpoints) <= limit {
-		out := make([]Checkpoint, len(m.checkpoints))
-		copy(out, m.checkpoints)
-		return out, nil
-	}
-	out := make([]Checkpoint, limit)
-	copy(out, m.checkpoints[:limit])
-	return out, nil
-}
-
-func (m *MemoryCommitIndex) AppendCheckpoint(_ context.Context, cp Checkpoint) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// Prepend newest; keep simple and allow duplicates for now.
-	m.checkpoints = append([]Checkpoint{cp}, m.checkpoints...)
-	return nil
-}
-
 // FinalizedBase returns the current finalized base
 func (m *MemoryCommitIndex) FinalizedBase(_ context.Context) (FinalizedBase, bool, error) {
 	m.mu.RLock()
@@ -141,24 +93,5 @@ func (m *MemoryCommitIndex) SetFinalizedBase(_ context.Context, fb FinalizedBase
 		fb.UpdatedAt = time.Now()
 	}
 	m.finalizedBase = &fb
-	return nil
-}
-
-// GetOriginEventIDMapping checks if an origin_event_id has been resubmitted
-func (m *MemoryCommitIndex) GetOriginEventIDMapping(_ context.Context, originEventID string) (HLCTimestamp, bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	hlc, ok := m.originEventIDMap[originEventID]
-	return hlc, ok, nil
-}
-
-// SetOriginEventIDMapping records a resubmission for idempotency
-func (m *MemoryCommitIndex) SetOriginEventIDMapping(_ context.Context, originEventID string, newHLC HLCTimestamp) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.originEventIDMap == nil {
-		m.originEventIDMap = make(map[string]HLCTimestamp)
-	}
-	m.originEventIDMap[originEventID] = newHLC
 	return nil
 }

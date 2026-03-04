@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 
 	p2pgrpc "github.com/birros/go-libp2p-grpc"
 	"github.com/nustiueudinastea/doltswarm"
@@ -20,10 +21,6 @@ type ExternalDB interface {
 	GetLastCommit(branch string) (doltswarm.Commit, error)
 }
 
-type PeerLimiter interface {
-	SetPeerLimits(maxPeers, minPeers int)
-}
-
 type PeerStats interface {
 	PeerCounts() (hostPeers, grpcPeers, gossipPeers int)
 }
@@ -32,10 +29,9 @@ type Server struct {
 	proto.UnimplementedPingerServer
 	proto.UnimplementedTesterServer
 
-	DB      ExternalDB
-	Node    *doltswarm.Node
-	Limiter PeerLimiter
-	Stats   PeerStats
+	DB    ExternalDB
+	Node  *doltswarm.Node
+	Stats PeerStats
 }
 
 func (s *Server) Ping(ctx context.Context, req *proto.PingRequest) (*proto.PingResponse, error) {
@@ -89,8 +85,26 @@ func (s *Server) GetAllCommits(context.Context, *proto.GetAllCommitsRequest) (*p
 	}
 
 	res := &proto.GetAllCommitsResponse{}
+	type userCommit struct {
+		hash string
+		hlc  doltswarm.HLCTimestamp
+	}
+	userCommits := make([]userCommit, 0, len(commits))
 	for _, commit := range commits {
-		res.Commits = append(res.Commits, commit.Hash)
+		meta, err := doltswarm.ParseCommitMetadata(commit.Message)
+		if err != nil || meta == nil || meta.Kind != doltswarm.CommitKindUser {
+			continue
+		}
+		userCommits = append(userCommits, userCommit{hash: commit.Hash, hlc: meta.HLC})
+	}
+	sort.Slice(userCommits, func(i, j int) bool {
+		if userCommits[i].hlc.Equal(userCommits[j].hlc) {
+			return userCommits[i].hash < userCommits[j].hash
+		}
+		return userCommits[i].hlc.Less(userCommits[j].hlc)
+	})
+	for _, c := range userCommits {
+		res.Commits = append(res.Commits, c.hash)
 	}
 
 	return res, nil
@@ -113,11 +127,8 @@ func (s *Server) GetHead(context.Context, *proto.GetHeadRequest) (*proto.GetHead
 }
 
 func (s *Server) SetPeerLimits(ctx context.Context, req *proto.SetPeerLimitsRequest) (*proto.SetPeerLimitsResponse, error) {
-	if s.Limiter != nil {
-		s.Limiter.SetPeerLimits(int(req.GetMax()), int(req.GetMin()))
-		return &proto.SetPeerLimitsResponse{}, nil
-	}
-	return &proto.SetPeerLimitsResponse{Err: "peer limiter not configured"}, nil
+	// Peer limits are no longer enforced (full-mesh model).
+	return &proto.SetPeerLimitsResponse{}, nil
 }
 
 func (s *Server) GetPeerCounts(ctx context.Context, req *proto.GetPeerCountsRequest) (*proto.GetPeerCountsResponse, error) {

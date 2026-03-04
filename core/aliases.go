@@ -16,34 +16,11 @@ const MaxClockSkew = protocol.MaxClockSkew
 
 type CommitMetadata = protocol.CommitMetadata
 type CommitMetadataForSigning = protocol.CommitMetadataForSigning
-type OriginEnvelope = protocol.OriginEnvelope
 
-// Re-export commit kind constants
-const (
-	CommitKindNormal       = protocol.CommitKindNormal
-	CommitKindResubmission = protocol.CommitKindResubmission
-)
-
-// Re-export metadata helper functions
-var ComputeOriginEventID = protocol.ComputeOriginEventID
-var NewResubmissionMetadata = protocol.NewResubmissionMetadata
+const CommitKindUser = protocol.CommitKindUser
 
 type CommitAdV1 = protocol.CommitAdV1
-type Checkpoint = protocol.Checkpoint
-type DigestV1 = protocol.DigestV1
-
-type BundleRequest = protocol.BundleRequest
-type BundleHeader = protocol.BundleHeader
-type BundledCommit = protocol.BundledCommit
-type BundledChunk = protocol.BundledChunk
-type ChunkCodec = protocol.ChunkCodec
-
-const (
-	ChunkCodecRaw           = protocol.ChunkCodecRaw
-	ChunkCodecNBSCompressed = protocol.ChunkCodecNBSCompressed
-)
-
-type CommitBundle = protocol.CommitBundle
+type HeartbeatV1 = protocol.HeartbeatV1
 
 type Signer = protocol.Signer
 
@@ -64,22 +41,6 @@ type TableFileInfo = transport.TableFileInfo
 
 var ErrUnimplemented = transport.ErrUnimplemented
 
-func WithPreferredProvider(ctx context.Context, providerID string) context.Context {
-	return transport.WithPreferredProvider(ctx, providerID)
-}
-
-func PreferredProviderFromContext(ctx context.Context) (string, bool) {
-	return transport.PreferredProviderFromContext(ctx)
-}
-
-func WithExcludedProviders(ctx context.Context, providerIDs []string) context.Context {
-	return transport.WithExcludedProviders(ctx, providerIDs)
-}
-
-func ExcludedProvidersFromContext(ctx context.Context) []string {
-	return transport.ExcludedProvidersFromContext(ctx)
-}
-
 type UsedProviderTracker = transport.UsedProviderTracker
 
 func WithUsedProviderTracker(ctx context.Context, tracker *UsedProviderTracker) context.Context {
@@ -89,7 +50,3 @@ func WithUsedProviderTracker(ctx context.Context, tracker *UsedProviderTracker) 
 func UsedProviderTrackerFromContext(ctx context.Context) *UsedProviderTracker {
 	return transport.UsedProviderTrackerFromContext(ctx)
 }
-
-// PeerConnector is an optional interface for proactive connection establishment.
-type PeerConnector = transport.PeerConnector
-type PeerConnectivity = transport.PeerConnectivity

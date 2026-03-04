@@ -36,9 +36,13 @@ else
     exit 1
 fi
 
-# Build Docker image
+# Build Docker image (ensure it is loaded into the local Docker engine)
 echo "Building Docker image..."
-docker build -t doltswarmdemo -f "$BUILD_DIR/doltswarm/integration/docker/Dockerfile" "$BUILD_DIR"
+if docker buildx version >/dev/null 2>&1; then
+    docker buildx build --load -t doltswarmdemo -f "$BUILD_DIR/doltswarm/integration/docker/Dockerfile" "$BUILD_DIR"
+else
+    docker build -t doltswarmdemo -f "$BUILD_DIR/doltswarm/integration/docker/Dockerfile" "$BUILD_DIR"
+fi
 
 # Cleanup
 echo "Cleaning up build context..."

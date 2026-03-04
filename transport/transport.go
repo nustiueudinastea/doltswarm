@@ -11,11 +11,11 @@ type Transport interface {
 	Providers() ProviderPicker
 }
 
-// Gossip provides pubsub-style dissemination for small typed messages (ads/digests).
+// Gossip provides pubsub-style dissemination for small typed messages (ads/heartbeats).
 // The transport owns message encoding (protobuf/JSON/CBOR/etc) and routing.
 type Gossip interface {
 	PublishCommitAd(ctx context.Context, ad CommitAdV1) error
-	PublishDigest(ctx context.Context, digest DigestV1) error
+	PublishHeartbeat(ctx context.Context, hb HeartbeatV1) error
 
 	Subscribe(ctx context.Context) (GossipSubscription, error)
 }
@@ -28,22 +28,6 @@ type GossipSubscription interface {
 type GossipEvent struct {
 	From string
 
-	CommitAd *CommitAdV1
-	Digest   *DigestV1
-}
-
-// PeerConnector is an optional interface that transports can implement
-// to support proactive connection establishment to specific peers.
-// This helps ensure data-plane connections are ready when gossip arrives.
-type PeerConnector interface {
-	// EnsurePeerConnected requests that the transport establish a data-plane
-	// connection to the specified peer if not already connected.
-	// This is best-effort and non-blocking; the transport may queue the request.
-	EnsurePeerConnected(peerID string)
-}
-
-// PeerConnectivity is an optional interface that transports can implement to
-// report whether a peer is currently connected in the data plane.
-type PeerConnectivity interface {
-	IsPeerConnected(peerID string) bool
+	CommitAd  *CommitAdV1
+	Heartbeat *HeartbeatV1
 }

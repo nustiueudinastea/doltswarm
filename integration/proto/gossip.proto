@@ -11,12 +11,6 @@ message RepoId {
   string repo_name = 2;
 }
 
-// Checkpoint is a compact prefix summary entry (HLC + commit hash).
-message Checkpoint {
-  HLCTimestamp hlc = 1;
-  string commit_hash = 2;
-}
-
 // CommitAdV1 is the gossip payload for a commit advertisement.
 message CommitAdV1 {
   RepoId repo = 1;
@@ -25,18 +19,17 @@ message CommitAdV1 {
   bytes metadata_sig = 4;
 }
 
-// DigestV1 is a compact anti-entropy summary used to negotiate a shared base.
-message DigestV1 {
+// HeartbeatV1 is a periodic liveness message carrying the sender's current HLC.
+message HeartbeatV1 {
   RepoId repo = 1;
-  HLCTimestamp head_hlc = 2;
-  string head_hash = 3;
-  repeated Checkpoint checkpoints = 4;
+  HLCTimestamp hlc = 2;
+  string peer_id = 3;
 }
 
 // GossipMessage is the envelope published on the gossip topic.
 message GossipMessage {
   oneof msg {
     CommitAdV1 commit_ad = 1;
-    DigestV1 digest = 2;
+    HeartbeatV1 heartbeat = 3;
   }
 }

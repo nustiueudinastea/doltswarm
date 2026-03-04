@@ -73,59 +73,6 @@ func (x *RepoId) GetRepoName() string {
 	return ""
 }
 
-// Checkpoint is a compact prefix summary entry (HLC + commit hash).
-type Checkpoint struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Hlc           *HLCTimestamp          `protobuf:"bytes,1,opt,name=hlc,proto3" json:"hlc,omitempty"`
-	CommitHash    string                 `protobuf:"bytes,2,opt,name=commit_hash,json=commitHash,proto3" json:"commit_hash,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Checkpoint) Reset() {
-	*x = Checkpoint{}
-	mi := &file_proto_gossip_proto_msgTypes[1]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Checkpoint) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Checkpoint) ProtoMessage() {}
-
-func (x *Checkpoint) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gossip_proto_msgTypes[1]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Checkpoint.ProtoReflect.Descriptor instead.
-func (*Checkpoint) Descriptor() ([]byte, []int) {
-	return file_proto_gossip_proto_rawDescGZIP(), []int{1}
-}
-
-func (x *Checkpoint) GetHlc() *HLCTimestamp {
-	if x != nil {
-		return x.Hlc
-	}
-	return nil
-}
-
-func (x *Checkpoint) GetCommitHash() string {
-	if x != nil {
-		return x.CommitHash
-	}
-	return ""
-}
-
 // CommitAdV1 is the gossip payload for a commit advertisement.
 type CommitAdV1 struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -139,7 +86,7 @@ type CommitAdV1 struct {
 
 func (x *CommitAdV1) Reset() {
 	*x = CommitAdV1{}
-	mi := &file_proto_gossip_proto_msgTypes[2]
+	mi := &file_proto_gossip_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -151,7 +98,7 @@ func (x *CommitAdV1) String() string {
 func (*CommitAdV1) ProtoMessage() {}
 
 func (x *CommitAdV1) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gossip_proto_msgTypes[2]
+	mi := &file_proto_gossip_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -164,7 +111,7 @@ func (x *CommitAdV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitAdV1.ProtoReflect.Descriptor instead.
 func (*CommitAdV1) Descriptor() ([]byte, []int) {
-	return file_proto_gossip_proto_rawDescGZIP(), []int{2}
+	return file_proto_gossip_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *CommitAdV1) GetRepo() *RepoId {
@@ -195,32 +142,31 @@ func (x *CommitAdV1) GetMetadataSig() []byte {
 	return nil
 }
 
-// DigestV1 is a compact anti-entropy summary used to negotiate a shared base.
-type DigestV1 struct {
+// HeartbeatV1 is a periodic liveness message carrying the sender's current HLC.
+type HeartbeatV1 struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Repo          *RepoId                `protobuf:"bytes,1,opt,name=repo,proto3" json:"repo,omitempty"`
-	HeadHlc       *HLCTimestamp          `protobuf:"bytes,2,opt,name=head_hlc,json=headHlc,proto3" json:"head_hlc,omitempty"`
-	HeadHash      string                 `protobuf:"bytes,3,opt,name=head_hash,json=headHash,proto3" json:"head_hash,omitempty"`
-	Checkpoints   []*Checkpoint          `protobuf:"bytes,4,rep,name=checkpoints,proto3" json:"checkpoints,omitempty"`
+	Hlc           *HLCTimestamp          `protobuf:"bytes,2,opt,name=hlc,proto3" json:"hlc,omitempty"`
+	PeerId        string                 `protobuf:"bytes,3,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *DigestV1) Reset() {
-	*x = DigestV1{}
-	mi := &file_proto_gossip_proto_msgTypes[3]
+func (x *HeartbeatV1) Reset() {
+	*x = HeartbeatV1{}
+	mi := &file_proto_gossip_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *DigestV1) String() string {
+func (x *HeartbeatV1) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*DigestV1) ProtoMessage() {}
+func (*HeartbeatV1) ProtoMessage() {}
 
-func (x *DigestV1) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gossip_proto_msgTypes[3]
+func (x *HeartbeatV1) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_gossip_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -231,37 +177,30 @@ func (x *DigestV1) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use DigestV1.ProtoReflect.Descriptor instead.
-func (*DigestV1) Descriptor() ([]byte, []int) {
-	return file_proto_gossip_proto_rawDescGZIP(), []int{3}
+// Deprecated: Use HeartbeatV1.ProtoReflect.Descriptor instead.
+func (*HeartbeatV1) Descriptor() ([]byte, []int) {
+	return file_proto_gossip_proto_rawDescGZIP(), []int{2}
 }
 
-func (x *DigestV1) GetRepo() *RepoId {
+func (x *HeartbeatV1) GetRepo() *RepoId {
 	if x != nil {
 		return x.Repo
 	}
 	return nil
 }
 
-func (x *DigestV1) GetHeadHlc() *HLCTimestamp {
+func (x *HeartbeatV1) GetHlc() *HLCTimestamp {
 	if x != nil {
-		return x.HeadHlc
+		return x.Hlc
 	}
 	return nil
 }
 
-func (x *DigestV1) GetHeadHash() string {
+func (x *HeartbeatV1) GetPeerId() string {
 	if x != nil {
-		return x.HeadHash
+		return x.PeerId
 	}
 	return ""
-}
-
-func (x *DigestV1) GetCheckpoints() []*Checkpoint {
-	if x != nil {
-		return x.Checkpoints
-	}
-	return nil
 }
 
 // GossipMessage is the envelope published on the gossip topic.
@@ -270,7 +209,7 @@ type GossipMessage struct {
 	// Types that are valid to be assigned to Msg:
 	//
 	//	*GossipMessage_CommitAd
-	//	*GossipMessage_Digest
+	//	*GossipMessage_Heartbeat
 	Msg           isGossipMessage_Msg `protobuf_oneof:"msg"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -278,7 +217,7 @@ type GossipMessage struct {
 
 func (x *GossipMessage) Reset() {
 	*x = GossipMessage{}
-	mi := &file_proto_gossip_proto_msgTypes[4]
+	mi := &file_proto_gossip_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -290,7 +229,7 @@ func (x *GossipMessage) String() string {
 func (*GossipMessage) ProtoMessage() {}
 
 func (x *GossipMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_gossip_proto_msgTypes[4]
+	mi := &file_proto_gossip_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -303,7 +242,7 @@ func (x *GossipMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GossipMessage.ProtoReflect.Descriptor instead.
 func (*GossipMessage) Descriptor() ([]byte, []int) {
-	return file_proto_gossip_proto_rawDescGZIP(), []int{4}
+	return file_proto_gossip_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *GossipMessage) GetMsg() isGossipMessage_Msg {
@@ -322,10 +261,10 @@ func (x *GossipMessage) GetCommitAd() *CommitAdV1 {
 	return nil
 }
 
-func (x *GossipMessage) GetDigest() *DigestV1 {
+func (x *GossipMessage) GetHeartbeat() *HeartbeatV1 {
 	if x != nil {
-		if x, ok := x.Msg.(*GossipMessage_Digest); ok {
-			return x.Digest
+		if x, ok := x.Msg.(*GossipMessage_Heartbeat); ok {
+			return x.Heartbeat
 		}
 	}
 	return nil
@@ -339,13 +278,13 @@ type GossipMessage_CommitAd struct {
 	CommitAd *CommitAdV1 `protobuf:"bytes,1,opt,name=commit_ad,json=commitAd,proto3,oneof"`
 }
 
-type GossipMessage_Digest struct {
-	Digest *DigestV1 `protobuf:"bytes,2,opt,name=digest,proto3,oneof"`
+type GossipMessage_Heartbeat struct {
+	Heartbeat *HeartbeatV1 `protobuf:"bytes,3,opt,name=heartbeat,proto3,oneof"`
 }
 
 func (*GossipMessage_CommitAd) isGossipMessage_Msg() {}
 
-func (*GossipMessage_Digest) isGossipMessage_Msg() {}
+func (*GossipMessage_Heartbeat) isGossipMessage_Msg() {}
 
 var File_proto_gossip_proto protoreflect.FileDescriptor
 
@@ -354,26 +293,20 @@ const file_proto_gossip_proto_rawDesc = "" +
 	"\x12proto/gossip.proto\x12\x05proto\x1a\x0fproto/hlc.proto\"7\n" +
 	"\x06RepoId\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x1b\n" +
-	"\trepo_name\x18\x02 \x01(\tR\brepoName\"T\n" +
-	"\n" +
-	"Checkpoint\x12%\n" +
-	"\x03hlc\x18\x01 \x01(\v2\x13.proto.HLCTimestampR\x03hlc\x12\x1f\n" +
-	"\vcommit_hash\x18\x02 \x01(\tR\n" +
-	"commitHash\"\x9e\x01\n" +
+	"\trepo_name\x18\x02 \x01(\tR\brepoName\"\x9e\x01\n" +
 	"\n" +
 	"CommitAdV1\x12!\n" +
 	"\x04repo\x18\x01 \x01(\v2\r.proto.RepoIdR\x04repo\x12%\n" +
 	"\x03hlc\x18\x02 \x01(\v2\x13.proto.HLCTimestampR\x03hlc\x12#\n" +
 	"\rmetadata_json\x18\x03 \x01(\fR\fmetadataJson\x12!\n" +
-	"\fmetadata_sig\x18\x04 \x01(\fR\vmetadataSig\"\xaf\x01\n" +
-	"\bDigestV1\x12!\n" +
-	"\x04repo\x18\x01 \x01(\v2\r.proto.RepoIdR\x04repo\x12.\n" +
-	"\bhead_hlc\x18\x02 \x01(\v2\x13.proto.HLCTimestampR\aheadHlc\x12\x1b\n" +
-	"\thead_hash\x18\x03 \x01(\tR\bheadHash\x123\n" +
-	"\vcheckpoints\x18\x04 \x03(\v2\x11.proto.CheckpointR\vcheckpoints\"s\n" +
+	"\fmetadata_sig\x18\x04 \x01(\fR\vmetadataSig\"p\n" +
+	"\vHeartbeatV1\x12!\n" +
+	"\x04repo\x18\x01 \x01(\v2\r.proto.RepoIdR\x04repo\x12%\n" +
+	"\x03hlc\x18\x02 \x01(\v2\x13.proto.HLCTimestampR\x03hlc\x12\x17\n" +
+	"\apeer_id\x18\x03 \x01(\tR\x06peerId\"|\n" +
 	"\rGossipMessage\x120\n" +
-	"\tcommit_ad\x18\x01 \x01(\v2\x11.proto.CommitAdV1H\x00R\bcommitAd\x12)\n" +
-	"\x06digest\x18\x02 \x01(\v2\x0f.proto.DigestV1H\x00R\x06digestB\x05\n" +
+	"\tcommit_ad\x18\x01 \x01(\v2\x11.proto.CommitAdV1H\x00R\bcommitAd\x122\n" +
+	"\theartbeat\x18\x03 \x01(\v2\x12.proto.HeartbeatV1H\x00R\theartbeatB\x05\n" +
 	"\x03msgB\tZ\a./protob\x06proto3"
 
 var (
@@ -388,29 +321,26 @@ func file_proto_gossip_proto_rawDescGZIP() []byte {
 	return file_proto_gossip_proto_rawDescData
 }
 
-var file_proto_gossip_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_proto_gossip_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_proto_gossip_proto_goTypes = []any{
 	(*RepoId)(nil),        // 0: proto.RepoId
-	(*Checkpoint)(nil),    // 1: proto.Checkpoint
-	(*CommitAdV1)(nil),    // 2: proto.CommitAdV1
-	(*DigestV1)(nil),      // 3: proto.DigestV1
-	(*GossipMessage)(nil), // 4: proto.GossipMessage
-	(*HLCTimestamp)(nil),  // 5: proto.HLCTimestamp
+	(*CommitAdV1)(nil),    // 1: proto.CommitAdV1
+	(*HeartbeatV1)(nil),   // 2: proto.HeartbeatV1
+	(*GossipMessage)(nil), // 3: proto.GossipMessage
+	(*HLCTimestamp)(nil),  // 4: proto.HLCTimestamp
 }
 var file_proto_gossip_proto_depIdxs = []int32{
-	5, // 0: proto.Checkpoint.hlc:type_name -> proto.HLCTimestamp
-	0, // 1: proto.CommitAdV1.repo:type_name -> proto.RepoId
-	5, // 2: proto.CommitAdV1.hlc:type_name -> proto.HLCTimestamp
-	0, // 3: proto.DigestV1.repo:type_name -> proto.RepoId
-	5, // 4: proto.DigestV1.head_hlc:type_name -> proto.HLCTimestamp
-	1, // 5: proto.DigestV1.checkpoints:type_name -> proto.Checkpoint
-	2, // 6: proto.GossipMessage.commit_ad:type_name -> proto.CommitAdV1
-	3, // 7: proto.GossipMessage.digest:type_name -> proto.DigestV1
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	0, // 0: proto.CommitAdV1.repo:type_name -> proto.RepoId
+	4, // 1: proto.CommitAdV1.hlc:type_name -> proto.HLCTimestamp
+	0, // 2: proto.HeartbeatV1.repo:type_name -> proto.RepoId
+	4, // 3: proto.HeartbeatV1.hlc:type_name -> proto.HLCTimestamp
+	1, // 4: proto.GossipMessage.commit_ad:type_name -> proto.CommitAdV1
+	2, // 5: proto.GossipMessage.heartbeat:type_name -> proto.HeartbeatV1
+	6, // [6:6] is the sub-list for method output_type
+	6, // [6:6] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_proto_gossip_proto_init() }
@@ -419,9 +349,9 @@ func file_proto_gossip_proto_init() {
 		return
 	}
 	file_proto_hlc_proto_init()
-	file_proto_gossip_proto_msgTypes[4].OneofWrappers = []any{
+	file_proto_gossip_proto_msgTypes[3].OneofWrappers = []any{
 		(*GossipMessage_CommitAd)(nil),
-		(*GossipMessage_Digest)(nil),
+		(*GossipMessage_Heartbeat)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -429,7 +359,7 @@ func file_proto_gossip_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_gossip_proto_rawDesc), len(file_proto_gossip_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
