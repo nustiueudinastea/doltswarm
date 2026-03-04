@@ -208,12 +208,13 @@ Steps:
 
 1. If `e.cid ∈ clock`: discard (idempotent).
 2. **Signature check:** If `IdentityResolver` is configured, verify `e.signature` against `e.peer`'s public key. If invalid, discard silently.
-3. `hlc ← merge(hlc, e.hlc)`.
-4. `clock[e.cid] ← e`. Event is now **ANNOUNCED**.
-5. Recompute `heads` from clock: `heads = { cid ∈ clock | cid is not a parent of any event in clock }`.
-6. If `|heads| = 1` and chunks are available: fast-forward `latest_root ← clock[head].root_hash`.
-7. Request prolly tree chunks for `e.root_hash` from originating peer via point-to-point stream. On completion, event becomes **CHUNKS_READY**.
-8. Call `RECONCILE(peer)` (if `|heads| > 1`). `RECONCILE` operates only on heads that are **CHUNKS_READY** or **MERGEABLE** — heads whose chunks are not yet local are skipped until the next reconciliation pass.
+3. **Strict admission rule:** If an event is valid and new, it MUST be accepted into `clock`. Peers MUST NOT discard based on local wall-time checks (e.g., `|now() - e.hlc.wall|`).
+4. `hlc ← merge(hlc, e.hlc)`.
+5. `clock[e.cid] ← e`. Event is now **ANNOUNCED**.
+6. Recompute `heads` from clock: `heads = { cid ∈ clock | cid is not a parent of any event in clock }`.
+7. If `|heads| = 1` and chunks are available: fast-forward `latest_root ← clock[head].root_hash`.
+8. Request prolly tree chunks for `e.root_hash` from originating peer via point-to-point stream. On completion, event becomes **CHUNKS_READY**.
+9. Call `RECONCILE(peer)` (if `|heads| > 1`). `RECONCILE` operates only on heads that are **CHUNKS_READY** or **MERGEABLE** — heads whose chunks are not yet local are skipped until the next reconciliation pass.
 
 #### RECONCILE(peer) → unit
 
@@ -508,7 +509,7 @@ RECEIVE_EVENT(e)
 
 Old events (e.g., from a peer reconnecting after a partition) are accepted into the clock like any other event. There is no protocol-level rejection mechanism — the Merkle clock is a G-Set (append-only, union-merge). Old events are placed in the correct position by the HLC total order, reconciled via `MergeRoots`, and eventually finalized. If they conflict with newer events, they are parked like any other conflict (§6.2).
 
-**Local admission policy (optional, implementation-level):** Peers may apply a local admission window (e.g., discard events with `|now() - e.hlc.wall| > 60s`) as an implementation-level safety valve against severely skewed clocks. This is a unilateral decision — no broadcast, no voting, no coordination. It is not part of the core protocol.
+**Strict convergence requirement:** Peers MUST NOT apply unilateral wall-time admission windows that discard otherwise-valid events. Local wall clocks can differ; dropping by `|now() - e.hlc.wall|` would violate the Merkle clock G-Set model and break INV1 (Clock Convergence). Skew handling is operational: peers may log/flag suspicious timestamps and apply transport/identity controls (rate-limit, disconnect, key revocation), but valid events still enter `clock`.
 
 ### 6.2 Conflicts (Data or Schema)
 

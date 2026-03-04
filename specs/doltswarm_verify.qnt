@@ -507,9 +507,11 @@ module doltswarm_verify {
   /// A peer processes a single event from its inbox.
   /// Events are processed one at a time (not batched), matching the protocol's
   /// per-event processing with inline reconciliation between events.
-  /// Reconciliation is inlined here (matching §2.4 RECEIVE_EVENT step 8):
+  /// Reconciliation is inlined here (matching §2.4 RECEIVE_EVENT step 9):
   /// when receiving creates multiple active heads, immediately compute the
   /// merged root and park any conflicts.
+  /// No local wall-time admission filter is modeled or permitted: any valid,
+  /// non-duplicate received event is accepted into the clock (G-Set behavior).
   action do_receive(p: PeerID): bool = {
     val st = nodes.get(p)
     val processable = inbox.get(p).filter(e =>
