@@ -66,6 +66,9 @@ module doltswarm_verify {
     stable_hlc: HLC,
     finalized_root: Hash,
     finalized_events: Set[EventCID],
+    finalized_parents: Hash -> Set[Hash],
+    finalized_ancestors: Hash -> Set[Hash],
+    finalized_depth: Hash -> int,
     parked_conflicts: Set[EventCID],
     active_peers: Set[PeerID],
     localWall: int,
@@ -160,45 +163,6 @@ module doltswarm_verify {
     cidList.sortList((a, b) => less(clock.get(a).hlc, clock.get(b).hlc))
   }
 
-  /// Deterministic finalized root from a LINEAR event chain: pure function of
-  /// the event set. Sorts events by HLC total order and folds mergeRoots from
-  /// EMPTY_ROOT. Since mergeRoots(acc, x, acc) is a fast-forward (ours ==
-  /// ancestor → theirs), the result equals the root_hash of the HLC-maximum
-  /// event. The fold is kept explicit to mirror the protocol's replay semantics.
-  ///
-  /// Events that produce a conflict during the fold are skipped (§7.1.1):
-  /// this handles formerly-parked events whose root_hash branches from an
-  /// earlier state. The resolution event (later in HLC order) carries their
-  /// data. In this abstract model, the skip path is never exercised because
-  /// mergeRoots(acc, x, acc) always fast-forwards, but it aligns with the
-  /// protocol and provides defense in depth.
-  ///
-  /// IMPORTANT: This function is ONLY used for computing the common ancestor
-  /// during SYNC_FINALIZED's divergence branch (where the input is a pre-split linear chain —
-  /// correct). It must NOT be used for general finalized root advancement,
-  /// because after a partition merge the finalized event set contains events
-  /// from divergent lineages whose merged result cannot be recovered by
-  /// replaying them in HLC order. do_finalize uses a fixed-anchor batch fold
-  /// over stable frontier heads instead. See §7.10.
-  pure def computeFinalizedRoot(events: Set[EventCID], clock: EventCID -> Event): Hash = {
-    if (events.empty()) EMPTY_ROOT
-    else {
-      // Only include events still present in the clock
-      val present = events.filter(cid => clock.has(cid))
-      if (present.empty()) EMPTY_ROOT
-      else {
-        val sorted = sortCIDsByHLC(present, clock)
-        sorted.foldl(EMPTY_ROOT, (acc, cid) => {
-          val merged = mergeRoots(acc, clock.get(cid).root_hash, acc)
-          // Skip events that conflict in the fold (§7.1.1): handles
-          // formerly-parked events whose content was subsumed by a
-          // later resolution event.
-          if (merged == CONFLICT_HASH) acc else merged
-        })
-      }
-    }
-  }
-
   /// Deterministic merged root for a set of heads.
   /// Operates on ALL heads (not pre-filtered by existing parked_conflicts).
   /// Sorts heads by HLC and folds mergeRoots left-to-right.
@@ -263,6 +227,76 @@ module doltswarm_verify {
     }
   }
 
+  /// Merge two maps Hash -> Set[Hash] by key union and value union.
+  pure def mergeSetMap(m1: Hash -> Set[Hash], m2: Hash -> Set[Hash]): Hash -> Set[Hash] = {
+    m1.keys().union(m2.keys()).mapBy(k => {
+      val s1 = if (m1.has(k)) m1.get(k) else Set()
+      val s2 = if (m2.has(k)) m2.get(k) else Set()
+      s1.union(s2)
+    })
+  }
+
+  /// Merge two maps Hash -> int by key union and max value.
+  pure def mergeDepthMap(m1: Hash -> int, m2: Hash -> int): Hash -> int = {
+    m1.keys().union(m2.keys()).mapBy(k => {
+      val d1 = if (m1.has(k)) m1.get(k) else 0
+      val d2 = if (m2.has(k)) m2.get(k) else 0
+      if (d1 > d2) d1 else d2
+    })
+  }
+
+  /// Add/update a finalized checkpoint root with given parent roots.
+  ///
+  /// Uses root-level checkpoint DAG metadata:
+  /// - if child already exists, parents are unioned
+  /// - ancestors/depth are recomputed from merged parents
+  pure def lineageAddCheckpoint(parentsMap: Hash -> Set[Hash],
+      ancestorsMap: Hash -> Set[Hash], depthMap: Hash -> int, child: Hash,
+      parentRoots: Set[Hash]): ((Hash -> Set[Hash]), (Hash -> Set[Hash]), (Hash -> int)) = {
+    val sanitizedParents = parentRoots.exclude(Set(child))
+    val priorParents = if (parentsMap.has(child)) parentsMap.get(child) else Set()
+    val allParents = priorParents.union(sanitizedParents)
+    val parentAncestors = allParents.fold(Set(), (acc, p) => {
+      val anc = if (ancestorsMap.has(p)) ancestorsMap.get(p) else Set(p, EMPTY_ROOT)
+      acc.union(anc)
+    })
+    val allAncestors = Set(child).union(parentAncestors)
+    val maxParentDepth = allParents.fold(0, (acc, p) => {
+      val d = if (depthMap.has(p)) depthMap.get(p) else if (p == EMPTY_ROOT) 0 else 1
+      if (d > acc) d else acc
+    })
+    val childDepth = if (child == EMPTY_ROOT) 0 else maxParentDepth + 1
+    (
+      parentsMap.put(child, allParents),
+      ancestorsMap.put(child, allAncestors),
+      depthMap.put(child, childDepth)
+    )
+  }
+
+  /// Lowest common finalized-root ancestor using finalized checkpoint metadata.
+  /// Picks the common ancestor with highest depth; ties break by root value.
+  pure def lineageLcaRoot(rootA: Hash, rootB: Hash, ancestorsMap: Hash -> Set[Hash],
+      depthMap: Hash -> int): Hash = {
+    val ancA = if (ancestorsMap.has(rootA)) ancestorsMap.get(rootA) else Set(rootA, EMPTY_ROOT)
+    val ancB = if (ancestorsMap.has(rootB)) ancestorsMap.get(rootB) else Set(rootB, EMPTY_ROOT)
+    val common = ancA.intersect(ancB)
+    if (common.empty()) EMPTY_ROOT
+    else common.fold(EMPTY_ROOT, (best, candidate) => {
+      val bestDepth = if (depthMap.has(best)) depthMap.get(best) else 0
+      val candidateDepth = if (depthMap.has(candidate)) depthMap.get(candidate) else 0
+      if (candidateDepth > bestDepth) candidate
+      else if (candidateDepth < bestDepth) best
+      else if (candidate < best) candidate
+      else best
+    })
+  }
+
+  pure def depthAt(depthMap: Hash -> int, root: Hash): int =
+    if (depthMap.has(root)) depthMap.get(root) else 0
+
+  pure def ancestorsAt(ancestorsMap: Hash -> Set[Hash], root: Hash): Set[Hash] =
+    if (ancestorsMap.has(root)) ancestorsMap.get(root) else Set(root, EMPTY_ROOT)
+
   // ===========================================================================
   // SYNC_FINALIZED contract helpers
   // ===========================================================================
@@ -291,6 +325,18 @@ module doltswarm_verify {
       true
   }
 
+  /// Lineage metadata readiness for SYNC_FINALIZED: after exchanging finalized
+  /// checkpoint metadata, both local and remote finalized roots must be present
+  /// in the merged lineage view so common-ancestor lookup is well-defined.
+  pure def syncLineageReady(st_local: NodeState, st_remote: NodeState): bool = {
+    val mergedAncestors = mergeSetMap(
+      st_local.finalized_ancestors,
+      st_remote.finalized_ancestors
+    )
+    mergedAncestors.has(st_local.finalized_root) and
+      mergedAncestors.has(st_remote.finalized_root)
+  }
+
   /// Enable condition for SYNC_FINALIZED transition.
   pure def syncEnabled(conn: Set[(PeerID, PeerID)], p: PeerID, q: PeerID,
       st_local: NodeState, st_remote: NodeState): bool = all {
@@ -300,22 +346,39 @@ module doltswarm_verify {
     st_local.finalized_root != EMPTY_ROOT,
     st_remote.finalized_root != EMPTY_ROOT,
     syncAdoptionReady(st_local, st_remote),
+    syncLineageReady(st_local, st_remote),
   }
 
   /// Finalized-state update for SYNC_FINALIZED (without latest_root re-anchoring).
   pure def syncFinalizedCore(st_local: NodeState, st_remote: NodeState): NodeState = {
     val mode = syncMode(st_local, st_remote)
+    // SYNC_FINALIZED exchanges finalized checkpoint metadata. The spec models
+    // this by taking the union of local+remote lineage maps.
+    val mergedParents = mergeSetMap(st_local.finalized_parents, st_remote.finalized_parents)
+    val mergedAncestors = mergeSetMap(st_local.finalized_ancestors, st_remote.finalized_ancestors)
+    val mergedDepth = mergeDepthMap(st_local.finalized_depth, st_remote.finalized_depth)
+    val withMergedLineage: NodeState = {
+      ...st_local,
+      finalized_parents: mergedParents,
+      finalized_ancestors: mergedAncestors,
+      finalized_depth: mergedDepth,
+    }
     if (mode == SYNC_ADOPT) {
       {
-        ...st_local,
+        ...withMergedLineage,
         finalized_root: st_remote.finalized_root,
         finalized_events: st_remote.finalized_events,
       }
     } else if (mode == SYNC_NOOP) {
-      st_local
+      // Ahead path: finalized state no-op, but metadata exchange is retained.
+      withMergedLineage
     } else {
-      val commonEvents = st_local.finalized_events.intersect(st_remote.finalized_events)
-      val commonRoot = computeFinalizedRoot(commonEvents, st_local.clock)
+      val commonRoot = lineageLcaRoot(
+        st_local.finalized_root,
+        st_remote.finalized_root,
+        mergedAncestors,
+        mergedDepth
+      )
       // Deterministic ours/theirs: compare finalized roots by value.
       val oursRoot = if (st_local.finalized_root < st_remote.finalized_root)
         st_local.finalized_root else st_remote.finalized_root
@@ -325,10 +388,23 @@ module doltswarm_verify {
       val mergedEvents = st_local.finalized_events.union(st_remote.finalized_events)
       // Unified path: on conflict, use ours root (deterministic, no blocking).
       val effectiveRoot = if (merged == CONFLICT_HASH) oursRoot else merged
-      {
-        ...st_local,
+      val mergedState: NodeState = {
+        ...withMergedLineage,
         finalized_root: effectiveRoot,
         finalized_events: mergedEvents,
+      }
+      val lineage = lineageAddCheckpoint(
+        mergedState.finalized_parents,
+        mergedState.finalized_ancestors,
+        mergedState.finalized_depth,
+        effectiveRoot,
+        Set(st_local.finalized_root, st_remote.finalized_root)
+      )
+      {
+        ...mergedState,
+        finalized_parents: lineage._1,
+        finalized_ancestors: lineage._2,
+        finalized_depth: lineage._3,
       }
     }
   }
@@ -367,6 +443,9 @@ module doltswarm_verify {
       stable_hlc: ZERO,
       finalized_root: EMPTY_ROOT,
       finalized_events: Set(),
+      finalized_parents: Map().put(EMPTY_ROOT, Set()),
+      finalized_ancestors: Map().put(EMPTY_ROOT, Set(EMPTY_ROOT)),
+      finalized_depth: Map().put(EMPTY_ROOT, 0),
       parked_conflicts: Set(),
       active_peers: PEERS,
       localWall: 1,
@@ -590,10 +669,30 @@ module doltswarm_verify {
     all {
       not(candidates.empty()),
       val batch = finalizeBatch(st)
-      nodes' = nodes.set(p, {
+      val withBatch: NodeState = {
         ...st,
         finalized_root: batch._1,
         finalized_events: batch._2,
+      }
+      val withLineage: NodeState = if (batch._1 != st.finalized_root) {
+        val lineage = lineageAddCheckpoint(
+          st.finalized_parents,
+          st.finalized_ancestors,
+          st.finalized_depth,
+          batch._1,
+          Set(st.finalized_root)
+        )
+        {
+          ...withBatch,
+          finalized_parents: lineage._1,
+          finalized_ancestors: lineage._2,
+          finalized_depth: lineage._3,
+        }
+      } else {
+        withBatch
+      }
+      nodes' = nodes.set(p, {
+        ...withLineage,
       }),
       inbox' = inbox,
       prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
@@ -801,6 +900,150 @@ module doltswarm_verify {
     (s1.finalized_events == s2.finalized_events) implies
       (s1.finalized_root == s2.finalized_root)
   }))
+
+  /// Finalized lineage well-formedness:
+  /// - EMPTY_ROOT is present with depth 0
+  /// - finalized_root is present in all lineage maps
+  /// - every known root is its own ancestor
+  /// - every parent edge points to a strictly shallower root
+  val inv_lineage_well_formed = PEERS.forall(p => {
+    val st = nodes.get(p)
+    val knownRoots = st.finalized_parents.keys()
+      .union(st.finalized_ancestors.keys())
+      .union(st.finalized_depth.keys())
+    all {
+      st.finalized_parents.has(EMPTY_ROOT),
+      st.finalized_ancestors.has(EMPTY_ROOT),
+      st.finalized_depth.has(EMPTY_ROOT),
+      st.finalized_depth.get(EMPTY_ROOT) == 0,
+      st.finalized_parents.has(st.finalized_root),
+      st.finalized_ancestors.has(st.finalized_root),
+      st.finalized_depth.has(st.finalized_root),
+      knownRoots.forall(r =>
+        st.finalized_parents.has(r) and
+        st.finalized_ancestors.has(r) and
+        st.finalized_depth.has(r) and
+        st.finalized_ancestors.get(r).contains(r)
+      ),
+      st.finalized_parents.keys().forall(r =>
+        st.finalized_parents.get(r).forall(parent =>
+          parent != r and
+          st.finalized_depth.has(parent) and
+          st.finalized_depth.get(parent) < st.finalized_depth.get(r)
+        )
+      ),
+    }
+  })
+
+  /// Finalized lineage closure:
+  /// - parents of a root are included in its ancestor set
+  /// - every referenced parent has lineage metadata entries
+  val inv_lineage_closure = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.finalized_parents.keys().forall(r => {
+      if (st.finalized_ancestors.has(r)) {
+        st.finalized_parents.get(r).subseteq(st.finalized_ancestors.get(r)) and
+        st.finalized_parents.get(r).forall(parent =>
+          st.finalized_parents.has(parent) and
+          st.finalized_ancestors.has(parent) and
+          st.finalized_depth.has(parent)
+        )
+      } else {
+        false
+      }
+    })
+  })
+
+  /// LCA soundness over lineage metadata:
+  /// lineageLcaRoot(a, b) must be a common ancestor with maximal depth.
+  val inv_lineage_lca_sound = PEERS.forall(p => {
+    val st = nodes.get(p)
+    val knownRoots = st.finalized_ancestors.keys().intersect(st.finalized_depth.keys())
+    knownRoots.forall(a => knownRoots.forall(b => {
+      val lca = lineageLcaRoot(a, b, st.finalized_ancestors, st.finalized_depth)
+      val common = ancestorsAt(st.finalized_ancestors, a).intersect(
+        ancestorsAt(st.finalized_ancestors, b)
+      )
+      if (common.empty()) {
+        lca == EMPTY_ROOT
+      } else {
+        all {
+          common.contains(lca),
+          common.forall(c =>
+            depthAt(st.finalized_depth, c) <= depthAt(st.finalized_depth, lca)
+          ),
+        }
+      }
+    }))
+  })
+
+  /// SYNC_FINALIZED metadata-union contract:
+  /// output lineage metadata includes merged local+remote metadata.
+  val inv_sync_metadata_union = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val mergedParents = mergeSetMap(st_p.finalized_parents, st_q.finalized_parents)
+    val mergedAncestors = mergeSetMap(st_p.finalized_ancestors, st_q.finalized_ancestors)
+    val mergedDepth = mergeDepthMap(st_p.finalized_depth, st_q.finalized_depth)
+    val synced = applySyncFinalized(st_p, st_q)
+    syncEnabled(connected, p, q, st_p, st_q) implies all {
+      mergedParents.keys().forall(k => {
+        if (synced.finalized_parents.has(k))
+          mergedParents.get(k).subseteq(synced.finalized_parents.get(k))
+        else
+          false
+      }),
+      mergedAncestors.keys().forall(k => {
+        if (synced.finalized_ancestors.has(k))
+          mergedAncestors.get(k).subseteq(synced.finalized_ancestors.get(k))
+        else
+          false
+      }),
+      mergedDepth.keys().forall(k => {
+        if (synced.finalized_depth.has(k))
+          synced.finalized_depth.get(k) >= mergedDepth.get(k)
+        else
+          false
+      }),
+    }
+  }))
+
+  /// SYNC_FINALIZED merge branch must record lineage links to both input roots
+  /// (excluding self-edge if resulting root equals one input root).
+  val inv_sync_merge_parent_edges = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val synced = applySyncFinalized(st_p, st_q)
+    val expectedParents = Set(st_p.finalized_root, st_q.finalized_root)
+      .exclude(Set(synced.finalized_root))
+    (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_MERGE) implies {
+      if (synced.finalized_parents.has(synced.finalized_root))
+        expectedParents.subseteq(synced.finalized_parents.get(synced.finalized_root))
+      else
+        false
+    }
+  }))
+
+  /// Nested-merge determinism check:
+  /// sync(sync(A,B),C) and sync(A,sync(B,C)) converge on finalized state
+  /// under merge-mode preconditions.
+  val inv_sync_nested_merge_determinism = PEERS.forall(p => PEERS.forall(q => PEERS.forall(r => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val st_r = nodes.get(r)
+    val left = applySyncFinalized(applySyncFinalized(st_p, st_q), st_r)
+    val right = applySyncFinalized(st_p, applySyncFinalized(st_q, st_r))
+    (p != q and q != r and p != r and
+      syncEnabled(connected, p, q, st_p, st_q) and
+      syncEnabled(connected, q, r, st_q, st_r) and
+      syncEnabled(connected, p, r, st_p, st_r) and
+      syncMode(st_p, st_q) == SYNC_MERGE and
+      syncMode(st_q, st_r) == SYNC_MERGE and
+      syncMode(st_p, st_r) == SYNC_MERGE) implies all {
+      left.finalized_root == right.finalized_root,
+      left.finalized_events == right.finalized_events,
+    }
+  })))
 
   /// SYNC_FINALIZED contract (adopt branch): behind peer adopts remote
   /// finalized state exactly once metadata is complete.
