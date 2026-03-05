@@ -49,6 +49,8 @@ module doltswarm_verify {
 
   type Hash = int
   /// EventCID is a (peer, wall, logical) tuple — unique event identifier.
+  /// Protocol-level CID bytes come from hash(CanonicalEncode(CIDPayload));
+  /// this tuple abstracts that identity without modeling byte encoding/hashing.
   type EventCID = (int, int, int)
 
   /// Deterministic identity for a finalized-layer conflict from SYNC_FINALIZED.
@@ -80,6 +82,7 @@ module doltswarm_verify {
     stable_hlc: HLC,
     finalized_root: Hash,
     finalized_events: Set[EventCID],
+    finalized_event_roots: EventCID -> Hash,
     finalized_parents: Hash -> Set[Hash],
     finalized_ancestors: Hash -> Set[Hash],
     finalized_depth: Hash -> int,
@@ -298,6 +301,17 @@ module doltswarm_verify {
     }
   }
 
+  /// Finalized events safe to compact from clock.
+  /// A finalized CID is pruneable only if no non-finalized event depends on it
+  /// through parent ancestry.
+  pure def gcPruneable(st: NodeState): Set[EventCID] =
+    st.finalized_events.intersect(st.clock.keys()).filter(cid =>
+      not(st.clock.keys().exists(eid =>
+        not(st.finalized_events.contains(eid)) and
+        ancestorIdClosure(Set(eid), st.clock).contains(cid)
+      ))
+    )
+
   /// Merge two maps Hash -> Set[Hash] by key union and value union.
   pure def mergeSetMap(m1: Hash -> Set[Hash], m2: Hash -> Set[Hash]): Hash -> Set[Hash] = {
     m1.keys().union(m2.keys()).mapBy(k => {
@@ -315,6 +329,23 @@ module doltswarm_verify {
       if (d1 > d2) d1 else d2
     })
   }
+
+  /// Merge finalized event catalogs (cid -> root hash) by key union.
+  pure def mergeEventRootMap(m1: EventCID -> Hash, m2: EventCID -> Hash): EventCID -> Hash =
+    m1.keys().union(m2.keys()).mapBy(k =>
+      if (m1.has(k)) m1.get(k) else m2.get(k)
+    )
+
+  /// Keep only entries whose CID is in the target finalized set.
+  pure def retainEventRoots(m: EventCID -> Hash, finalizedEvents: Set[EventCID]): EventCID -> Hash =
+    m.keys().intersect(finalizedEvents).mapBy(k => m.get(k))
+
+  /// Add finalized event roots from clock into the finalized catalog.
+  pure def indexFinalizedEvents(catalog: EventCID -> Hash, clock: EventCID -> Event,
+      finalizedCIDs: Set[EventCID]): EventCID -> Hash =
+    finalizedCIDs.fold(catalog, (acc, cid) =>
+      if (clock.has(cid)) acc.put(cid, clock.get(cid).root_hash) else acc
+    )
 
   /// Merge two finalized-conflict maps by key union.
   pure def mergeFinalizedConflictMap(
@@ -391,11 +422,20 @@ module doltswarm_verify {
       conflictIDs: Set[FinalizedConflictID]): FinalizedConflictID -> FinalizedConflict =
     conflicts.keys().exclude(conflictIDs).mapBy(k => conflicts.get(k))
 
+  /// Remove one event from the clock map.
+  pure def dropEvent(clock: EventCID -> Event, cid: EventCID): EventCID -> Event =
+    clock.keys().exclude(Set(cid)).mapBy(k => clock.get(k))
+
   /// Collect all finalized-conflict resolution references observed in a clock.
   pure def resolvedFinalizedConflictRefs(clock: EventCID -> Event): Set[FinalizedConflictID] =
     clock.keys().fold(Set(), (acc, cid) =>
       acc.union(clock.get(cid).resolved_finalized_conflicts)
     )
+
+  /// Finalized-event metadata catalog visible to sync logic and invariants.
+  /// Includes both retained finalized events in clock and compacted finalized roots.
+  pure def finalizedEventCatalog(st: NodeState): Set[EventCID] =
+    st.finalized_event_roots.keys().union(st.finalized_events.intersect(st.clock.keys()))
 
   pure def resolveFinalizedConflictEnabled(st: NodeState, p: PeerID,
       conflictID: FinalizedConflictID): bool = all {
@@ -454,11 +494,11 @@ module doltswarm_verify {
   }
 
   /// Metadata-completeness gate used by SYNC_FINALIZED.
-  /// If local is behind and must adopt, it must already have remote finalized
-  /// events in its local clock metadata.
+  /// If local is behind and must adopt, the remote peer must have a complete
+  /// finalized-event catalog for its own finalized set.
   pure def syncAdoptionReady(st_local: NodeState, st_remote: NodeState): bool = {
     if (syncMode(st_local, st_remote) == SYNC_ADOPT)
-      st_remote.finalized_events.subseteq(st_local.clock.keys())
+      st_remote.finalized_events.subseteq(finalizedEventCatalog(st_remote))
     else
       true
   }
@@ -497,8 +537,13 @@ module doltswarm_verify {
     val mergedParents = mergeSetMap(st_local.finalized_parents, st_remote.finalized_parents)
     val mergedAncestors = mergeSetMap(st_local.finalized_ancestors, st_remote.finalized_ancestors)
     val mergedDepth = mergeDepthMap(st_local.finalized_depth, st_remote.finalized_depth)
+    val mergedEventRoots = mergeEventRootMap(
+      indexFinalizedEvents(st_local.finalized_event_roots, st_local.clock, st_local.finalized_events),
+      indexFinalizedEvents(st_remote.finalized_event_roots, st_remote.clock, st_remote.finalized_events)
+    )
     val withMergedLineage: NodeState = {
       ...st_local,
+      finalized_event_roots: mergedEventRoots,
       finalized_parents: mergedParents,
       finalized_ancestors: mergedAncestors,
       finalized_depth: mergedDepth,
@@ -508,6 +553,7 @@ module doltswarm_verify {
         ...withMergedLineage,
         finalized_root: st_remote.finalized_root,
         finalized_events: st_remote.finalized_events,
+        finalized_event_roots: retainEventRoots(mergedEventRoots, st_remote.finalized_events),
         finalized_conflicts: dropFinalizedConflicts(
           st_remote.finalized_conflicts,
           knownResolvedRefs
@@ -515,7 +561,10 @@ module doltswarm_verify {
       }
     } else if (mode == SYNC_NOOP) {
       // Ahead path: finalized state no-op, but metadata exchange is retained.
-      withMergedLineage
+      {
+        ...withMergedLineage,
+        finalized_event_roots: retainEventRoots(mergedEventRoots, st_local.finalized_events),
+      }
     } else {
       val commonRoot = lineageLcaRoot(
         st_local.finalized_root,
@@ -537,6 +586,7 @@ module doltswarm_verify {
       }
       val merged = mergeRoots(oursRoot, theirsRoot, commonRoot)
       val mergedEvents = st_local.finalized_events.union(st_remote.finalized_events)
+      val mergedRoots = retainEventRoots(mergedEventRoots, mergedEvents)
       val baseFinalizedConflicts = mergeFinalizedConflictMap(
         st_local.finalized_conflicts,
         st_remote.finalized_conflicts
@@ -559,6 +609,7 @@ module doltswarm_verify {
         ...withMergedLineage,
         finalized_root: effectiveRoot,
         finalized_events: mergedEvents,
+        finalized_event_roots: mergedRoots,
         finalized_conflicts: mergedFinalizedConflicts,
       }
       val lineage = lineageAddCheckpoint(
@@ -602,6 +653,7 @@ module doltswarm_verify {
       stable_hlc: ZERO,
       finalized_root: EMPTY_ROOT,
       finalized_events: Set(),
+      finalized_event_roots: Map(),
       finalized_parents: Map().put(EMPTY_ROOT, Set()),
       finalized_ancestors: Map().put(EMPTY_ROOT, Set(EMPTY_ROOT)),
       finalized_depth: Map().put(EMPTY_ROOT, 0),
@@ -672,7 +724,8 @@ module doltswarm_verify {
   action do_receive(p: PeerID): bool = {
     val st = nodes.get(p)
     val processable = inbox.get(p).filter(e =>
-      not(st.clock.keys().contains(e.cid))
+      not(st.clock.keys().contains(e.cid)) and
+      not(st.finalized_event_roots.has(e.cid))
     )
 
     all {
@@ -720,6 +773,9 @@ module doltswarm_verify {
   /// nothing is broadcast. Every peer with the same event set independently
   /// computes the same merged root. The next LOCAL_WRITE will have
   /// parents = active_heads (excluding parked), which collapses them in the DAG.
+  /// Primarily used to exercise re-anchoring after finalized_root advances
+  /// (via do_finalize or do_sync_finalized). Steady-state reconciliation is
+  /// inlined in do_receive and do_write.
   ///
   /// computeMergedRoot operates on parent-closed heads only and returns the
   /// complete parked set (not a delta), making parking a pure function of
@@ -823,10 +879,12 @@ module doltswarm_verify {
     all {
       not(candidates.empty()),
       val batch = finalizeBatch(st)
+      val updatedCatalog = indexFinalizedEvents(st.finalized_event_roots, st.clock, batch._2)
       val withBatch: NodeState = {
         ...st,
         finalized_root: batch._1,
         finalized_events: batch._2,
+        finalized_event_roots: updatedCatalog,
       }
       val withLineage: NodeState = if (batch._1 != st.finalized_root) {
         val lineage = lineageAddCheckpoint(
@@ -855,6 +913,37 @@ module doltswarm_verify {
       prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
       prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
 
+      connected' = connected,
+    }
+  }
+
+  /// Compact finalized event bodies from clock when no non-finalized event
+  /// depends on them. Finalized CID/root accounting is retained in
+  /// finalized_event_roots.
+  action do_gc(p: PeerID): bool = {
+    val st = nodes.get(p)
+    val pruneable = gcPruneable(st)
+    all {
+      not(pruneable.empty()),
+      nondet cid = pruneable.oneOf()
+      val updatedCatalog = st.finalized_event_roots.put(cid, st.clock.get(cid).root_hash)
+      val newClock = dropEvent(st.clock, cid)
+      val newHeads = computeHeads(newClock)
+      val gcState: NodeState = {
+        ...st,
+        clock: newClock,
+        heads: newHeads,
+        finalized_event_roots: updatedCatalog,
+      }
+      val reconcileResult = computeMergedRoot(gcState)
+      nodes' = nodes.set(p, {
+        ...gcState,
+        latest_root: reconcileResult._1,
+        parked_conflicts: reconcileResult._2,
+      }),
+      inbox' = inbox,
+      prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
+      prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
       connected' = connected,
     }
   }
@@ -925,7 +1014,7 @@ module doltswarm_verify {
   /// - incomparable sets: deterministic three-way merge (accept-the-fork)
   ///
   /// In the merge branch, deterministic ours/theirs assignment picks the
-  /// earlier finalized tip as "ours". On conflict, uses ours-side root
+  /// lower finalized-root value as "ours". On conflict, uses ours-side root
   /// (deterministic) with explicit tracking in finalized_conflicts.
   action do_sync_finalized(p: PeerID, q: PeerID): bool = {
     val st_p = nodes.get(p)
@@ -1045,6 +1134,7 @@ module doltswarm_verify {
       nondet q = PEERS.oneOf()
       do_heartbeat(p, q),
       do_finalize(p),
+      do_gc(p),
       // Partition and membership actions
       nondet q3 = PEERS.oneOf()
       do_partition(p, q3),
@@ -1239,11 +1329,13 @@ module doltswarm_verify {
     val st_q = nodes.get(q)
     val knownResolvedRefs = resolvedFinalizedConflictRefs(st_p.clock)
       .union(resolvedFinalizedConflictRefs(st_q.clock))
+    val synced = applySyncFinalized(st_p, st_q)
     (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_ADOPT) implies all {
-      st_q.finalized_events.subseteq(st_p.clock.keys()),
-      applySyncFinalized(st_p, st_q).finalized_events == st_q.finalized_events,
-      applySyncFinalized(st_p, st_q).finalized_root == st_q.finalized_root,
-      applySyncFinalized(st_p, st_q).finalized_conflicts
+      st_q.finalized_events.subseteq(finalizedEventCatalog(st_q)),
+      synced.finalized_events == st_q.finalized_events,
+      synced.finalized_root == st_q.finalized_root,
+      synced.finalized_events.subseteq(finalizedEventCatalog(synced)),
+      synced.finalized_conflicts
         == dropFinalizedConflicts(st_q.finalized_conflicts, knownResolvedRefs),
     }
   }))
@@ -1271,14 +1363,16 @@ module doltswarm_verify {
       .union(resolvedFinalizedConflictRefs(st_q.clock))
     val unresolvedP = st_p.finalized_conflicts.keys().exclude(knownResolvedRefs)
     val unresolvedQ = st_q.finalized_conflicts.keys().exclude(knownResolvedRefs)
+    val synced = applySyncFinalized(st_p, st_q)
     (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_MERGE) implies all {
-      applySyncFinalized(st_p, st_q).finalized_events == st_p.finalized_events.union(st_q.finalized_events),
-      applySyncFinalized(st_p, st_q).finalized_root != CONFLICT_HASH,
+      synced.finalized_events == st_p.finalized_events.union(st_q.finalized_events),
+      synced.finalized_root != CONFLICT_HASH,
+      synced.finalized_events.subseteq(finalizedEventCatalog(synced)),
       unresolvedP.subseteq(
-        applySyncFinalized(st_p, st_q).finalized_conflicts.keys()
+        synced.finalized_conflicts.keys()
       ),
       unresolvedQ.subseteq(
-        applySyncFinalized(st_p, st_q).finalized_conflicts.keys()
+        synced.finalized_conflicts.keys()
       ),
     }
   }))
@@ -1408,21 +1502,16 @@ module doltswarm_verify {
     }
   }))
 
-  /// Data convergence: peers with the same events and the same single
-  /// parent-closed head agree on latest_root.
-  ///
-  /// Without parent-closure, an orphan single head may remain ANNOUNCED and
-  /// latest_root may still reflect the last mergeable state.
+  /// Data convergence: peers with the same retained clock state and the same
+  /// finalized root must derive the same reconcile projection.
   val inv_data_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
-    (s1.clock.keys() == s2.clock.keys() and
-     s1.heads.size() == 1 and s2.heads.size() == 1 and
-     s1.heads == s2.heads and
-     s1.heads.forall(cid =>
-       isParentClosed(s1.clock, cid) and
-       isParentClosed(s2.clock, cid))) implies
-      (s1.latest_root == s2.latest_root)
+    (s1.clock == s2.clock and
+     s1.finalized_root == s2.finalized_root and
+     not(mergeableHeads(s1).empty())) implies
+      (s1.latest_root == s2.latest_root and
+       s1.parked_conflicts == s2.parked_conflicts)
   }))
 
   /// Causal consistency (INV4): if e1 is a parent of e2 in the clock DAG,
@@ -1440,17 +1529,16 @@ module doltswarm_verify {
     })
   })
 
-  /// No silent data loss (INV5, safety approximation): every event that any peer
-  /// has ever seen is accounted for — still in the clock (pending finalization)
-  /// or already finalized. No event disappears silently.
+  /// No silent data loss (INV5, safety approximation): every finalized CID is
+  /// represented in the finalized-event catalog (retained in clock and/or
+  /// compacted in finalized_event_roots).
   ///
   /// The full INV5 ("every event *eventually* enters finalized set") is a
   /// liveness property that cannot be checked as a state invariant. This safety
   /// version ensures the precondition: events are never dropped without a trace.
   val inv_no_silent_data_loss = PEERS.forall(p => {
     val st = nodes.get(p)
-    // Every finalized event is still in the clock (not silently removed)
-    st.finalized_events.forall(cid => st.clock.has(cid))
+    st.finalized_events.subseteq(finalizedEventCatalog(st))
   })
 
   /// No unhandled tentative conflict (INV7a): latest_root is never
@@ -1518,10 +1606,10 @@ module doltswarm_verify {
     st.parked_conflicts.subseteq(mergeableHeads(st))
   })
 
-  /// Finalization safety: every finalized event is parent-closed in the local clock.
+  /// Finalization safety: every retained finalized event in clock is parent-closed.
   val inv_finalized_parent_closed = PEERS.forall(p => {
     val st = nodes.get(p)
-    st.finalized_events.forall(cid => isParentClosed(st.clock, cid))
+    st.finalized_events.intersect(st.clock.keys()).forall(cid => isParentClosed(st.clock, cid))
   })
 
   /// Reconcile fixed-point safety: latest_root is always equal to the

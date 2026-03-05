@@ -235,116 +235,146 @@ RECEIVE_EVENT(peer, e):
 
 ## Medium (protocol/spec inconsistency or incomplete specification)
 
-### 8. CID/signature canonicalization is under-specified and coupled to optional metadata
+### 8. ~~CID/signature canonicalization is under-specified and coupled to optional metadata~~ FIXED
 
-**Refs:** protocol §2.1 (line 105–109), §2.3.1 (line 170), §7.2 (line 543).
+**Refs:** protocol §2.1 canonical payload definitions, §2.3.1 signing/verification, §7.2 event signing notes; spec EventCID modeling comment.
 
-**Problem.** `UnsignedEvent = serialize(root_hash, parents, hlc, peer, op_summary, resolved_finalized_conflict_id)` — but `parents` is a `Set` (unordered) and optional fields (`op_summary`, `resolved_finalized_conflict_id`) require canonical encoding. Without an exact canonical serialization spec (sorted parents, field order, encoding format), cross-implementation CID/signature mismatches are inevitable. Additionally, hashing optional advisory data (`op_summary`) into the event's identity creates unnecessary coupling — events with identical data but different summaries produce different CIDs.
+**Status.** Fixed by introducing an explicit canonical payload contract that is codec-agnostic and decouples CID identity from optional advisory metadata.
 
-**Protocol fix.** Either:
-- (a) Specify exact canonical serialization: parents sorted by CID bytes, fixed field order, specific encoding (e.g., protobuf with sorted repeated fields, or a custom canonical form).
-- (b) Simplify by excluding `op_summary` from `UnsignedEvent` / CID computation. If tamper-proofing is needed, include it in the signature payload but not the CID:
+**Implemented protocol behavior.**
+- Replaced `UnsignedEvent` with:
+  - `CIDPayload = (root_hash, sorted parents, hlc, peer, resolved_finalized_conflict_id)`
+  - `SignedPayload = (CIDPayload, op_summary)`
+- Defined `CanonicalEncode(v)` by required properties (deterministic, injective, canonical ordering, canonical Optional encoding), without mandating a concrete wire codec.
+- Defined:
+  - `EventCID = hash(CanonicalEncode(CIDPayload))`
+  - `Signature = Sign(private_key, CanonicalEncode(SignedPayload))`
+- Updated `LOCAL_WRITE` and signing sections accordingly.
 
-```
-UnsignedEvent = serialize(root_hash, sorted(parents), hlc, peer)  // CID input
-EventCID = hash(UnsignedEvent)
-SignedPayload = serialize(root_hash, sorted(parents), hlc, peer, op_summary)
-Signature = Sign(private_key, SignedPayload)
-```
+**Implemented spec behavior.**
+- Updated spec comments to match the protocol abstraction: protocol CID is canonical-hash based, while the model uses tuple CIDs as an abstraction.
 
-**Spec fix.** Align spec comments with the chosen canonicalization rule.
-
----
-
-### 9. Deterministic ours/theirs rule differs between protocol and spec
-
-**Refs:** protocol §2.4 MERGE_FINALIZED step 3 (line 287), modeling notes (line 362), spec `do_merge_finalized` (line 585).
-
-**Problem.** Protocol uses "HLC total order of the associated tip events" for ours/theirs. Spec uses `st_p.finalized_root < st_q.finalized_root` (root hash comparison). These are different orderings. Additionally, "associated tip event" is ambiguous after a MERGE_FINALIZED — the finalized_root no longer corresponds to any single event's root_hash.
-
-**Fix.** Pick one deterministic rule and use it in both protocol and spec. Root-hash lexicographic comparison is simpler, fully local (no "tip event" lookup), and unambiguous after partition merges. Update the protocol to match the spec's approach, or vice versa.
+**Why this closes the issue.** Parent ordering and Optional encoding are now explicitly canonicalized, cross-implementation CID/signature mismatches are avoidable, and `op_summary` no longer affects event identity.
 
 ---
 
-### 10. Total order "causal → HLC → CID" is redundant; simplify to HLC
+### 9. ~~Deterministic ours/theirs rule differs between protocol and spec~~ FIXED
 
-**Refs:** protocol §2.4 ADVANCE_STABILITY step 2 (line 266), spec `sortCIDsByHLC` (line 158).
+**Refs:** protocol §2.4 `SYNC_FINALIZED` divergence merge path, modeling notes; spec `syncFinalizedCore`.
 
-**Problem.** The protocol specifies the total order as "causal → HLC → CID." All three levels are unnecessary:
-- Causal order is subsumed by HLC: INV4 guarantees `ancestor(e1, e2) ⟹ e1.hlc < e2.hlc`.
-- CID tiebreaker is never reached: HLC includes `peer`, and `tick()` ensures strict monotonicity per peer. Two distinct events always have different HLCs.
+**Status.** Fixed by standardizing both protocol and spec on finalized-root hash comparison.
 
-The spec already uses only HLC ordering (`sortCIDsByHLC`), which is correct. The protocol's specification is redundant and potentially confusing.
+**Implemented protocol behavior.**
+- Replaced ambiguous "associated tip event by HLC" wording with:
+  - compare `our_finalized_root` vs `their_finalized_root` lexicographically by hash bytes
+  - lower hash = "ours", higher hash = "theirs"
+- Updated corresponding design notes/examples to the same rule.
 
-**Fix.** Replace "total order: causal → HLC → CID" with "HLC total order" throughout the protocol. Remove the CID tiebreaker mention. Add a brief note explaining that HLC subsumes causal ordering by construction (INV4).
+**Implemented spec behavior.**
+- `syncFinalizedCore` already used root-hash ordering; comments were aligned to the same deterministic rule.
+
+**Why this closes the issue.** Ours/theirs assignment is now unambiguous after partition merges and consistent across document + model.
 
 ---
 
-### 11. HLC PeerID tiebreaker creates systematic parking bias
+### 10. ~~Total order "causal → HLC → CID" is redundant; simplify to HLC~~ FIXED
 
-**Refs:** protocol §2.1 HLC definition (line 98–103), spec `hlc.qnt` `less` function (line 31).
+**Refs:** protocol ordering text in architecture/operations sections, INV4 note; spec `sortCIDsByHLC`.
 
-**Problem.** The `(wall, logical, peer)` lexicographic comparison means lower-PeerID peers' events always sort earlier when wall and logical match. In RECONCILE, the first head by total order fast-forwards (never parked); later heads are candidates for parking. This creates a systematic bias: the lower-PeerID peer's writes are less likely to be parked during conflicts.
+**Status.** Fixed by simplifying protocol wording to HLC total order and removing stale CID tiebreak references.
 
-**Fix.** Replace the raw PeerID tiebreaker with `hash(wall ⊕ logical ⊕ peer)` for the final comparison. This distributes priority randomly across peers per-event while keeping the comparison cheap. Wall/logical ties are rare in practice (nanosecond precision), so this is primarily a fairness improvement.
+**Implemented protocol behavior.**
+- Reworded ordering descriptions to "HLC total order".
+- Added/kept explicit causality note that parent links imply strictly lower HLC (INV4), so causal ordering is preserved by construction.
+- Removed redundant "causal → HLC → CID" phrasing.
+
+**Implemented spec behavior.**
+- No algorithmic change required; spec already orders by HLC.
+
+**Why this closes the issue.** Protocol and spec now describe the same ordering model without redundant or misleading tie-break language.
+
+---
+
+### 11. ~~HLC PeerID tiebreaker creates systematic parking bias~~ FIXED
+
+**Refs:** protocol §2.1 HLC definition/notes; spec HLC ordering (`less` semantics).
+
+**Status.** Fixed as an explicit design decision: keep raw PeerID tie-breaker for now and document fairness tradeoff as non-blocking.
+
+**Implemented protocol behavior.**
+- Retained `(wall, logical, peer)` ordering.
+- Added explicit note that hashed tie-break randomization is possible but currently not used (complexity vs. benefit tradeoff).
+
+**Implemented spec behavior.**
+- No change needed; model already matches `(wall, logical, peer)` ordering.
+
+**Why this closes the issue.** The protocol/spec mismatch and ambiguity are resolved. Remaining bias is documented as an intentional tradeoff rather than an accidental inconsistency.
 
 ---
 
 ## Low (spec improvements, documentation, long-term concerns)
 
-### 12. Unbounded clock and finalized_events growth; no GC strategy
+### 12. ~~Unbounded clock and finalized_events growth; no GC strategy~~ FIXED
 
-**Refs:** protocol §7.5 (line 660), §2.2 state table (line 138–149).
+**Refs:** protocol §2.2 state table, §2.4 `GC_CLOCK`, `RECEIVE_EVENT`, `SYNC_FINALIZED`, `PEER_JOIN`, §7.5 memory notes; spec `NodeState.finalized_event_roots`, `do_gc`.
 
-**Problem.** The `clock` map and `finalized_events` set grow without bound. The protocol defines no pruning strategy. For a long-running system, this is an unbounded memory leak. After finalization, an event's full body (parents, signature, op_summary) is no longer needed for any protocol action — only the CID and root_hash matter (for MERGE_FINALIZED intersection and log lookup).
+**Status.** Fixed by adding explicit finalized-history compaction plus finalized-event metadata retention.
 
-**Fix.** Add an explicit GC rule:
+**Implemented protocol behavior.**
+- Added `finalized_event_index: Map[EventCID, Hash]` to retain finalized CID/root metadata even when finalized event bodies are pruned from `clock`.
+- Added `GC_CLOCK(peer)`:
+  - prune finalized events only when no non-finalized event depends on them
+  - persist pruned metadata into `finalized_event_index`
+  - recompute `heads` and reconcile projection.
+- Updated:
+  - `RECEIVE_EVENT` dedup to include `finalized_event_index`
+  - `SYNC_FINALIZED` metadata exchange/adopt/merge to include finalized-event catalog semantics
+  - `PEER_JOIN` snapshot and verification to include finalized metadata representation.
 
-```
-GC_CLOCK(peer):
-  pruneable = { cid ∈ finalized_events |
-    all events that reference cid as parent are also finalized }
-  clock ← clock \ pruneable
-```
+**Implemented spec behavior.**
+- Added `finalized_event_roots` to `NodeState`.
+- Added `do_gc` + helper functions (`gcPruneable`, catalog merge/retain/index helpers).
+- Updated `do_receive` and `do_finalize` to maintain catalog correctness.
+- Updated sync contract checks and data-loss invariant to use finalized-event catalog semantics.
 
-Retain CID set in `finalized_events` and `finalized_root_log` entries (from fix #3). Discard full Event bodies. This bounds active memory to O(tentative events) + O(finalized CIDs × 20 bytes). Update `PEER_JOIN` snapshot to align: transfer `finalized_root_log` instead of expecting finalized events in the clock.
-
----
-
-### 13. Spec `inv_data_convergence` is weaker than protocol INV2
-
-**Refs:** protocol INV2 (line 336), spec `inv_data_convergence` (line 733).
-
-**Problem.** The spec checks: same clock + both single-head + same heads → same `latest_root`. This is the trivial case. The interesting case — same events + same `finalized_root` with *multiple* heads — is only partially covered by `inv_parking_agreement`. The protocol's INV2 is stronger: same events processed in same total order → same `latest_root`.
-
-**Spec fix.** Strengthen to:
-
-```quint
-val inv_data_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
-  val s1 = nodes.get(p1)
-  val s2 = nodes.get(p2)
-  (s1.clock.keys() == s2.clock.keys() and
-   s1.finalized_root == s2.finalized_root) implies
-    (s1.latest_root == s2.latest_root and
-     s1.parked_conflicts == s2.parked_conflicts)
-}))
-```
-
-This directly captures: same inputs → same derived state. It subsumes the current check and `inv_parking_agreement`.
+**Why this closes the issue.** Finalized event bodies can now be compacted safely, and finalized CID accounting remains explicit for sync/join/invariant safety.
 
 ---
 
-### 14. `computeHeads` not formally defined in §2.1
+### 13. ~~Spec `inv_data_convergence` is weaker than protocol INV2~~ FIXED
 
-**Refs:** protocol §2.4 RECEIVE_EVENT step 5 (line 211), spec `computeHeads` (line 150).
+**Refs:** protocol INV2 convergence intent; spec `inv_data_convergence`.
 
-**Problem.** `computeHeads(clock)` is used throughout the protocol (LOCAL_WRITE, RECEIVE_EVENT, RECONCILE, RESOLVE_CONFLICT) but only defined inline in RECEIVE_EVENT step 5. It deserves a formal definition in §2.1 alongside the other data types.
+**Status.** Fixed by strengthening the invariant from the trivial single-head case to full reconcile-projection agreement for equivalent retained state.
 
-**Fix.** Add to §2.1:
+**Implemented spec behavior.**
+- Replaced old single-head-only condition with:
+  - same retained `clock`
+  - same `finalized_root`
+  - non-empty `mergeableHeads`
+  - implies same `latest_root` and same `parked_conflicts`.
+
+**Why this closes the issue.** The invariant now directly checks deterministic derived-state convergence for the meaningful multi-head reconcile regime, not just the trivial case.
+
+---
+
+### 14. ~~`computeHeads` not formally defined in §2.1~~ FIXED
+
+**Refs:** protocol §2.1 definitions, protocol actions using `computeHeads`, spec `computeHeads`.
+
+**Status.** Fixed by adding an explicit formal definition in the core protocol data model.
+
+**Implemented protocol behavior.**
+- Added:
 
 ```
-computeHeads(clock) = { cid ∈ clock.keys() | ∀ e ∈ clock.values(): cid ∉ e.parents }
+computeHeads(clock) = { cid ∈ clock.keys() | ¬∃ e ∈ clock.values(): cid ∈ e.parents }
 ```
+
+**Implemented spec behavior.**
+- No change required; spec already had a formal `computeHeads`.
+
+**Why this closes the issue.** `computeHeads` is now defined once in §2.1 and referenced consistently across protocol actions.
 
 ---
 
