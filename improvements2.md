@@ -175,20 +175,61 @@ RECEIVE_EVENT(peer, e):
 
 ---
 
-### 7. Finalized conflict path has no explicit resolution state machine
+### 7. ~~Finalized conflict path has no explicit resolution state machine~~ FIXED
 
-**Refs:** protocol §2.4 MERGE_FINALIZED step 5 (line 291), §6.5 (line 499), §7.10 (line 783).
+**Refs:** protocol §2.2 per-peer state (`finalized_conflicts`), §2.4 `SYNC_FINALIZED` conflict branch, §2.4 `RESOLVE_FINALIZED_CONFLICT`, §2.5 INV7e/INV7h; spec `NodeState.finalized_conflicts`, `syncFinalizedCore`, `do_resolve_finalized_conflict`, `inv_sync_conflict_recorded`, `inv_finalized_conflict_visibility`.
 
-**Problem.** When `MERGE_FINALIZED` encounters a conflict, the ours-side root is chosen and the conflict is "surfaced to the user." But unlike tentative conflicts (which have `parked_conflicts`, `RESOLVE_CONFLICT`, and INV7 invariants), finalized conflicts have no state variable, no resolution action, and no invariant ensuring they are tracked. A finalized conflict can be silently lost if the node restarts or the user misses the notification.
+**Status.** Fixed by adding explicit finalized-conflict tracking and an explicit resolution action while preserving non-blocking finalization.
 
-**Protocol fix.** Add:
-- `finalized_conflicts: Map[MergeID, ConflictInfo]` to per-peer state (§2.2)
-- `RESOLVE_FINALIZED_CONFLICT` action (async, non-blocking, similar to `RESOLVE_CONFLICT`)
-- Invariant INV7e: every finalized conflict is tracked until explicitly resolved; none is silently cleared
+**Implemented protocol behavior.**
+- Added `finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictInfo]` to per-peer state.
+- In `SYNC_FINALIZED` adopt branch (`our_finalized_events ⊂ their_finalized_events`):
+  - Adopt remote `finalized_conflicts` together with `finalized_root/finalized_events`.
+- In `SYNC_FINALIZED` divergence merge conflict path:
+  - Start from key-union of local+remote `finalized_conflicts` (preserve existing open conflicts from both peers).
+  - Keep deterministic ours-side root as `finalized_root` (non-blocking).
+  - Compute deterministic `conflict_id = hash(serialize(ours_root, theirs_root, common_root))`.
+  - Insert/update `finalized_conflicts[conflict_id]` with conflict metadata.
+- Added `RESOLVE_FINALIZED_CONFLICT(peer, conflict_id, resolution_ops)`:
+  - Requires `conflict_id ∈ finalized_conflicts`.
+  - Emits a normal write event via `LOCAL_WRITE` mechanics with `resolved_finalized_conflict_id = conflict_id`.
+  - Removes tracked conflict entry explicitly after successful write creation/publication.
+- Updated `RECEIVE_EVENT`:
+  - If an event carries `resolved_finalized_conflict_id`, remove the referenced entry from `finalized_conflicts` (idempotent).
+- Updated `SYNC_FINALIZED` conflict-map handling:
+  - Track/merge known resolution references and filter conflict maps to exclude already-resolved ids (prevents resurrection on later merge unions).
+- Added finalized-conflict persistence to `PEER_JOIN` snapshot transfer.
+- Added INV7e/INV7h framing: finalized conflicts are tracked until resolved and cannot be resurrected after a known resolution reference.
 
-The resolution creates a new event whose root incorporates the conflict-losing side's data, flowing through normal LOCAL_WRITE mechanics.
+**Implemented spec behavior.**
+- Added `FinalizedConflictID`/`FinalizedConflict` types.
+- Extended `Event` with `resolved_finalized_conflicts` (set-model of optional conflict reference).
+- Added `finalized_conflicts` map to `NodeState` (initialized in `init`).
+- Updated `syncFinalizedCore` adopt branch:
+  - Copies `st_remote.finalized_conflicts` during finalized-state adoption, filtered by known resolved refs.
+- Updated `syncFinalizedCore` merge branch:
+  - Unions local+remote `finalized_conflicts` as the merge-branch base.
+  - Filters merged conflicts by known resolved refs.
+  - On `CONFLICT_HASH`, records deterministic finalized conflict entry.
+  - Skips reinserting conflict ids already known as resolved.
+  - Keeps deterministic ours-side root as effective finalized root.
+- Added `do_resolve_finalized_conflict` action:
+  - Removes one conflict entry explicitly.
+  - Creates/broadcasts a normal write event carrying the resolved conflict reference and recomputes reconcile projection.
+- Updated `do_receive`:
+  - Clears tracked finalized conflicts referenced by received events.
+- Wired `do_resolve_finalized_conflict` into `step`.
+- Added regression checks:
+  - `inv_sync_contract_adopt` (adopt branch now also requires conflict-map adoption)
+  - `inv_sync_contract_merge` (merge branch must preserve both sides' pre-existing conflict IDs)
+  - `inv_sync_conflict_recorded` (conflict branch must record entry)
+  - `inv_sync_conflict_id_symmetric` (both sync directions derive the same conflict ID)
+  - `inv_resolve_finalized_conflict_contract` (resolution removes exactly one conflict ID, does not directly mutate finalized root/events, and emits matching conflict reference)
+  - `inv_finalized_conflict_visibility` (tracked entries are well-formed/lineage-rooted)
+  - `inv_finalized_conflict_authenticity` (tracked entries correspond to actual merge conflicts)
+  - `inv_finalized_conflict_no_resurrection` (ids referenced as resolved in observed events cannot remain in tracked conflict map)
 
-**Spec fix.** Add `finalized_conflicts` to NodeState, add `do_resolve_finalized_conflict` action, add invariant.
+**Why this closes the issue.** Finalized conflicts are no longer ephemeral notifications. They are first-class tracked state with explicit resolution flow, and the Quint model now checks both recording and structural integrity.
 
 ---
 
@@ -198,7 +239,7 @@ The resolution creates a new event whose root incorporates the conflict-losing s
 
 **Refs:** protocol §2.1 (line 105–109), §2.3.1 (line 170), §7.2 (line 543).
 
-**Problem.** `UnsignedEvent = serialize(root_hash, parents, hlc, peer, op_summary)` — but `parents` is a `Set` (unordered) and `op_summary` is optional with a sentinel. Without a canonical serialization spec (sorted parents, field order, encoding format), cross-implementation CID/signature mismatches are inevitable. Additionally, hashing optional advisory data (`op_summary`) into the event's identity creates unnecessary coupling — events with identical data but different summaries produce different CIDs.
+**Problem.** `UnsignedEvent = serialize(root_hash, parents, hlc, peer, op_summary, resolved_finalized_conflict_id)` — but `parents` is a `Set` (unordered) and optional fields (`op_summary`, `resolved_finalized_conflict_id`) require canonical encoding. Without an exact canonical serialization spec (sorted parents, field order, encoding format), cross-implementation CID/signature mismatches are inevitable. Additionally, hashing optional advisory data (`op_summary`) into the event's identity creates unnecessary coupling — events with identical data but different summaries produce different CIDs.
 
 **Protocol fix.** Either:
 - (a) Specify exact canonical serialization: parents sorted by CID bytes, fixed field order, specific encoding (e.g., protobuf with sorted repeated fields, or a custom canonical form).
