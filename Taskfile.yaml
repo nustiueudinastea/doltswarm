@@ -171,12 +171,12 @@ tasks:
     cmds:
       - |
         {{if .INVARIANT}}
-          quint run doltswarm_verify.qnt --invariant={{.INVARIANT}} --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
+          quint run doltswarm_verify.qnt --backend=rust --invariant={{.INVARIANT}} --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
         {{else}}
           INVS=$(grep -o 'val inv_[a-z_]*' doltswarm_verify.qnt | sed 's/val //')
           for inv in $INVS; do
             echo "=== Checking $inv ==="
-            quint run doltswarm_verify.qnt --invariant=$inv --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
+            quint run doltswarm_verify.qnt --backend=rust --invariant=$inv --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
           done
         {{end}}
 
