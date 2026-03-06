@@ -6,29 +6,55 @@
 
 Design a peer-to-peer synchronization protocol for Dolt databases that allows multiple peers to concurrently read and write SQL data, automatically merge non-conflicting changes, surface conflicts to users for resolution, and converge on a shared finalized history — all without a central coordinator, with minimal inter-peer communication, and with no consensus protocol.
 
+### The real boundary problem: when does local reconciliation harden into shared history?
+
+The hard problem in doltswarm is not "when do we merge data?" Dolt already provides a three-way merge over `RootValue`s. The harder problem is: **when does a reversible local reconciliation become irreversible shared history?**
+
+That boundary is what separates two different kinds of merge:
+
+- **Tentative reconciliation:** multiple Merkle-clock heads are allowed, local `RECONCILE` computes a current projection, and tentative Dolt commits are treated as rewritable convenience state.
+- **History-level merge:** two already-finalized lineages later meet after a partition or long disconnect, so the shared finalized Dolt DAG must record a real merge commit instead of pretending one side can be rewritten away.
+
+This leads to the design rule that motivates the whole protocol:
+
+**merge roots continuously, merge commits only when finalized lineages meet.**
+
+For connected, still-settling concurrency, we do not want to emit a Dolt merge commit for every concurrent write. That would collapse back to "just let every peer make commits and merge the commit DAG all the time", which is exactly what causes merge storms, repeated re-parenting, and unstable commit identity. The Merkle clock exists to keep that churn below the history boundary.
+
+For partition-grade divergence, the story changes. Once each side has already hardened some history for its current witness set, rewinding finalized history would violate monotonicity. At that point a real merge in the finalized Dolt DAG is the correct representation: two independently hardened histories met and had to be joined.
+
 ### The problem with Dolt's commit model in a P2P setting
 
-Dolt stores data in content-addressed prolly trees (deterministic B-trees where the same dataset always produces the same root hash). This is excellent for sync — identical data produces identical chunks regardless of which peer produced it. However, Dolt layers a Git-style linear commit DAG on top of this data layer. Each commit's hash is computed from its serialized flatbuffer, which includes `parent_addrs` — the 20-byte hashes of parent commits. This means a commit's identity depends on its position in the DAG. Two commits with identical data but different parents produce different hashes.
+Dolt stores data in content-addressed prolly trees (deterministic B-trees where the same dataset always produces the same root hash). This is excellent for sync — identical data produces identical chunks regardless of which peer produced it. However, Dolt layers a Git-style commit DAG on top of this data layer. Each commit's hash is computed from its serialized flatbuffer, which includes `parent_addrs` — the 20-byte hashes of parent commits. Commit identity therefore depends on position in history, not just on table state.
 
-In a P2P setting, this creates a fundamental tension. If peers create commits independently and later try to stitch them into a shared history, every rebase or parent reassignment produces new commit hashes, which cascade through all descendants. Any external reference to the original hash becomes stale. Git solves this with a central server that establishes ordering. We cannot rely on that.
+In a P2P setting, that creates the core tension. If peers create commits independently and later try to stitch them into one shared history, every rebase or parent reassignment changes commit hashes and cascades through descendants. Any external reference to the old commit hash becomes stale. Git solves this by centralizing ordering at a server or maintainer. Doltswarm cannot rely on that.
 
-### What DefraDB taught us: the CRDT approach avoids linear history entirely
+So the protocol must do two things at once:
 
-DefraDB (by Source Network) takes a radically different approach. Instead of a global linear commit history, each document has its own Merkle DAG. Every mutation to a document creates a new DAG node whose hash includes the content delta and the parent node hash(es). Concurrent edits to the same document produce multiple DAG heads — a natural representation of divergence. Merging happens per-document by walking the DAG to find the common ancestor and applying CRDT merge semantics at the field level.
+- avoid treating every concurrent write as a commit-DAG merge problem
+- still provide a common, meaningful finalized Dolt history once some set of changes is no longer considered rewritable
 
-The key insight from DefraDB is that **a per-document Merkle DAG CRDT requires no coordination for non-conflicting changes.** Peers simply exchange DAG nodes. The DAG union is itself a CRDT (a G-Set of immutable nodes). Each peer independently computes the merged state from the same set of nodes and arrives at the same result. There is no rebase, no linear ordering to agree on, no epoch to finalize. The tradeoff is that DefraDB cannot easily prune history (every DAG node is needed for future merge-base computation) and its merge semantics are limited to CRDT-compatible operations on schemaless JSON documents — it cannot do the rich SQL-level three-way merge that Dolt provides.
+### What DefraDB taught us: a Merkle DAG can be the truth
 
-The lesson for doltswarm: **minimize coordination by making the shared data structure a CRDT.** Don't try to get peers to agree on a linear commit chain in real-time. Use an append-only structure that converges via set union.
+DefraDB (by Source Network) takes the CRDT route. Each document is stored as a Merkle CRDT update DAG. Concurrent edits naturally produce multiple heads, and peers converge by exchanging immutable DAG nodes and applying the embedded CRDT semantics. There is no extra obligation to compile those heads into a single shared commit DAG for users. The Merkle DAG itself is the truth.
+
+The key lesson from DefraDB is that **a CRDT-shaped shared structure removes the need to coordinate on linear history while the system is still settling.** Peers can simply union immutable nodes and compute the same current state from the same causal graph. The tradeoff is that DefraDB is operating in a document/CRDT world, not in a SQL database with rich three-way merge semantics and a user-visible commit history.
+
+### What OrbitDB taught us: exchanging heads is enough if the log is the product
+
+OrbitDB pushes the same lesson from a different angle. OrbitDB peers synchronize by exchanging log heads and then pulling missing log entries until they converge on the same log state. The system promises eventual consistency of the replicated log, not a separate finalized history layer with stable, user-meaningful commit identities.
+
+That contrast matters. OrbitDB's sync problem stops at "do peers eventually observe the same append-only log?" Doltswarm has an extra obligation: the replicated causal structure is not the final user-facing history. It must eventually be compiled into a common finalized Dolt DAG. That makes doltswarm's stability boundary stricter than OrbitDB's head-exchange story.
 
 ### What Fireproof taught us: separate the clock from the data
 
-Fireproof (by Chris Anderson, co-creator of CouchDB) provides the architectural blueprint. It cleanly separates two layers:
+Fireproof provides the architectural blueprint. It cleanly separates two layers:
 
-**Merkle Clock (Pail):** A DAG of events where each event carries an operation payload and parent CIDs. The clock is a G-Set CRDT — merging two clocks is set union. Concurrent writes produce multiple heads. A deterministic HLC total order allows any peer to replay events in the same sequence; causality is preserved because parent links must have strictly lower HLC (INV4).
+**Merkle Clock (Pail):** a causal event log where concurrent writes produce multiple heads and clocks can be union-merged cheaply.
 
-**Prolly Trees:** Deterministic B-trees that store the actual data. Events from the clock are applied to the prolly tree in the deterministic order. Because the tree is history-independent (same data = same tree regardless of insertion order), all peers converge to the same root hash.
+**Prolly Trees:** deterministic trees that store the actual state, so applying the same accepted event set yields the same root.
 
-The separation means the clock handles *what happened and when*, while the prolly tree handles *what is the current state*. This is exactly the split Dolt already has — prolly trees for data, commit DAG for ordering — but Fireproof's clock is designed for P2P from the ground up, whereas Dolt's commit DAG assumes a linear history with content-addressed identity that breaks under concurrent independent commits.
+The lesson is not only "use a Merkle clock." The deeper lesson is: **keep causal structure and data state separate.** The clock answers *what happened and what is concurrent*; the data layer answers *what state results when those changes are merged*. Fireproof can stop there because its clock/data model is already the system of record. Doltswarm cannot stop there, because it also owes users a common, stable Dolt commit DAG.
 
 ### The non-obvious finding in Dolt: MergeRoots is DAG-independent
 
@@ -48,15 +74,31 @@ Additionally, Dolt's chunk-level sync (`Puller`) operates on opaque content-addr
 
 Combining these findings:
 
-From **DefraDB** we take the principle: use a CRDT-based shared structure (the Merkle clock) so that peers converge without coordination. The clock DAG is a G-Set — append-only, union-merge, no rebase, no hash instability.
+From **DefraDB** we take the principle that unsettled concurrency should live in a CRDT-shaped shared structure, not in a globally-agreed commit chain.
 
-From **Fireproof** we take the architecture: separate the ordering layer (Merkle clock) from the data layer (prolly trees). The clock establishes causal structure plus deterministic HLC ordering and provides merge-base discovery. The prolly trees store the actual SQL data and provide efficient diffing and structural sharing.
+From **OrbitDB** we take the lesson that exchanging heads and missing causal history is enough while the replicated causal structure is still the product.
 
-From **Dolt** we keep everything valuable: the SQL interface, the prolly tree storage engine, the three-way merge with cell-level conflict detection, the chunk-level sync protocol, and the local commit DAG for `dolt log` / `dolt diff` on each peer.
+From **Fireproof** we take the architectural split: keep the Merkle clock as the causal/witness layer and the prolly trees as the state/merge layer.
 
-The protocol does not modify Dolt's commit model. Instead, it introduces a new Merkle clock layer that sits between the prolly tree data and the local commit DAG. Peers exchange clock events (small metadata) and prolly tree chunks over a direct mesh network. HLC provides the deterministic total order that all peers compute identically, and parent links enforce causal ordering (INV4). `MergeRoots` is called with ancestor roots discovered from the clock, not from Dolt's commit parents. Local Dolt commits are created after reconciliation — they provide SQL tooling compatibility but their hashes are peer-specific in the tentative zone and byte-identical in the finalized zone (once causal stability confirms the ordering is settled).
+From **Dolt** we keep everything valuable: the SQL interface, the prolly tree storage engine, the three-way merge with cell-level conflict detection, the chunk-level sync protocol, and the local commit DAG as the final human-facing history representation.
 
-The result: Dolt's full SQL merge semantics in a P2P setting, with coordination limited to broadcast message exchange over a direct mesh, no consensus, and no central coordinator.
+The protocol does not modify Dolt's merge engine. Instead, it introduces a Merkle clock layer that sits between prolly-tree data and the local commit DAG:
+
+- while history is still tentative, the Merkle clock is the authoritative shared structure
+- `RECONCILE` is local and silent: peers continuously merge roots without emitting commit-DAG merge artifacts
+- tentative Dolt commits are projections, not globally stable history
+- once the witness condition for finalization holds, some portion of that tentative arrangement hardens into the shared finalized Dolt DAG
+- only if two already-finalized lineages later meet do we emit a real Dolt merge commit
+
+This is what makes doltswarm different from the other systems above. DefraDB, OrbitDB, and Fireproof can stop at the converged clock/log/DAG level. Doltswarm cannot, because it must periodically compile that causal structure into a common, meaningful, user-visible Dolt history.
+
+The result is a protocol with a sharper boundary:
+
+- **below the boundary:** live concurrency, multiple heads, local reconciliation, no commit-DAG merges
+- **at the boundary:** a witness condition decides that some tentative arrangement may harden into shared history
+- **above the boundary:** finalized lineages are monotone, and when they later diverge and meet, the Dolt DAG records a real merge commit
+
+That boundary — not data merge alone — is the central design problem of doltswarm.
 
 ---
 
