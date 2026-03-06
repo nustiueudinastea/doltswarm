@@ -16,6 +16,10 @@
  * state directly (skipping message-level digest compare mechanics), but models
  * the same closure-based pull target: remote heads plus recursive ancestors.
  *
+ * Events carry anchor_root_hash in addition to root_hash. Reconciliation and
+ * finalization start from the current finalized_root accumulator, but each
+ * event is merged against its own recorded anchor_root_hash.
+ *
  * Conceptual split mirrored from the protocol:
  * - Finalized state: finalized_root/finalized_events/finalized_parents.
  * - Tentative state: clock/heads/latest_root/parked_conflicts.
@@ -68,6 +72,7 @@ module doltswarm_verify {
   type Event = {
     cid: EventCID,
     root_hash: Hash,
+    anchor_root_hash: Hash,
     parents: Set[EventCID],
     resolved_finalized_conflicts: Set[FinalizedConflictID],
     hlc: HLC,
@@ -289,15 +294,17 @@ module doltswarm_verify {
     cidList.sortList((a, b) => less(clock.get(a).hlc, clock.get(b).hlc))
   }
 
-  /// Shared fixed-anchor ordered merge fold used by RECONCILE and ADVANCE_STABILITY.
-  /// Returns (merged_root, conflicts) where conflicts contains heads whose merge
-  /// against the running accumulator conflicted under the fixed anchor.
-  pure def fixedAnchorFold(heads: Set[EventCID], st: NodeState, anchor: Hash): (Hash, Set[EventCID]) = {
+  /// Shared anchored ordered merge fold used by RECONCILE and ADVANCE_STABILITY.
+  /// Starts from startRoot and merges each head against its own recorded
+  /// anchor_root_hash. Returns (merged_root, conflicts) where conflicts
+  /// contains heads whose merge against the running accumulator conflicted.
+  pure def anchoredFold(heads: Set[EventCID], st: NodeState, startRoot: Hash): (Hash, Set[EventCID]) = {
     val sorted = sortCIDsByHLC(heads, st.clock)
-    sorted.foldl((anchor, Set()), (acc, cid) => {
+    sorted.foldl((startRoot, Set()), (acc, cid) => {
       val currentRoot = acc._1
       val conflicts = acc._2
-      val merged = mergeRoots(currentRoot, st.clock.get(cid).root_hash, anchor)
+      val event = st.clock.get(cid)
+      val merged = mergeRoots(currentRoot, event.root_hash, event.anchor_root_hash)
       if (merged == CONFLICT_HASH) {
         (currentRoot, conflicts.union(Set(cid)))
       } else {
@@ -307,12 +314,12 @@ module doltswarm_verify {
   }
 
   /// Deterministic tentative projection for heads:
-  /// - full closure path: mergeable heads are folded with fixed anchor
+  /// - full closure path: mergeable heads are folded with per-event anchors
   /// - closure-lag path: projection is provisional and retains unresolved
   ///   parked head IDs conservatively until closure completes
   ///
   /// Returns (merged_root, parked_set). Single-head and multi-head use the
-  /// same fixed-anchor fold semantics (no single-head bypass).
+  /// same anchored fold semantics (no single-head bypass).
   pure def computeMergedRoot(st: NodeState): (Hash, Set[EventCID]) = {
     val readyHeads = mergeableHeads(st)
     if (st.heads.empty()) {
@@ -320,7 +327,7 @@ module doltswarm_verify {
     } else if (readyHeads.empty()) {
       (st.latest_root, st.parked_conflicts.intersect(st.heads))
     } else {
-      val folded = fixedAnchorFold(readyHeads, st, st.finalized_root)
+      val folded = anchoredFold(readyHeads, st, st.finalized_root)
       val unreadyHeads = st.heads.exclude(readyHeads)
       val retainedUnreadyParked = st.parked_conflicts.intersect(unreadyHeads)
       (folded._1, folded._2.union(retainedUnreadyParked))
@@ -345,8 +352,8 @@ module doltswarm_verify {
     )
 
   /// Advance finalized state in one deterministic batch:
-  /// 1) snapshot anchor = finalized_root at batch start
-  /// 2) merge stable frontier heads in HLC order with fixed ancestor = anchor
+  /// 1) start from finalized_root at batch start
+  /// 2) merge stable frontier heads in HLC order against each head's recorded anchor
   /// 3) mark all candidates finalized for bookkeeping
   pure def finalizeBatch(st: NodeState): (Hash, EventCID -> Hash) = {
     val candidates = finalizationCandidates(st)
@@ -354,7 +361,7 @@ module doltswarm_verify {
       (st.finalized_root, st.finalized_events)
     } else {
       val frontier = stableFrontier(candidates, st.clock)
-      val folded = fixedAnchorFold(frontier, st, st.finalized_root)
+      val folded = anchoredFold(frontier, st, st.finalized_root)
       val newRoot = folded._1
       val updatedFinalized = candidates.fold(st.finalized_events, (acc, cid) =>
         if (st.clock.has(cid)) acc.put(cid, st.clock.get(cid).root_hash) else acc
@@ -526,6 +533,7 @@ module doltswarm_verify {
     val event: Event = {
       cid: newCID,
       root_hash: resolvedContent,
+      anchor_root_hash: st.finalized_root,
       parents: activeHeads,
       resolved_finalized_conflicts: Set(conflictID),
       hlc: newHLC,
@@ -740,6 +748,7 @@ module doltswarm_verify {
       val event: Event = {
         cid: newCID,
         root_hash: content,
+        anchor_root_hash: st.finalized_root,
         parents: activeHeads,
         resolved_finalized_conflicts: Set(),
         hlc: newHLC,
@@ -824,7 +833,8 @@ module doltswarm_verify {
   }
 
   /// Mark one announced event as CHUNKS_READY.
-  /// This models asynchronous chunk transfer completion and immediately
+  /// This abstracts completion of all chunks needed to evaluate the event,
+  /// including both root_hash and anchor_root_hash, and immediately
   /// re-evaluates tentative projection.
   action do_chunks_ready(p: PeerID, cid: EventCID): bool = {
     val st = nodes.get(p)
@@ -932,8 +942,8 @@ module doltswarm_verify {
 
   /// Finalize all currently-stable candidates in one deterministic batch.
   /// Candidates are closure-ready and chunk-ready.
-  /// Uses a fixed anchor = finalized_root at batch start and merges only
-  /// stable frontier heads (candidates with no stable descendants).
+  /// Starts from finalized_root and merges only stable frontier heads
+  /// (candidates with no stable descendants), using each head's recorded anchor.
   /// This avoids fast-forward overwrite of concurrent writes while preserving
   /// incremental advancement on top of SYNC_FINALIZED outputs.
   action do_finalize(p: PeerID): bool = {
@@ -1099,6 +1109,7 @@ module doltswarm_verify {
       val event: Event = {
         cid: newCID,
         root_hash: resolvedContent,
+        anchor_root_hash: st.finalized_root,
         parents: resolveParents,
         resolved_finalized_conflicts: Set(),
         hlc: newHLC,
@@ -1490,6 +1501,7 @@ module doltswarm_verify {
             resolvedState.finalized_conflicts.keys()
               == st.finalized_conflicts.keys().exclude(Set(conflictID)),
             emitted.resolved_finalized_conflicts == Set(conflictID),
+            emitted.anchor_root_hash == st.finalized_root,
             resolvedState.chunks_ready.contains(emittedCID),
             resolvedState.peer_seen_frontier.get(p) == observedFrontier(resolvedState.clock),
           }

@@ -146,6 +146,7 @@ HLC         = { wall: uint64, logical: uint16, peer: PeerID }
 
 CIDPayload = (
   root_hash: Hash,
+  anchor_root_hash: Hash,
   parents_sorted: List[EventCID],         -- parents sorted by EventCID bytes (lexicographic)
   hlc: HLC,
   peer: PeerID,
@@ -165,6 +166,7 @@ Signature  = Sign(private_key, CanonicalEncode(SignedPayload))
 Event = {
   cid:            EventCID,               -- redundant on wire (receivers recompute), useful for quick dedup
   root_hash:      Hash,                   -- RootValue hash after this peer's local write
+  anchor_root_hash: Hash,                 -- finalized root against which this event's root_hash was produced
   resolved_finalized_conflict_id: Optional[FinalizedConflictID], -- null unless this event resolves a finalized conflict
   parents:        Set[EventCID],          -- causal parents in the Merkle clock
   hlc:            HLC,
@@ -204,7 +206,7 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 |---|---|---|
 | `clock` | `Map[EventCID, Event]` | Locally retained Merkle clock events: all non-finalized events plus any retained finalized events not yet compacted by `GC_CLOCK` |
 | `heads` | `Set[EventCID]` | Clock heads (events with no children locally) |
-| `chunks_ready` | `Set[EventCID]` | Announced events whose `root_hash` chunks are locally available (`CHUNKS_READY`). |
+| `chunks_ready` | `Set[EventCID]` | Announced events whose `root_hash` and `anchor_root_hash` chunks are locally available (`CHUNKS_READY`). |
 | `latest_root` | `Hash` | Current merged RootValue |
 | `hlc` | `HLC` | Local hybrid logical clock used only for deterministic event ordering and tie-breaking |
 | `peer_seen_frontier` | `Map[PeerID, Set[EventCID]]` | Last known seen frontier per peer. A seen frontier is the maximal set of locally parent-closed events that peer has observed. `peer_seen_frontier[self]` MUST equal the locally derived seen frontier. |
@@ -239,7 +241,7 @@ The protocol assumes a **direct mesh** network: every peer can send messages to 
 | `Event` | See §2.1 | On local write |
 | `Heartbeat` | `{ peer: PeerID, heads_digest: Hash, seen_frontier_digest: Hash, finalized_root: Hash }` | Adaptive (event-driven + idle keepalive) |
 
-**Data plane (chunk sync)** — prolly tree data is synced via **point-to-point streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks for the event's `root_hash` from the originating peer (or any peer that has them). The sync walks the prolly tree from the root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not broadcast — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
+**Data plane (chunk sync)** — prolly tree data is synced via **point-to-point streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks needed to evaluate that event: the chunks for `event.root_hash`, and the chunks for `event.anchor_root_hash` if they are not already local. The sync walks each prolly tree from its root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not broadcast — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
 
 > **Implementation note:** Concrete API wiring for chunk sync is implementation-specific and maintained in [`doltswarm-implementation.md`](./doltswarm-implementation.md). This protocol only defines the abstract contract.
 
@@ -248,7 +250,7 @@ The protocol assumes a **direct mesh** network: every peer can send messages to 
 ### 2.3.1 Event Signing and Verification
 
 Every event carries:
-- `cid = hash(CanonicalEncode(CIDPayload))`, where `CIDPayload` includes `root_hash`, canonical parent list, `hlc`, `peer`, and `resolved_finalized_conflict_id`.
+- `cid = hash(CanonicalEncode(CIDPayload))`, where `CIDPayload` includes `root_hash`, `anchor_root_hash`, canonical parent list, `hlc`, `peer`, and `resolved_finalized_conflict_id`.
 - `signature = Sign(private_key, CanonicalEncode(SignedPayload))`, where `SignedPayload = CIDPayload`.
 
 This signs exactly the core state-machine payload. The protocol remains codec-agnostic: implementations may choose any wire format, as long as they produce identical `CanonicalEncode(...)` bytes for the same logical payload. On the wire, `cid` is redundant (receivers recompute it) but useful for quick deduplication before full deserialization.
@@ -267,9 +269,9 @@ No conflict precondition — writes are never blocked.
 1. Apply `sql_ops` to local Dolt instance → new `RootValue` with hash `r`.
 2. `hlc ← tick(hlc)`.
 3. `active_heads = heads \ parked_conflicts`.
-4. Build `cid_payload = (r, sort(active_heads), hlc, peer, null)` and `signed_payload = cid_payload`.
+4. Build `cid_payload = (r, finalized_root, sort(active_heads), hlc, peer, null)` and `signed_payload = cid_payload`.
 5. `cid = hash(CanonicalEncode(cid_payload))`, `sig = Sign(private_key, CanonicalEncode(signed_payload))`.
-6. `e = Event { cid, root_hash: r, resolved_finalized_conflict_id: null, parents: active_heads, hlc, peer, signature: sig }`.
+6. `e = Event { cid, root_hash: r, anchor_root_hash: finalized_root, resolved_finalized_conflict_id: null, parents: active_heads, hlc, peer, signature: sig }`.
 7. `clock[e.cid] ← e`.
 8. `chunks_ready ← chunks_ready ∪ {e.cid}` (local writes are immediately chunk-ready).
 9. Recompute `heads` from clock. Note: `computeHeads` may still return parked CIDs as heads (since no event has them as parents). That's correct — they persist as forks until resolved.
@@ -284,9 +286,9 @@ No conflict precondition — writes are never blocked.
 
 Events follow a per-event lifecycle: **ANNOUNCED → PARENTS_READY → CHUNKS_READY → MERGEABLE**.
 
-- **ANNOUNCED**: Event is in the clock, heads are recomputed, but its parent/ancestor closure may be incomplete locally and chunks for `e.root_hash` may not yet be local. The event participates in causal ordering and head computation, but NOT in `RECONCILE` or finalization.
+- **ANNOUNCED**: Event is in the clock, heads are recomputed, but its parent/ancestor closure may be incomplete locally and chunks for `e.root_hash` and/or `e.anchor_root_hash` may not yet be local. The event participates in causal ordering and head computation, but NOT in `RECONCILE` or finalization.
 - **PARENTS_READY**: All ancestor CIDs reachable from `e.parents` are present in the local clock.
-- **CHUNKS_READY**: Chunk sync for `e.root_hash` is complete.
+- **CHUNKS_READY**: Chunk sync for both `e.root_hash` and `e.anchor_root_hash` is complete.
 - **MERGEABLE**: Event is both **PARENTS_READY** and **CHUNKS_READY**, and `RECONCILE` has processed it (either merged or parked).
 
 Steps:
@@ -300,26 +302,26 @@ Steps:
 7. Recompute `heads` from clock: `heads = { cid ∈ clock | cid is not a parent of any event in clock }`.
 8. Recompute local seen frontier: `peer_seen_frontier[self] ← SeenFrontier(clock)`. This frontier contains only locally **PARENTS_READY** events.
 9. If step 8 changed the local witness input, call `ADVANCE_STABILITY(peer)`.
-10. Request prolly tree chunks for `e.root_hash` from originating peer via point-to-point stream.
-11. On chunk-sync completion: `chunks_ready ← chunks_ready ∪ {e.cid}` (event becomes **CHUNKS_READY**).
+10. Request prolly tree chunks for `e.root_hash` and, if needed, for `e.anchor_root_hash` from the originating peer (or any peer that already has them) via point-to-point stream.
+11. On completion of all required chunk sync for step 10: `chunks_ready ← chunks_ready ∪ {e.cid}` (event becomes **CHUNKS_READY**).
 12. Parent-closure readiness is tracked independently: an event becomes **PARENTS_READY** only when all ancestor CIDs reachable from its parent links are present in the local `clock` (typically via heartbeat pull-on-demand).
-13. If `|heads| = 1` and the lone head is both **PARENTS_READY** and **CHUNKS_READY**, fast-forward `latest_root ← clock[head].root_hash`.
+13. If `|heads| = 1` and the lone head is both **PARENTS_READY** and **CHUNKS_READY**, recompute `latest_root` and `parked_conflicts` using the same singleton anchored-fold semantics as `RECONCILE` (equivalently: `MergeRoots(finalized_root, head.root_hash, head.anchor_root_hash)` with the same conflict/parking contract).
 14. Call `RECONCILE(peer)` (if `|heads| > 1`). `RECONCILE` operates only on heads that are **PARENTS_READY** and **CHUNKS_READY** (or already **MERGEABLE**). Heads missing ancestors or chunks are skipped until a later reconciliation pass.
 
 #### RECONCILE(peer) → unit
 
 **Merges are deterministic local computations, not new information.** If peers A and B both have events `{e1, e2}` with two heads, they each independently call `MergeRoots` and arrive at the same `latest_root`. There is nothing to communicate — the merge result is fully determined by the inputs that all peers already have. No event is created, nothing is broadcast.
 
-**Reconcile has an explicit closure-lag contract.** Reconcile operates on ALL heads (not pre-filtered by existing `parked_conflicts`). When all heads are mergeable, parking is recomputed deterministically from anchor-consistent fold semantics. When closure is incomplete (some heads are not yet mergeable), projection is provisional and unresolved parked head IDs are retained conservatively until closure completion.
+**Reconcile has an explicit closure-lag contract.** Reconcile operates on ALL heads (not pre-filtered by existing `parked_conflicts`). When all heads are mergeable, parking is recomputed deterministically from anchored fold semantics. When closure is incomplete (some heads are not yet mergeable), projection is provisional and unresolved parked head IDs are retained conservatively until closure completion.
 
-`FixedAnchorFold(heads, anchor) -> (root, conflict_set)` is the shared merge primitive used by both `RECONCILE` and `ADVANCE_STABILITY`: sort heads by HLC, then fold `MergeRoots(acc, head.root_hash, anchor)` while keeping `anchor` fixed for the whole fold.
+`AnchoredFold(heads, start_root) -> (root, conflict_set)` is the shared merge primitive used by both `RECONCILE` and `ADVANCE_STABILITY`: sort heads by HLC, start `acc = start_root`, then fold `MergeRoots(acc, head.root_hash, head.anchor_root_hash)` so each event is replayed against the finalized anchor it was originally written on.
 
 1. If `heads = ∅`: set `latest_root ← finalized_root`, set `parked_conflicts ← ∅`, return.
 2. `mergeable_heads = { h ∈ heads | h is PARENTS_READY ∧ h is CHUNKS_READY }`.
 3. `unready_heads = heads \ mergeable_heads`.
 4. If `mergeable_heads = ∅`: no merge is possible yet. Keep `latest_root` unchanged and conservatively retain unresolved parked heads: `parked_conflicts ← parked_conflicts ∩ heads`. Return.
 5. Sort `mergeable_heads` by HLC total order (deterministic).
-6. Apply `FixedAnchorFold(mergeable_heads, finalized_root)` to compute `(merged_root, parked_ready)`:
+6. Apply `AnchoredFold(mergeable_heads, finalized_root)` to compute `(merged_root, parked_ready)`:
    - This single fold contract is used for both single-head and multi-head reconciliation (no semantic single-head bypass).
    - On each conflicting fold step, the later head in total order is parked.
 7. `retained_unready_parked = parked_conflicts ∩ unready_heads`.
@@ -384,15 +386,15 @@ Let `CoveredBy(frontier, e)` mean: some `f ∈ frontier` has `e` in its ancestor
 1. `newly_stable = { e ∈ clock | e.cid ∉ finalized_events.keys() ∧ e.cid ∉ parked_conflicts ∧ e is PARENTS_READY ∧ e is CHUNKS_READY ∧ ∀ q ∈ active_peers: CoveredBy(peer_seen_frontier[q], e) }`. Parked events cannot be finalized until resolved, and non-ready events (missing ancestors or chunks) cannot be finalized.
 2. `stable_frontier = { e ∈ newly_stable | no child of e is in newly_stable }` (the maximal stable events by causality).
 3. Sort `stable_frontier` by HLC total order (deterministic).
-4. Snapshot batch anchor once: `anchor = finalized_root`, `acc = finalized_root`.
-5. Apply `FixedAnchorFold(stable_frontier, anchor)` (equivalently: for each frontier event `e` in order: `merged = MergeRoots(acc, e.root_hash, anchor)`).
+4. Snapshot previous finalized root once: `prev_finalized_root = finalized_root`, `acc = finalized_root`.
+5. Apply `AnchoredFold(stable_frontier, prev_finalized_root)` (equivalently: for each frontier event `e` in order: `merged = MergeRoots(acc, e.root_hash, e.anchor_root_hash)`).
    - If `merged` is `Ok`: `acc ← merged`.
    - If `merged` is `Conflict`: skip `e`'s root for finalized-root advancement (do not update `acc`), but continue the batch.
 6. Bookkeeping finalization: for each `e ∈ newly_stable`, set `finalized_events[e.cid] ← e.root_hash`.
 7. Materialize deterministic Dolt commits (all fields from event metadata, HLC timestamp, deterministic parents).
 8. Replace tentative commits. `finalized_root ← acc`.
-9. If `acc ≠ anchor`, update finalized checkpoint metadata:
-   - `finalized_parents[acc] ← finalized_parents[acc] ∪ {anchor}` (self-edge excluded)
+9. If `acc ≠ prev_finalized_root`, update finalized checkpoint metadata:
+   - `finalized_parents[acc] ← finalized_parents[acc] ∪ {prev_finalized_root}` (self-edge excluded)
 
 > **Why frontier-only?** Replaying every stable event root can re-apply causal chains in the same batch and create false conflicts (e.g., parent then child over the same row). Merging only stable frontier heads applies each stable branch exactly once, while `finalized_events` still records all stabilized events for accounting.
 
@@ -468,7 +470,7 @@ Triggered when a peer detects a different `finalized_root` from a reconnecting p
       - `finalized_parents[finalized_root] ← finalized_parents[finalized_root] ∪ ({our_finalized_root, their_finalized_root} \ {finalized_root})`
       (This also handles the conflict path where `finalized_root = ours_finalized_root`: self-edge is excluded and the other side is recorded as an additional parent.)
    8. Create a deterministic Dolt merge commit with both finalized tips as parents. All metadata fields are derived deterministically from finalized states with deterministic parent ordering and standard merge metadata.
-4. **Re-anchor tentative events when finalized root changes:** All post-finalization tentative events used the previous `finalized_root` as merge ancestor. If `finalized_root` changed (adopt or merge), replay all non-finalized events from the new `finalized_root` via `RECONCILE`. CPU-only — all chunks already local. If no mergeable head is closure-ready yet, this projection is explicitly provisional; implementations MUST NOT silently clear unresolved parked head IDs in this state, and MUST recompute on closure completion (ancestor pull completion, chunk completion, or subsequent `RECEIVE_EVENT`/heartbeat-triggered reconcile).
+4. **Re-anchor tentative events when finalized root changes:** Every tentative event carries the `anchor_root_hash` of the finalized root it was originally written on. If `finalized_root` changed (adopt or merge), replay all non-finalized events over the new accumulator via `RECONCILE`, using each event's recorded `anchor_root_hash` in `AnchoredFold`. This is CPU-only for already-mergeable heads. If some head is still missing ancestors or root/anchor chunks, this projection is explicitly provisional; implementations MUST NOT silently clear unresolved parked head IDs in this state, and MUST recompute on closure completion (ancestor pull completion, chunk completion, or subsequent `RECEIVE_EVENT`/heartbeat-triggered reconcile).
 
 > Optional optimization (non-normative): peers may exchange finalized-event deltas/suffixes on the wire, but the semantic contract is equivalent to full-map exchange and must produce the same post-merge `finalized_events` map.
 
@@ -531,7 +533,7 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 **INV7 — Conflict Visibility:** All merge conflicts are captured and surfaced — none leak into working or finalized state, none are silently discarded. Nine sub-properties:
 
 - **INV7a — No Unhandled Tentative Conflict:** `latest_root` is never a conflict sentinel. Every conflict detected by `MergeRoots` during reconciliation is captured in `parked_conflicts` (the later event by total order is parked). No conflict result propagates into the working state.
-- **INV7b — No Unhandled Finalized Conflict:** `finalized_root` is never a conflict sentinel. `ADVANCE_STABILITY` skips conflicting stable-frontier roots during the fixed-anchor fold (§7.1.1), and `SYNC_FINALIZED` divergence merges handle conflicts by using the ours-side root (deterministic). No conflict result propagates into the finalized state.
+- **INV7b — No Unhandled Finalized Conflict:** `finalized_root` is never a conflict sentinel. `ADVANCE_STABILITY` skips conflicting stable-frontier roots during the anchored frontier fold (§7.1.1), and `SYNC_FINALIZED` divergence merges handle conflicts by using the ours-side root (deterministic). No conflict result propagates into the finalized state.
 - **INV7c — Parked Event Integrity:** Every parked event references a known event in the clock. No conflict is silently discarded — parked events persist until explicitly resolved via `RESOLVE_CONFLICT`.
 - **INV7d — Parking Agreement (closure-ready):** For any two peers with the same clock and the same `finalized_root`, parking decisions agree once relevant heads are mergeable. Under closure lag, parked tracking is conservative: unresolved parked head IDs may be retained provisionally until closure completes.
 - **INV7e — Finalized Conflict Tracking:** Every finalized-layer conflict detected by `SYNC_FINALIZED` conflict handling is inserted into `finalized_conflicts` and remains present until resolved either locally (`RESOLVE_FINALIZED_CONFLICT`) or via receipt of an event carrying `resolved_finalized_conflict_id` for that conflict.
@@ -565,11 +567,11 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 
 **Modeling notes (spec vs. this document):**
 
-- **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) processes a full batch each time it runs: compute `newly_stable` from active-peer seen-frontier coverage, derive the stable frontier (maximal stable events), sort that frontier by HLC total order, and fold with a fixed batch ancestor `anchor = finalized_root_at_batch_start`. The Quint spec models the same batch semantics via `finalizeBatch`.
+- **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) processes a full batch each time it runs: compute `newly_stable` from active-peer seen-frontier coverage, derive the stable frontier (maximal stable events), sort that frontier by HLC total order, and fold from the current `finalized_root` accumulator while merging each event against its recorded `anchor_root_hash`. The Quint spec models the same batch semantics via `finalizeBatch`.
 - **Finalized checkpoint lineage metadata:** The protocol treats `finalized_parents` as authoritative lineage state over finalized roots. Ancestor/depth views used for LCA may be derived on demand or maintained as optional local caches. `do_finalize` updates parents when `finalized_root` advances, and `do_sync_finalized` uses lineage-LCA (`lineageLcaRoot`) to compute `common_root` for divergence merges. This avoids unsound from-scratch replay of finalized events and preserves nested partition recovery correctness (INV3).
 - **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The protocol and Quint spec align on deterministic ours/theirs assignment in `do_sync_finalized`: lower finalized-root hash value = "ours". This is fully local and unambiguous after fork-and-join recoveries.
-- **EventCID representation:** The protocol defines `EventCID = hash(CanonicalEncode(CIDPayload))`, where `CIDPayload = (root_hash, sorted parents, hlc, peer, resolved_finalized_conflict_id)`. Signature covers `SignedPayload = CIDPayload`. The protocol is codec-agnostic: implementations need canonical bytes, not a mandated wire format. The spec uses `EventCID = (peer, wall, logical)` — a tuple derived from HLC — to avoid modeling hashing/byte encodings while preserving uniqueness.
-- **Event fields:** The spec's `Event` omits `signature`, but includes `resolved_finalized_conflicts` (a set model of optional `resolved_finalized_conflict_id`). `signature` omission is noted above (signature verification is document-only).
+- **EventCID representation:** The protocol defines `EventCID = hash(CanonicalEncode(CIDPayload))`, where `CIDPayload = (root_hash, anchor_root_hash, sorted parents, hlc, peer, resolved_finalized_conflict_id)`. Signature covers `SignedPayload = CIDPayload`. The protocol is codec-agnostic: implementations need canonical bytes, not a mandated wire format. The spec uses `EventCID = (peer, wall, logical)` — a tuple derived from HLC — to avoid modeling hashing/byte encodings while preserving uniqueness.
+- **Event fields:** The spec's `Event` includes `anchor_root_hash` and `resolved_finalized_conflicts` (a set model of optional `resolved_finalized_conflict_id`), but omits `signature`. `signature` omission is noted above (signature verification is document-only).
 - **`parked_conflicts` type:** Authoritative semantics are set-based in both protocol and spec (`Set[EventCID]`). Optional local detail maps are implementation-local only.
 - **`finalized_conflicts` type:** The protocol defines `finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictInfo]` (includes table/detail presentation metadata). The spec models `finalized_conflicts` as a map keyed by the same deterministic conflict ID, but tracks only structural roots (`ours_root`, `theirs_root`, `common_root`) needed for state-machine checks.
 - **Heartbeat frontier exchange:** The protocol heartbeat carries frontier digests (`heads_digest`, `seen_frontier_digest`) and the receiver requests full sets only on mismatch. The spec's `do_heartbeat` reads the sender's node state directly, updates the stored `peer_seen_frontier`, and pulls the same closure target without modeling digest message mechanics.
@@ -585,7 +587,7 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 - **`localWall` state variable:** The spec adds `localWall: int` to `NodeState`, not present in the protocol's §2.2 per-peer state table. This separates wall-clock progression into explicit `do_tick` actions, giving the model checker control over time advancement. In the protocol, wall time is implicit (read from the system clock).
 - **`mergeRoots` abstraction:** The protocol delegates to Dolt's `MergeRoots`, which performs cell-level three-way merge over prolly trees. The spec now models two independent writable dimensions so disjoint concurrent writes auto-merge and only overlapping writes conflict. `CONFLICT_HASH` remains the model sentinel.
 - **Event-only inbox:** The spec's `inbox: PeerID → Set[Event]` carries only `Event` messages. Heartbeats use direct state reads (`do_heartbeat`). This follows from the "heartbeat as direct state read" simplification above.
-- **Chunk and parent-closure gates:** The protocol defines a per-event lifecycle (ANNOUNCED → PARENTS_READY → CHUNKS_READY → MERGEABLE). The spec now models both gates with explicit `chunks_ready` state and a bounded `do_chunks_ready` action; reconciliation and finalization both require parent-closure and chunk-readiness for events they fold.
+- **Chunk and parent-closure gates:** The protocol defines a per-event lifecycle (ANNOUNCED → PARENTS_READY → CHUNKS_READY → MERGEABLE). `CHUNKS_READY` means both `root_hash` and `anchor_root_hash` are locally available for that event. The spec models this with explicit `chunks_ready` state and a bounded `do_chunks_ready` action; reconciliation and finalization both require parent-closure and chunk-readiness for events they fold.
 To run the spec: `task quint:run`
 
 ---
@@ -743,7 +745,7 @@ When a parked event is resolved via `RESOLVE_CONFLICT`, it leaves `parked_confli
 
 A formerly-parked event's `root_hash` branches from an earlier state — it does not incorporate concurrent changes that caused the parking. Replaying every stable event root can therefore re-introduce the same conflict at finalized layer.
 
-**Fix:** `ADVANCE_STABILITY` merges only stable frontier heads using a fixed batch ancestor (`anchor = finalized_root` at batch start). If a frontier merge conflicts, that head is skipped for finalized-root advancement while bookkeeping still finalizes the stabilized event set. This is safe because:
+**Fix:** `ADVANCE_STABILITY` merges only stable frontier heads, starting from the current `finalized_root` accumulator and using each frontier event's recorded `anchor_root_hash`. If a frontier merge conflicts, that head is skipped for finalized-root advancement while bookkeeping still finalizes the stabilized event set. This is safe because:
 
 1. Events still in `parked_conflicts` are excluded from finalization candidates by step 1.
 2. Resolved histories are represented by later frontier roots that subsume earlier conflicting branches.
@@ -754,7 +756,7 @@ This approach is receipt-order independent: frontier selection and HLC ordering 
 ### 7.2 Event signing: required
 
 Every event identity/signature uses canonical abstract payloads:
-- `CIDPayload = (root_hash, sorted parents, hlc, peer, resolved_finalized_conflict_id)`
+- `CIDPayload = (root_hash, anchor_root_hash, sorted parents, hlc, peer, resolved_finalized_conflict_id)`
 - `SignedPayload = CIDPayload`
 
 `EventCID = hash(CanonicalEncode(CIDPayload))`, `Signature = Sign(private_key, CanonicalEncode(SignedPayload))`.
@@ -764,7 +766,7 @@ When an `IdentityResolver` is configured on a peer, incoming events are verified
 
 ### 7.3 No epoch grouping
 
-Events are processed individually via `MergeRoots`. There is no batching into wall-time epochs. Each event triggers its own merge operation with `finalized_root` as the merge ancestor. This is simpler than epoch-based batching and avoids epoch boundary edge cases.
+Events are processed individually via `MergeRoots`. There is no batching into wall-time epochs. Each event is replayed against its recorded `anchor_root_hash` over the current accumulator. This is simpler than epoch-based batching and avoids epoch boundary edge cases.
 
 ### 7.3.1 Merges are silent local state
 
@@ -822,7 +824,7 @@ When a network partition separates peers into independent groups, each group evi
 
 **Finalized-layer conflicts use the ours-side root and are explicitly tracked.** During normal operation, conflicts only occur at the tentative layer (parked events). Partition recovery may introduce conflicts at the finalized layer when `SYNC_FINALIZED` takes its divergence-merge path. Rather than blocking finalization, the protocol handles these conflicts inline: the ours-side root (lower finalized-root hash, deterministic) becomes `finalized_root`, both sides' finalized events are unioned, and a deterministic `finalized_conflicts` entry is recorded. Users resolve these entries via `RESOLVE_FINALIZED_CONFLICT`, which emits a normal write event carrying `resolved_finalized_conflict_id`. Receivers clear matching entries on event receipt, and `SYNC_FINALIZED` excludes known-resolved ids from conflict-map merges to prevent resurrection. This preserves the "no peer is blocked" design principle while preventing finalized conflicts from being silently forgotten.
 
-**Finalized common-ancestor lookup uses checkpoint lineage, not event replay.** `SYNC_FINALIZED` computes `common_root` via lineage LCA over authoritative finalized checkpoint metadata (`finalized_parents`), not by replaying `finalized_events`. This preserves correctness under nested partition recoveries, where replay over unioned finalized events is unsound. General finalized-root advancement still uses fixed-anchor frontier folding in `ADVANCE_STABILITY`: snapshot `anchor = finalized_root` at batch start, merge stable frontier heads via `mergeRoots(acc, head.root_hash, anchor)`, and mark all newly stable events finalized for bookkeeping.
+**Finalized common-ancestor lookup uses checkpoint lineage, not event replay.** `SYNC_FINALIZED` computes `common_root` via lineage LCA over authoritative finalized checkpoint metadata (`finalized_parents`), not by replaying `finalized_events`. This preserves correctness under nested partition recoveries, where replay over unioned finalized events is unsound. General finalized-root advancement still uses anchored frontier folding in `ADVANCE_STABILITY`: start from the current `finalized_root`, merge stable frontier heads via `mergeRoots(acc, head.root_hash, head.anchor_root_hash)`, and mark all newly stable events finalized for bookkeeping.
 
 **Deterministic merge commit.** The partition merge commit must be byte-identical across all peers for INV3. This requires: (1) deterministic ours/theirs assignment (lower finalized-root hash = ours), (2) deterministic metadata (derived from finalized states), (3) deterministic parent ordering. Dolt's `CreateDeterministicCommit` provides this.
 
