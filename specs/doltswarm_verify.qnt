@@ -398,8 +398,11 @@ module doltswarm_verify {
   /// A finalized CID is pruneable only if no other retained clock event
   /// depends on it through parent ancestry. This preserves parent-closure of
   /// the retained subgraph after compaction.
+  pure def retainedFinalizedCIDs(st: NodeState): Set[EventCID] =
+    st.finalized_events.keys().intersect(st.clock.keys())
+
   pure def gcPruneable(st: NodeState): Set[EventCID] =
-    st.finalized_events.keys().intersect(st.clock.keys()).filter(cid =>
+    retainedFinalizedCIDs(st).filter(cid =>
       not(st.clock.keys().exists(eid =>
         eid != cid and
         ancestorIdClosure(Set(eid), st.clock).contains(cid)
@@ -1800,11 +1803,20 @@ module doltswarm_verify {
     (mergeableHeads(st) == st.heads) implies st.parked_conflicts.subseteq(mergeableHeads(st))
   })
 
+  /// Retained finalized subgraph closure: any finalized event body retained in
+  /// clock keeps its required retained ancestry.
+  val inv_retained_finalized_subgraph_parent_closed = PEERS.forall(p => {
+    val st = nodes.get(p)
+    retainedFinalizedCIDs(st).forall(cid =>
+      isParentClosed(st.clock, cid)
+    )
+  })
+
   /// Finalization safety: every retained finalized event in clock is
   /// parent-closed and chunk-ready.
   val inv_finalized_parent_closed = PEERS.forall(p => {
     val st = nodes.get(p)
-    st.finalized_events.keys().intersect(st.clock.keys()).forall(cid =>
+    retainedFinalizedCIDs(st).forall(cid =>
       isParentClosed(st.clock, cid) and st.chunks_ready.contains(cid)
     )
   })

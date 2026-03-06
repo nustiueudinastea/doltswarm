@@ -143,60 +143,32 @@ Items below are ordered by remaining protocol-correctness importance. Resolved o
 
 ---
 
-## Resolved / Mostly Resolved Items
+## Resolved Items
 
-### 5. ~~`clock` retention and GC semantics were inconsistent~~ MOSTLY FIXED
+### 5. ~~`clock` retention and GC semantics were inconsistent~~ FIXED
 
-**Refs:** protocol `clock` state definition and `GC_CLOCK`; spec `gcPruneable` and `do_gc`.
+**Refs:** protocol `clock` state definition, invariants, `GC_CLOCK`, and retained-finalized sync rule; spec `retainedFinalizedCIDs`, `gcPruneable`, retained-subgraph invariant, and `do_gc`.
 
-- Protocol: `doltswarm-protocol.md` lines 205-216, 399-410.
-- Spec: `specs/doltswarm_verify.qnt` lines 366-376, 974-1000.
+- Protocol: `doltswarm-protocol.md` lines 205-218, 420, 481, 530-534.
+- Spec: `specs/doltswarm_verify.qnt` lines 397-405, 1804-1816.
 
-**Status.** This is mostly fixed.
+**Status.** Fixed by choosing **Option A** from this round: keep a single mixed `clock` map and make retained-subgraph closure explicit.
 
-The protocol now explicitly defines `clock` as mixed retained state:
-- all non-finalized events;
-- plus retained finalized events not yet compacted.
+**Implemented protocol behavior.**
+- The protocol still uses one mixed `clock` map:
+  - all non-finalized events,
+  - plus retained finalized event bodies not yet compacted.
+- The `clock` state definition now says explicitly that the retained finalized subset `clock.keys() ∩ finalized_events.keys()` MUST stay parent-closed.
+- The state discussion now calls out retained finalized event bodies as a special cached subset inside the mixed `clock` map and states that `GC_CLOCK` and `SYNC_FINALIZED` preserve that closure rule.
+- The invariants section now includes an explicit retained-subgraph invariant (`INV1c`) instead of leaving this property implicit in the `GC_CLOCK` action text alone.
 
-`GC_CLOCK` and `gcPruneable` were also strengthened so a finalized event body is only pruned when no other retained event depends on it. That preserves parent-closure of the retained subgraph, and the Quint invariant suite now passes with that stronger rule.
+**Implemented spec behavior.**
+- Added a first-class helper `retainedFinalizedCIDs(st)` so the retained finalized subset is explicit in the model.
+- `gcPruneable` now refers to that helper directly.
+- Added an explicit named invariant `inv_retained_finalized_subgraph_parent_closed`.
+- Kept the stronger existing readiness invariant (`inv_finalized_parent_closed`) alongside it, so the model now exposes retained-subgraph closure directly instead of only as an implementation consequence of compaction rules.
 
-**Remaining cleanup.** The protocol should state the retained-subgraph invariant directly in the state/invariants discussion, not only inside the `GC_CLOCK` action.
-
-**Options.**
-
-**Option A (recommended): keep a single mixed `clock` map and make retained-subgraph closure explicit.**
-
-Pros:
-- smallest state surface;
-- aligns with the current protocol and spec;
-- keeps the retained-state model simple.
-
-Cons:
-- readers still need one sentence explaining that `clock` is not "tentative only".
-
-**Option B: split `clock` into `tentative_clock` and `retained_finalized_events`.**
-
-Pros:
-- more explicit naming.
-
-Cons:
-- extra state and invariants for little gain;
-- complicates both prose and model.
-
-**Recommended protocol fix.**
-- Keep the current single-map design.
-- Add one explicit invariant sentence: the retained `clock` subgraph is parent-closed.
-- Keep `GC_CLOCK` as the mechanism that preserves that invariant.
-
-**Recommended spec fix.**
-- No structural change required.
-- Optionally add a named invariant/comment making retained-subgraph closure visible as a first-class property, rather than only an implementation consequence of `gcPruneable`.
-
-**Why this should be done.**
-This issue is functionally closed. The remaining work is documentation clarity, not a protocol redesign.
-
----
-
-## Recommended Next Order
-
-1. Add the retained-subgraph closure sentence to the protocol invariants/state text.
+**Why this closes the issue.**
+- The protocol now states the retained-subgraph rule where readers expect it: in state/invariants, not only inside `GC_CLOCK`.
+- The spec now has a named retained-subgraph closure property instead of relying on readers to infer it from `gcPruneable`.
+- The single-map design stays intact, so the fix improves clarity without increasing protocol state surface.

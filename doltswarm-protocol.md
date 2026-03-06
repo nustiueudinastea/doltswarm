@@ -204,7 +204,7 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 
 | Variable | Type | Description |
 |---|---|---|
-| `clock` | `Map[EventCID, Event]` | Locally retained Merkle clock events: all non-finalized events plus any retained finalized events not yet compacted by `GC_CLOCK` |
+| `clock` | `Map[EventCID, Event]` | Locally retained Merkle clock events: all non-finalized events plus any retained finalized events not yet compacted by `GC_CLOCK`. The retained finalized subset `clock.keys() ∩ finalized_events.keys()` MUST stay parent-closed. |
 | `heads` | `Set[EventCID]` | Clock heads (events with no children locally) |
 | `chunks_ready` | `Set[EventCID]` | Announced events whose `root_hash` and `anchor_root_hash` chunks are locally available (`CHUNKS_READY`). |
 | `latest_root` | `Hash` | Current merged RootValue |
@@ -218,6 +218,8 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 | `active_peers` | `Set[PeerID]` | Peers seen in the last heartbeat window; this is the current witness set for finalization |
 
 Implementations MAY keep optional local caches for diagnostics/perf (for example `parked_conflict_details: Map[EventCID, MergeResult]`, lineage ancestor/depth caches derived from `finalized_parents`). These caches are non-authoritative and non-replicated.
+
+Retained finalized event bodies are a special case inside the mixed `clock` map: they remain optional local cache entries, but if retained they MUST form a parent-closed subgraph. This is preserved by `GC_CLOCK` and by the retained-finalized sync rules in `SYNC_FINALIZED`.
 
 ### 2.2.1 Tentative State vs. Finalized State
 
@@ -528,6 +530,8 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 **INV1a — Logical Event-Identity Convergence:** For any two peers `p, q` that have received the same events, canonical logical identity agrees over `clock.keys() ∪ finalized_events.keys()`.
 
 **INV1b — Retained-Structure Convergence:** For any two peers `p, q`, if retained `clock.keys()` are equal, then retained derived structure agrees (`p.heads == q.heads`). This is intentionally conditioned on retained state, because compacted peers may keep different in-memory event bodies while remaining logically equivalent via `finalized_events`.
+
+**INV1c — Retained Finalized Subgraph Closure:** For any peer `p`, the retained finalized subset `p.clock.keys() ∩ p.finalized_events.keys()` is parent-closed. A peer may compact finalized event bodies, but any finalized event body that remains in `clock` must retain the finalized ancestry needed by other retained events.
 
 **INV2 — Data Convergence:** For any two peers that have processed the same set of events in the same total order, `p.latest_root == q.latest_root`.
 
