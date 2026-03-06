@@ -46,69 +46,36 @@ Items below are ordered by remaining protocol-correctness importance. Resolved o
 - After `finalized_root` changes, the protocol has enough information to replay retained tentative events coherently.
 - The protocol/spec pair now define the same replay rule, including the single-head path and the chunk-readiness requirements for anchor roots.
 
+### 2. ~~`SYNC_FINALIZED` still excludes the `EMPTY_ROOT` recovery path~~ FIXED
+
+**Refs:** protocol heartbeat-triggered sync gate, `SYNC_FINALIZED` precondition, and sync-design notes; spec `syncEnabled` and empty-root ADOPT regression.
+
+- Protocol: `doltswarm-protocol.md` lines 377, 426, 580, 586, 710.
+- Spec: `specs/doltswarm_verify.qnt` lines 609-615, 1362-1373.
+
+**Status.** Fixed by choosing **Option A** from this round: allow `SYNC_FINALIZED` whenever finalized roots differ, with `EMPTY_ROOT` treated as the root of finalized lineage.
+
+**Implemented protocol behavior.**
+- HEARTBEAT now triggers `SYNC_FINALIZED` whenever `received.finalized_root ≠ finalized_root`; the special non-empty guard was removed.
+- `SYNC_FINALIZED` no longer requires both sides to have non-empty finalized roots.
+- The protocol now states explicitly that `EMPTY_ROOT` participates in normal lineage classification, so:
+  - `EMPTY_ROOT -> non-empty` is an **ADOPT** case,
+  - `non-empty -> EMPTY_ROOT` is a **NOOP** case,
+  - only incomparable non-empty roots take the **MERGE** branch.
+- Modeling/design notes now describe empty-peer recovery as part of the same finalized-sync machinery, not as a special excluded case.
+
+**Implemented spec behavior.**
+- Removed the `st_local.finalized_root != EMPTY_ROOT` and `st_remote.finalized_root != EMPTY_ROOT` guards from `syncEnabled`.
+- Added `inv_sync_empty_root_adopts`, which checks that a connected peer at `EMPTY_ROOT` takes the normal `SYNC_ADOPT` branch and adopts the remote non-empty finalized root/events.
+
+**Why this closes the issue.**
+- `EMPTY_ROOT` is now a normal lineage root instead of a protocol exception.
+- Recovery of empty peers no longer depends on retaining finalized event bodies in `clock` or on always using `PEER_JOIN`.
+- The protocol/spec pair now define one uniform finalized-recovery story for bootstrap, crash recovery, and reconnect after compaction.
+
 ---
 
 ## Correctness-Prioritized Open Items
----
-
-### 2. `SYNC_FINALIZED` still excludes the `EMPTY_ROOT` recovery path
-
-**Refs:** protocol heartbeat-triggered sync gate and `SYNC_FINALIZED` precondition; spec `syncEnabled`.
-
-- Protocol: `doltswarm-protocol.md` lines 375, 424.
-- Spec: `specs/doltswarm_verify.qnt` lines 600-610.
-
-**Problem.** The protocol still forbids `SYNC_FINALIZED` unless both sides already have non-empty finalized roots. That leaves one of the most important recovery paths outside the normal sync machinery:
-- one peer has finalized history,
-- one peer is still at `EMPTY_ROOT`,
-- finalized events may already have been compacted from `clock`,
-- plain event exchange is no longer guaranteed to reconstruct the missing finalized state.
-
-Under those conditions, `EMPTY_ROOT` is not a special semantic case. It is simply the root of lineage. Treating it as unsyncable makes recovery more brittle than it needs to be.
-
-**Options.**
-
-**Option A (recommended): allow `SYNC_FINALIZED` whenever finalized roots differ.**
-
-Pros:
-- simplest convergence story;
-- `EMPTY_ROOT` becomes a normal lineage ancestor;
-- recovery no longer depends on retaining finalized event bodies in `clock`.
-
-Cons:
-- slightly broadens the sync path, but only in a way that matches the existing lineage model.
-
-**Option B: keep the current gate and make `PEER_JOIN` the only legal bootstrap path.**
-
-Pros:
-- narrowest `SYNC_FINALIZED` contract.
-
-Cons:
-- bootstrap/recovery semantics are no longer uniform;
-- a peer that missed finalized history must rely on explicit state transfer rather than the protocol's normal sync path.
-
-**Option C: keep the gate and retain enough finalized event history that ordinary event exchange always repairs empties.**
-
-Pros:
-- no change to sync state machine.
-
-Cons:
-- directly fights compaction;
-- makes recovery correctness depend on retention policy.
-
-**Recommended protocol fix.**
-- Remove the non-empty guard from the heartbeat sync trigger.
-- Remove the non-empty precondition from `SYNC_FINALIZED`.
-- Treat `EMPTY_ROOT` as a normal lineage root in ADOPT/NOOP/MERGE mode classification.
-
-**Recommended spec fix.**
-- Remove `st_local.finalized_root != EMPTY_ROOT` and `st_remote.finalized_root != EMPTY_ROOT` from `syncEnabled`.
-- Add a regression where a peer at `EMPTY_ROOT` adopts a non-empty finalized lineage from another peer.
-
-**Why this should be done.**
-This is a small change with a disproportionately large simplification payoff. It makes finalized recovery uniform, reduces dependence on bootstrap special cases, and better matches the protocol's own lineage story.
-
----
 
 ### 3. ~~Seen-frontier finalization fixes the witness semantics, but heartbeat anti-entropy still needs one more tightening~~ PARTIALLY FIXED
 
@@ -292,8 +259,6 @@ This issue is functionally closed. The remaining work is documentation clarity, 
 
 ## Recommended Next Order
 
-1. Fix event semantics with `anchor_root_hash`.
-2. Remove the `EMPTY_ROOT` gate from `SYNC_FINALIZED`.
-3. Make admission semantics swarm-uniform via `ValidEvent(e)`.
-4. Tighten heartbeat anti-entropy with either `closure_deficit(q)` or full seen-frontier exchange.
-5. Add the retained-subgraph closure sentence to the protocol invariants/state text.
+1. Make admission semantics swarm-uniform via `ValidEvent(e)`.
+2. Tighten heartbeat anti-entropy with either `closure_deficit(q)` or full seen-frontier exchange.
+3. Add the retained-subgraph closure sentence to the protocol invariants/state text.

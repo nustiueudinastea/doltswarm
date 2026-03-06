@@ -611,8 +611,6 @@ module doltswarm_verify {
     p != q,
     isConnected(conn, p, q),
     st_local.finalized_root != st_remote.finalized_root,
-    st_local.finalized_root != EMPTY_ROOT,
-    st_remote.finalized_root != EMPTY_ROOT,
     syncAdoptionReady(st_local, st_remote),
     syncLineageReady(st_local, st_remote),
   }
@@ -702,9 +700,14 @@ module doltswarm_verify {
   /// Full SYNC_FINALIZED local result, including latest_root re-anchoring.
   pure def applySyncFinalized(st_local: NodeState, st_remote: NodeState): NodeState = {
     val syncedState = syncFinalizedCore(st_local, st_remote)
-    val reconcileResult = computeMergedRoot(syncedState)
-    {
+    val retainedFinalizedReady = syncedState.clock.keys().intersect(syncedState.finalized_events.keys())
+    val withRetainedFinalizedReady: NodeState = {
       ...syncedState,
+      chunks_ready: syncedState.chunks_ready.union(retainedFinalizedReady),
+    }
+    val reconcileResult = computeMergedRoot(withRetainedFinalizedReady)
+    {
+      ...withRetainedFinalizedReady,
       latest_root: reconcileResult._1,
       parked_conflicts: reconcileResult._2,
     }
@@ -1360,6 +1363,21 @@ module doltswarm_verify {
     }
   }))
 
+  /// SYNC_FINALIZED empty-root adoption contract: a peer at EMPTY_ROOT adopts
+  /// a connected peer's non-empty finalized state through the normal ADOPT path.
+  val inv_sync_empty_root_adopts = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val synced = applySyncFinalized(st_p, st_q)
+    (syncEnabled(connected, p, q, st_p, st_q) and
+      st_p.finalized_root == EMPTY_ROOT and
+      st_q.finalized_root != EMPTY_ROOT) implies all {
+      syncMode(st_p, st_q) == SYNC_ADOPT,
+      synced.finalized_root == st_q.finalized_root,
+      synced.finalized_events == st_q.finalized_events,
+    }
+  }))
+
   /// SYNC_FINALIZED contract (no-op branch): ahead peer does not change
   /// finalized root/events, but unresolved finalized conflicts still propagate
   /// monotonically (minus known resolution references).
@@ -1740,7 +1758,8 @@ module doltswarm_verify {
   /// Re-anchoring under closure lag: after SYNC_FINALIZED changes finalized_root,
   /// projection may remain provisional while mergeable heads are missing.
   /// Once required closure and chunks are available and introduce mergeable
-  /// heads with differing roots, recomputation must change the stale projection.
+  /// heads whose anchored merge step is not a no-op, recomputation must change
+  /// the stale projection.
   val inv_reanchor_after_closure_lag = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -1759,7 +1778,14 @@ module doltswarm_verify {
       not(synced.heads.empty()) and
       mergeableHeads(synced).empty() and
       not(mergeableHeads(caughtState).empty()) and
-      mergeableHeads(caughtState).exists(h => caughtState.clock.get(h).root_hash != synced.latest_root)
+      mergeableHeads(caughtState).exists(h => {
+        val candidate = mergeRoots(
+          synced.latest_root,
+          caughtState.clock.get(h).root_hash,
+          caughtState.clock.get(h).anchor_root_hash
+        )
+        candidate == CONFLICT_HASH or candidate != synced.latest_root
+      })
     ) implies
       (recomputed._1 != synced.latest_root or recomputed._2 != synced.parked_conflicts)
   }))
