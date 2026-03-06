@@ -7,7 +7,7 @@
  * no List (Seq) types — everything is sets and maps.
  *
  * Models the core protocol: Merkle clock events, MergeRoots-based reconcile,
- * heartbeats for stability, causal finalization,
+ * heartbeats for witness-frontier exchange, causal finalization,
  * merge conflicts, tentative + finalized conflict resolution, network partitions,
  * and partition recovery via accept-the-fork finalized merge (§7.10).
  *
@@ -87,8 +87,7 @@ module doltswarm_verify {
     chunks_ready: Set[EventCID],
     latest_root: Hash,
     hlc_clock: HLC,
-    peer_hlc: PeerID -> HLC,
-    stable_hlc: HLC,
+    peer_seen_frontier: PeerID -> Set[EventCID],
     finalized_root: Hash,
     finalized_events: EventCID -> Hash,
     finalized_parents: Hash -> Set[Hash],
@@ -104,10 +103,6 @@ module doltswarm_verify {
 
   var nodes: PeerID -> NodeState
   var inbox: PeerID -> Set[Event]
-  /// History variable: tracks previous stable_hlc per peer for monotonicity check.
-  var prev_stable_hlc: PeerID -> HLC
-  /// History variable: tracks previous active_peers per peer for monotonicity guard.
-  var prev_active_peers: PeerID -> Set[PeerID]
   /// Network connectivity: set of directed (a, b) pairs meaning a can send to b.
   /// Symmetric: (a, b) ∈ connected ⟺ (b, a) ∈ connected.
   /// Models network partitions: removing pairs isolates peers.
@@ -230,12 +225,39 @@ module doltswarm_verify {
       isParentClosed(st.clock, cid) and st.chunks_ready.contains(cid)
     )
 
+  /// Locally observed frontier:
+  /// maximal events whose full parent ancestry is present in the local clock.
+  pure def observedFrontier(clock: EventCID -> Event): Set[EventCID] = {
+    val observed = clock.keys().filter(cid => isParentClosed(clock, cid))
+    observed.filter(cid =>
+      not(observed.exists(child => clock.get(child).parents.contains(cid)))
+    )
+  }
+
+  /// A frontier covers cid iff some frontier element has cid in its
+  /// ancestor-or-self closure within the local retained clock.
+  pure def frontierCovers(clock: EventCID -> Event,
+      frontier: Set[EventCID], cid: EventCID): bool =
+    frontier.exists(fid =>
+      clock.has(fid) and ancestorIdClosure(Set(fid), clock).contains(cid)
+    )
+
+  /// Candidate cid is witnessed by the current active peer set iff every
+  /// active peer's last known seen frontier covers it.
+  pure def coveredByActivePeers(st: NodeState, cid: EventCID): bool =
+    st.active_peers.forall(q =>
+      frontierCovers(st.clock, st.peer_seen_frontier.get(q), cid)
+    )
+
   /// Pull target on heartbeat mismatch: remote heads plus recursive ancestor
-  /// closure, excluding CIDs already present locally.
-  pure def pullClosureCIDs(localClock: EventCID -> Event, remote: NodeState): Set[EventCID] = {
-    val remoteClosure = ancestorIdClosure(remote.heads, remote.clock)
+  /// closure for remote heads and remote seen frontier, excluding CIDs already
+  /// present locally.
+  pure def pullClosureCIDs(localClock: EventCID -> Event,
+      remoteClock: EventCID -> Event, remoteHeads: Set[EventCID],
+      remoteSeenFrontier: Set[EventCID]): Set[EventCID] = {
+    val remoteClosure = ancestorIdClosure(remoteHeads.union(remoteSeenFrontier), remoteClock)
     remoteClosure.filter(cid =>
-      remote.clock.has(cid) and
+      remoteClock.has(cid) and
       not(localClock.has(cid))
     )
   }
@@ -250,8 +272,14 @@ module doltswarm_verify {
 
   /// Bounded anti-entropy catchup projection: one heartbeat pull plus enough
   /// receive steps to materialize all pulled events into local clock state.
-  pure def heartbeatClosureCatchupClock(st_local: NodeState, st_remote: NodeState): EventCID -> Event = {
-    val pulled = pullClosureCIDs(st_local.clock, st_remote)
+  pure def heartbeatClosureCatchupClock(st_local: NodeState, st_remote: NodeState,
+      remotePeer: PeerID): EventCID -> Event = {
+    val pulled = pullClosureCIDs(
+      st_local.clock,
+      st_remote.clock,
+      st_remote.heads,
+      st_remote.peer_seen_frontier.get(remotePeer)
+    )
     applyRemoteEvents(st_local.clock, st_remote.clock, pulled)
   }
 
@@ -302,12 +330,11 @@ module doltswarm_verify {
   /// Eligible events for finalization at the current stability boundary.
   pure def finalizationCandidates(st: NodeState): Set[EventCID] =
     st.clock.keys().filter(cid =>
-      val e = st.clock.get(cid)
-      less(e.hlc, st.stable_hlc) and
       not(st.finalized_events.has(cid)) and
       not(st.parked_conflicts.contains(cid)) and
       isParentClosed(st.clock, cid) and
-      st.chunks_ready.contains(cid)
+      st.chunks_ready.contains(cid) and
+      coveredByActivePeers(st, cid)
     )
 
   /// Stable frontier heads: candidates that have no child in the same
@@ -337,12 +364,13 @@ module doltswarm_verify {
   }
 
   /// Finalized events safe to compact from clock.
-  /// A finalized CID is pruneable only if no non-finalized event depends on it
-  /// through parent ancestry.
+  /// A finalized CID is pruneable only if no other retained clock event
+  /// depends on it through parent ancestry. This preserves parent-closure of
+  /// the retained subgraph after compaction.
   pure def gcPruneable(st: NodeState): Set[EventCID] =
     st.finalized_events.keys().intersect(st.clock.keys()).filter(cid =>
       not(st.clock.keys().exists(eid =>
-        not(st.finalized_events.has(eid)) and
+        eid != cid and
         ancestorIdClosure(Set(eid), st.clock).contains(cid)
       ))
     )
@@ -494,8 +522,6 @@ module doltswarm_verify {
       conflictID: FinalizedConflictID, resolvedContent: int): NodeState = {
     val newHLC = tick(st.hlc_clock, st.localWall, p)
     val newCID = makeEventCID(p, newHLC.wall, newHLC.logical)
-    val updatedPeerHLC = st.peer_hlc.set(p, hlcMax(st.peer_hlc.get(p), newHLC))
-    val newStable = hlcMinOver(updatedPeerHLC, st.active_peers)
     val activeHeads = st.heads.exclude(st.parked_conflicts)
     val event: Event = {
       cid: newCID,
@@ -513,8 +539,7 @@ module doltswarm_verify {
       heads: newHeads,
       chunks_ready: st.chunks_ready.union(Set(newCID)),
       hlc_clock: newHLC,
-      peer_hlc: updatedPeerHLC,
-      stable_hlc: newStable,
+      peer_seen_frontier: st.peer_seen_frontier.set(p, observedFrontier(newClock)),
       finalized_conflicts: dropFinalizedConflict(st.finalized_conflicts, conflictID),
     }
     val reconcileResult = computeMergedRoot(postState)
@@ -688,8 +713,7 @@ module doltswarm_verify {
       chunks_ready: Set(),
       latest_root: EMPTY_ROOT,
       hlc_clock: { wall: 1, logical: 0, peer: p },
-      peer_hlc: PEERS.mapBy(q => { wall: 0, logical: 0, peer: q }),
-      stable_hlc: ZERO,
+      peer_seen_frontier: PEERS.mapBy(_ => Set()),
       finalized_root: EMPTY_ROOT,
       finalized_events: Map(),
       finalized_parents: Map().put(EMPTY_ROOT, Set()),
@@ -699,8 +723,6 @@ module doltswarm_verify {
       localWall: 1,
     }),
     inbox' = PEERS.mapBy(_ => Set()),
-    prev_stable_hlc' = PEERS.mapBy(_ => ZERO),
-    prev_active_peers' = PEERS.mapBy(_ => PEERS),
     connected' = allPairs(PEERS),
   }
 
@@ -713,8 +735,6 @@ module doltswarm_verify {
       st.localWall <= MAX_WALL,
       st.clock.keys().size() < MAX_EVENTS,
       val newHLC = tick(st.hlc_clock, st.localWall, p)
-      val updatedPeerHLC = st.peer_hlc.set(p, hlcMax(st.peer_hlc.get(p), newHLC))
-      val newStable = hlcMinOver(updatedPeerHLC, st.active_peers)
       val newCID = makeEventCID(p, newHLC.wall, newHLC.logical)
       val activeHeads = st.heads.exclude(st.parked_conflicts)
       val event: Event = {
@@ -734,8 +754,7 @@ module doltswarm_verify {
         heads: newHeads,
         chunks_ready: st.chunks_ready.union(Set(newCID)),
         hlc_clock: newHLC,
-        peer_hlc: updatedPeerHLC,
-        stable_hlc: newStable,
+        peer_seen_frontier: st.peer_seen_frontier.set(p, observedFrontier(newClock)),
       }
       val reconcileResult = computeMergedRoot(postWriteState)
       val newLatestRoot = reconcileResult._1
@@ -747,9 +766,6 @@ module doltswarm_verify {
           parked_conflicts: newParkedConflicts,
         }),
         inbox' = broadcastConnected(inbox, event, connected),
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
         connected' = connected,
       }
     }
@@ -778,8 +794,6 @@ module doltswarm_verify {
       val newClock = st.clock.put(e.cid, e)
       // Merge HLC with the received timestamp
       val newHLC = observe(st.hlc_clock, e.hlc, st.localWall, p)
-      val updatedPeerHLC = st.peer_hlc.set(p, hlcMax(st.peer_hlc.get(p), newHLC))
-      val newStable = hlcMinOver(updatedPeerHLC, st.active_peers)
       // Recompute heads from the full clock (order-independent)
       val newHeads = computeHeads(newClock)
       // Inline reconciliation with closure/chunk gates.
@@ -792,8 +806,7 @@ module doltswarm_verify {
           e.resolved_finalized_conflicts
         ),
         hlc_clock: newHLC,
-        peer_hlc: updatedPeerHLC,
-        stable_hlc: newStable,
+        peer_seen_frontier: st.peer_seen_frontier.set(p, observedFrontier(newClock)),
       }
       val reconcileResult = computeMergedRoot(tempState)
       val newLatestRoot = reconcileResult._1
@@ -805,9 +818,6 @@ module doltswarm_verify {
           parked_conflicts: newParkedConflicts,
         }),
         inbox' = inbox,
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
         connected' = connected,
       }
     }
@@ -832,8 +842,6 @@ module doltswarm_verify {
         parked_conflicts: reconcileResult._2,
       }),
       inbox' = inbox,
-      prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-      prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
       connected' = connected,
     }
   }
@@ -865,9 +873,6 @@ module doltswarm_verify {
           parked_conflicts: newParkedConflicts,
         }),
         inbox' = inbox,
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
         connected' = connected,
       }
     }
@@ -880,24 +885,19 @@ module doltswarm_verify {
       st.localWall < MAX_WALL,
       nodes' = nodes.set(p, { ...st, localWall: st.localWall + 1 }),
       inbox' = inbox,
-      prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-      prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
       connected' = connected,
     }
   }
 
-  /// Heartbeat: peer p observes peer q's HLC.
+  /// Heartbeat: peer p refreshes its witness view of peer q.
   /// Requires connectivity (heartbeats don't flow across partitions).
-  /// Also updates p's own peer_hlc entry to its current HLC clock,
-  /// ensuring that stable_hlc can advance (a peer always knows its own time).
   ///
-  /// NOTE: The protocol uses frontier digests (heads_digest) for bandwidth
-  /// efficiency — peers compare digests and only exchange full heads on
-  /// mismatch (§7.6). The spec reads full remote state directly as a sound
-  /// over-approximation, skipping the digest-compare step.
+  /// NOTE: The protocol uses head/seen-frontier digests for bandwidth
+  /// efficiency. The spec reads full remote state directly as a sound
+  /// over-approximation, skipping the digest-compare mechanics.
   ///
-  /// Pull-on-demand (§2.4 HEARTBEAT step 5): on mismatch, p requests q's head
-  /// set and recursively fetches missing ancestor closure for those heads.
+  /// Pull-on-demand: p requests q's head set and seen frontier and recursively
+  /// fetches missing ancestor closure for their union.
   /// Fetched events are added to p's inbox for later processing via do_receive.
   /// Chunk completion is modeled separately by do_chunks_ready.
   /// This models closure-based event exchange after partitions.
@@ -907,34 +907,24 @@ module doltswarm_verify {
     all {
       p != q,
       isConnected(connected, p, q),
-      // Update q's entry from the remote heartbeat
-      val updatedPeerHLC = st.peer_hlc
-        .set(q, hlcMax(st.peer_hlc.get(q), remote.hlc_clock))
-        // Also advance self's entry to current local HLC
-        // (a peer always knows its own clock is at least this advanced)
-        .set(p, hlcMax(st.peer_hlc.get(p), st.hlc_clock))
-      // Re-add q to active_peers on heartbeat (reconnection).
-      // Compute stable_hlc over the NEW active_peers so that the min
-      // immediately accounts for q's entry. This prevents a delayed
-      // stability decrease in the next step (which would violate
-      // stability monotonicity within the same active_peers set).
       val newActivePeers = st.active_peers.union(Set(q))
-      val newStable = hlcMinOver(updatedPeerHLC, newActivePeers)
-      // Pull-on-demand closure: remote heads + recursive ancestors (§2.4 step 5)
-      val pulledCIDs = pullClosureCIDs(st.clock, remote)
+      val remoteSeenFrontier = remote.peer_seen_frontier.get(q)
+      // Pull-on-demand closure: remote heads + remote seen frontier.
+      val pulledCIDs = pullClosureCIDs(
+        st.clock,
+        remote.clock,
+        remote.heads,
+        remoteSeenFrontier
+      )
       val pulledEvents = pulledCIDs.map(cid => remote.clock.get(cid))
       all {
         nodes' = nodes.set(p, {
           ...st,
-          peer_hlc: updatedPeerHLC,
-          stable_hlc: newStable,
+          peer_seen_frontier: st.peer_seen_frontier.set(q, remoteSeenFrontier),
           active_peers: newActivePeers,
         }),
         // Add pulled closure events to p's inbox for processing via do_receive
         inbox' = inbox.set(p, inbox.get(p).union(pulledEvents)),
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
         connected' = connected,
       }
     }
@@ -977,9 +967,6 @@ module doltswarm_verify {
         parked_conflicts: reconcileResult._2,
       }),
       inbox' = inbox,
-      prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-      prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
       connected' = connected,
     }
   }
@@ -1000,6 +987,7 @@ module doltswarm_verify {
         clock: newClock,
         heads: newHeads,
         chunks_ready: newChunksReady,
+        peer_seen_frontier: st.peer_seen_frontier.set(p, observedFrontier(newClock)),
       }
       val reconcileResult = computeMergedRoot(gcState)
       nodes' = nodes.set(p, {
@@ -1008,8 +996,6 @@ module doltswarm_verify {
         parked_conflicts: reconcileResult._2,
       }),
       inbox' = inbox,
-      prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-      prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
       connected' = connected,
     }
   }
@@ -1026,8 +1012,6 @@ module doltswarm_verify {
     nodes' = nodes,
     inbox' = inbox,
     connected' = connected.exclude(Set((p, q), (q, p))),
-    prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-    prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
   }
 
   /// Network heal: reconnect two peers.
@@ -1039,14 +1023,13 @@ module doltswarm_verify {
     nodes' = nodes,
     inbox' = inbox,
     connected' = connected.union(Set((p, q), (q, p))),
-    prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-    prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
   }
 
   /// Peer eviction: p removes q from its active_peers.
   /// Triggered after heartbeat timeout when q is unreachable.
   /// Precondition: q is not connected to p (models timeout detection).
-  /// Recomputes stable_hlc without q, allowing finalization to resume.
+  /// Cached frontier metadata for q is retained, but q no longer participates
+  /// in finalization once evicted.
   action do_evict(p: PeerID, q: PeerID): bool = {
     val st = nodes.get(p)
     all {
@@ -1054,18 +1037,12 @@ module doltswarm_verify {
       st.active_peers.contains(q),
       not(isConnected(connected, p, q)),
       val newActivePeers = st.active_peers.exclude(Set(q))
-      // Recompute stable_hlc over reduced membership
-      val newStable = hlcMinOver(st.peer_hlc, newActivePeers)
       all {
         nodes' = nodes.set(p, {
           ...st,
           active_peers: newActivePeers,
-          stable_hlc: newStable,
         }),
         inbox' = inbox,
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
         connected' = connected,
       }
     }
@@ -1095,9 +1072,6 @@ module doltswarm_verify {
         mode == syncMode(st_p, st_q),
         nodes' = nodes.set(p, syncedState),
         inbox' = inbox,
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
         connected' = connected,
       }
     }
@@ -1118,8 +1092,6 @@ module doltswarm_verify {
       st.clock.keys().size() < MAX_EVENTS,
       nondet resolvedContent = CONTENTS.oneOf()
       val newHLC = tick(st.hlc_clock, st.localWall, p)
-      val updatedPeerHLC = st.peer_hlc.set(p, hlcMax(st.peer_hlc.get(p), newHLC))
-      val newStable = hlcMinOver(updatedPeerHLC, st.active_peers)
       val newCID = makeEventCID(p, newHLC.wall, newHLC.logical)
       // Resolve one parked conflict explicitly:
       // parents = active_heads ∪ {parkedCID}
@@ -1141,8 +1113,7 @@ module doltswarm_verify {
         heads: newHeads,
         chunks_ready: st.chunks_ready.union(Set(newCID)),
         hlc_clock: newHLC,
-        peer_hlc: updatedPeerHLC,
-        stable_hlc: newStable,
+        peer_seen_frontier: st.peer_seen_frontier.set(p, observedFrontier(newClock)),
       }
       val reconcileResult = computeMergedRoot(postState)
       val newLatestRoot = reconcileResult._1
@@ -1153,9 +1124,6 @@ module doltswarm_verify {
           parked_conflicts: reconcileResult._2,
         }),
         inbox' = broadcastConnected(inbox, event, connected),
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
-
         connected' = connected,
       }
     }
@@ -1184,8 +1152,6 @@ module doltswarm_verify {
           ...nextState,
         }),
         inbox' = broadcastConnected(inbox, emittedEvent, connected),
-        prev_stable_hlc' = PEERS.mapBy(pp => nodes.get(pp).stable_hlc),
-        prev_active_peers' = PEERS.mapBy(pp => nodes.get(pp).active_peers),
         connected' = connected,
       }
     }
@@ -1525,7 +1491,7 @@ module doltswarm_verify {
               == st.finalized_conflicts.keys().exclude(Set(conflictID)),
             emitted.resolved_finalized_conflicts == Set(conflictID),
             resolvedState.chunks_ready.contains(emittedCID),
-            leq(resolvedState.hlc_clock, resolvedState.peer_hlc.get(p)),
+            resolvedState.peer_seen_frontier.get(p) == observedFrontier(resolvedState.clock),
           }
         })
     })
@@ -1736,7 +1702,7 @@ module doltswarm_verify {
   val inv_heartbeat_closure_catchup_bounded = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
-    val caughtUpClock = heartbeatClosureCatchupClock(st_p, st_q)
+    val caughtUpClock = heartbeatClosureCatchupClock(st_p, st_q, q)
     (p != q and isConnected(connected, p, q)) implies
       st_q.heads.forall(h =>
         (st_q.clock.has(h) and
@@ -1767,7 +1733,7 @@ module doltswarm_verify {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
     val synced = applySyncFinalized(st_p, st_q)
-    val caughtClock = heartbeatClosureCatchupClock(synced, st_q)
+    val caughtClock = heartbeatClosureCatchupClock(synced, st_q, q)
     val caughtChunksReady = synced.chunks_ready.union(caughtClock.keys())
     val caughtState: NodeState = {
       ...synced,
@@ -1786,26 +1752,26 @@ module doltswarm_verify {
       (recomputed._1 != synced.latest_root or recomputed._2 != synced.parked_conflicts)
   }))
 
-  /// Stability monotonicity (INV6): stable_hlc never decreases.
-  /// Uses the prev_stable_hlc history variable to compare across transitions.
-  ///
-  /// NOTE: This invariant is conditioned on active_peers not changing.
-  /// When a peer is re-added to active_peers (reconnection via heartbeat),
-  /// stable_hlc can temporarily decrease if the returning peer's HLC is
-  /// behind the current minimum. This is expected during partition recovery
-  /// and does not compromise finalization safety.
-  val inv_stability_monotonicity = PEERS.forall(p => {
-    val sameActivePeers = nodes.get(p).active_peers == prev_active_peers.get(p)
-    sameActivePeers implies leq(prev_stable_hlc.get(p), nodes.get(p).stable_hlc)
+  /// Witness-frontier soundness (INV6): each peer records its own observed
+  /// frontier exactly, and finalization with singleton membership reduces to
+  /// local readiness because self coverage is immediate.
+  val inv_self_seen_frontier_exact = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.peer_seen_frontier.get(p) == observedFrontier(st.clock)
   })
 
-  /// Reduced-membership progress scenario:
-  /// with singleton membership, stability is exactly the explicit self
-  /// contribution and therefore can advance without heartbeat ordering artifacts.
-  val inv_singleton_membership_self_stability = PEERS.forall(p => {
+  pure def localReadyUnfinalized(st: NodeState): Set[EventCID] =
+    st.clock.keys().filter(cid =>
+      not(st.finalized_events.has(cid)) and
+      not(st.parked_conflicts.contains(cid)) and
+      isParentClosed(st.clock, cid) and
+      st.chunks_ready.contains(cid)
+    )
+
+  val inv_singleton_membership_self_coverage = PEERS.forall(p => {
     val st = nodes.get(p)
     (st.active_peers == Set(p)) implies
-      st.stable_hlc == st.peer_hlc.get(p)
+      finalizationCandidates(st) == localReadyUnfinalized(st)
   })
 
   /// Parking agreement (INV7d, closure-ready):
