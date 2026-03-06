@@ -11,10 +11,10 @@
  * merge conflicts, tentative + finalized conflict resolution, network partitions,
  * and partition recovery via accept-the-fork finalized merge (§7.10).
  *
- * NOTE: The protocol uses frontier digests (heads_digest = hash(sort(heads)))
- * in heartbeats for bandwidth efficiency (§7.6). The spec reads full remote
- * state directly (skipping message-level digest compare mechanics), but models
- * the same closure-based pull target: remote heads plus recursive ancestors.
+ * NOTE: The protocol heartbeats carry `heads_digest = hash(sort(heads))`,
+ * the full seen frontier, and `finalized_root` (§7.6). The spec reads full
+ * remote state directly, which matches the protocol's seen-frontier exchange
+ * and only skips the message-level head-digest compare mechanics.
  *
  * Events carry anchor_root_hash in addition to root_hash. Reconciliation and
  * finalization start from the current finalized_root accumulator, but each
@@ -254,7 +254,7 @@ module doltswarm_verify {
       frontierCovers(st.clock, st.peer_seen_frontier.get(q), cid)
     )
 
-  /// Pull target on heartbeat mismatch: remote heads plus recursive ancestor
+  /// Pull target on heartbeat refresh: remote heads plus recursive ancestor
   /// closure for remote heads and remote seen frontier, excluding CIDs already
   /// present locally.
   pure def pullClosureCIDs(localClock: EventCID -> Event,
@@ -905,9 +905,10 @@ module doltswarm_verify {
   /// Heartbeat: peer p refreshes its witness view of peer q.
   /// Requires connectivity (heartbeats don't flow across partitions).
   ///
-  /// NOTE: The protocol uses head/seen-frontier digests for bandwidth
-  /// efficiency. The spec reads full remote state directly as a sound
-  /// over-approximation, skipping the digest-compare mechanics.
+  /// NOTE: The protocol heartbeat sends the full seen frontier and only uses
+  /// a digest for the remote head set. The spec reads full remote state
+  /// directly, matching the frontier-exchange semantics and skipping only the
+  /// message-level head-digest compare mechanics.
   ///
   /// Pull-on-demand: p requests q's head set and seen frontier and recursively
   /// fetches missing ancestor closure for their union.

@@ -239,7 +239,7 @@ The protocol assumes a **direct mesh** network: every peer can send messages to 
 | Message Type | Payload | Rate |
 |---|---|---|
 | `Event` | See §2.1 | On local write |
-| `Heartbeat` | `{ peer: PeerID, heads_digest: Hash, seen_frontier_digest: Hash, finalized_root: Hash }` | Adaptive (event-driven + idle keepalive) |
+| `Heartbeat` | `{ peer: PeerID, heads_digest: Hash, seen_frontier: Set[EventCID], finalized_root: Hash }` | Adaptive (event-driven + idle keepalive) |
 
 **Data plane (chunk sync)** — prolly tree data is synced via **point-to-point streams** between specific peers, triggered by event receipt. When a peer receives an event, it requests the prolly tree chunks needed to evaluate that event: the chunks for `event.root_hash`, and the chunks for `event.anchor_root_hash` if they are not already local. The sync walks each prolly tree from its root hash, requesting only chunks not already present in the local `ChunkStore`. Point-to-point, not broadcast — only the peer that needs chunks requests them. Content-addressed deduplication via Dolt's SHA-512/20 hashing ensures structural sharing across events.
 
@@ -361,16 +361,16 @@ Adaptive policy:
 On heartbeat send:
 
 1. `heads_digest ← hash(sort(heads))`.
-2. `seen_frontier_digest ← hash(sort(peer_seen_frontier[self]))`.
-3. Broadcast `{ peer: self, heads_digest, seen_frontier_digest, finalized_root }` to all peers.
+2. `seen_frontier ← peer_seen_frontier[self]`.
+3. Broadcast `{ peer: self, heads_digest, seen_frontier, finalized_root }` to all peers.
 
 On receive from peer `q`:
 
 1. `active_peers ← active_peers ∪ {q}`.
 2. **Head digest comparison:** Compute `own_heads_digest ← hash(sort(own heads))`. If `own_heads_digest ≠ received.heads_digest`, request the sender's full head set.
-3. **Seen-frontier digest comparison:** Compute `known_seen_frontier_digest ← hash(sort(peer_seen_frontier[q]))`. If `known_seen_frontier_digest ≠ received.seen_frontier_digest`, request the sender's full seen frontier and update `peer_seen_frontier[q]`.
+3. **Seen-frontier refresh:** `peer_seen_frontier[q] ← received.seen_frontier`. The received frontier is authoritative witness metadata for peer `q`; no separate digest/request round is used for it.
 4. **Ancestor-closure pull-on-demand:** Pull missing ancestor closure for the union of the remote head set and the remote seen frontier:
-   1. Let `remote_targets = remote_heads ∪ peer_seen_frontier[q]`.
+   1. Let `remote_targets = remote_heads ∪ received.seen_frontier`.
    2. For each `t ∈ remote_targets`, recursively request every ancestor CID reachable from `t` that is missing locally.
    3. For each fetched event, pull chunks for its `root_hash`.
    Continue until each remote target is parent-closed locally (or no additional ancestors are available from the sender's clock view).
@@ -575,9 +575,9 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 - **Event fields:** The spec's `Event` includes `anchor_root_hash` and `resolved_finalized_conflicts` (a set model of optional `resolved_finalized_conflict_id`), but omits `signature`. `signature` omission is noted above (signature verification is document-only).
 - **`parked_conflicts` type:** Authoritative semantics are set-based in both protocol and spec (`Set[EventCID]`). Optional local detail maps are implementation-local only.
 - **`finalized_conflicts` type:** The protocol defines `finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictInfo]` (includes table/detail presentation metadata). The spec models `finalized_conflicts` as a map keyed by the same deterministic conflict ID, but tracks only structural roots (`ours_root`, `theirs_root`, `common_root`) needed for state-machine checks.
-- **Heartbeat frontier exchange:** The protocol heartbeat carries frontier digests (`heads_digest`, `seen_frontier_digest`) and the receiver requests full sets only on mismatch. The spec's `do_heartbeat` reads the sender's node state directly, updates the stored `peer_seen_frontier`, and pulls the same closure target without modeling digest message mechanics.
-- **Heartbeat as direct state read:** The protocol broadcasts heartbeat messages carrying digests, not full frontier sets. Receivers compare digests and request full sets on mismatch. The spec's `do_heartbeat` reads the sender's node state directly (no heartbeat inbox, no digest) as a standard model-checking simplification; it does not model heartbeat loss, reordering, or the digest-compare step.
-- **Pull-on-demand scope:** The protocol (§2.4 HEARTBEAT steps 2-4) compares head/frontier digests and, on mismatch, requests the full remote head set and seen frontier, then recursively pulls missing ancestor closure for their union. The spec models the same closure pull target while still treating heartbeat as direct state read and skipping digest mechanics.
+- **Heartbeat frontier exchange:** The protocol heartbeat carries `heads_digest`, the full `seen_frontier`, and `finalized_root`. The spec's `do_heartbeat` reads the sender's node state directly, updates the stored `peer_seen_frontier`, and pulls the same closure target without modeling message serialization.
+- **Heartbeat as direct state read:** The protocol broadcasts heartbeat messages carrying `heads_digest` plus the full seen frontier. Receivers compare only the head digest; the frontier itself is refreshed directly from the heartbeat. The spec's `do_heartbeat` reads the sender's node state directly (no heartbeat inbox, no digest compare for heads) as a standard model-checking simplification; it does not model heartbeat loss or reordering.
+- **Pull-on-demand scope:** The protocol (§2.4 HEARTBEAT steps 2-4) compares `heads_digest`, requests the full remote head set only on mismatch, and always uses the received full seen frontier when recursively pulling missing ancestor closure for their union. The spec models the same closure pull target while still treating heartbeat as direct state read and skipping the head-digest message mechanics.
 - **Finalized sync trigger and case split:** The protocol (§2.4 HEARTBEAT step 6) triggers `SYNC_FINALIZED` whenever finalized roots differ. `EMPTY_ROOT` is treated as the root of finalized lineage, so an empty peer can ADOPT a non-empty finalized state through the normal sync path. `SYNC_FINALIZED` case-splits by finalized-root lineage ancestry (ADOPT/NOOP/MERGE), not finalized-event subsets. Conflict maps are merged as `(ours ∪ theirs) \ known_resolved_ids` in every branch. The spec mirrors this contract via `syncMode`, `syncAdoptionReady`, `syncEnabled`, `applySyncFinalized`, and `resolvedFinalizedConflictRefs`.
 - **SYNC_FINALIZED regression checks in spec:** The Quint model includes branch-specific contract invariants (`inv_sync_contract_adopt`, `inv_sync_contract_noop`, `inv_sync_contract_merge`, `inv_sync_unresolved_conflicts_monotone`, `inv_sync_conflict_recorded`, `inv_sync_conflict_id_symmetric`) and pairwise convergence scenario checks to catch lineage-mode and conflict-propagation regressions early.
 - **Finalized-conflict hardening checks in spec:** The Quint model checks finalized-conflict structural integrity (`inv_finalized_conflict_visibility`), authenticity against merge semantics (`inv_finalized_conflict_authenticity`), explicit resolve-action contract behavior (`inv_resolve_finalized_conflict_contract`: remove exactly one conflict id, no direct finalized-root/events mutation, emitted event carries conflict reference), and anti-resurrection (`inv_finalized_conflict_no_resurrection`).
@@ -776,7 +776,7 @@ Merges (RECONCILE) are deterministic local computations derived entirely from th
 Only three protocol actions produce broadcast messages:
 - **LOCAL_WRITE** — new data (the event's `parents = active_heads` naturally reflects the post-merge state).
 - **RESOLVE_CONFLICT** / **RESOLVE_FINALIZED_CONFLICT** — user resolution SQL, both flow through LOCAL_WRITE.
-- **HEARTBEAT** — adaptive event-driven/keepalive, carries `heads_digest` + `seen_frontier_digest` + `finalized_root`.
+- **HEARTBEAT** — adaptive event-driven/keepalive, carries `heads_digest` + full `seen_frontier` + `finalized_root`.
 
 Heads (`computeHeads(clock)`) are always derived from the clock structure, never stored independently. After reconciliation, `heads` remain multi-valued until the next LOCAL_WRITE collapses them.
 
@@ -797,9 +797,9 @@ All Merkle clock state (events, heads, peer tracking) is held in-memory. There i
 
 Memory is bounded by optional compaction (`GC_CLOCK`): finalized event bodies can be pruned from `clock` once no retained event depends on them, while finalized CID accounting is retained in canonical `finalized_events`.
 
-### 7.6 Frontier digest heartbeats
+### 7.6 Seen-frontier heartbeats
 
-Anti-entropy is handled by adaptive heartbeats (event-driven + low-rate idle keepalive, carrying `{ peer, heads_digest, seen_frontier_digest, finalized_root }`). Heartbeats carry two compact digests: `heads_digest = hash(sort(heads))` and `seen_frontier_digest = hash(sort(peer_seen_frontier[self]))`. On receive, the receiver compares local digests against the advertised digests. Digest match means no extra transfer for that set. Digest mismatch means request the sender's full head set and/or seen frontier, then recursively pull missing ancestor closure for their union plus required root chunks. This makes the common case (peers in sync) a cheap fixed-size comparison; only divergence triggers additional traffic. Heartbeats also drive the causality-based finalization witness.
+Anti-entropy is handled by adaptive heartbeats (event-driven + low-rate idle keepalive, carrying `{ peer, heads_digest, seen_frontier, finalized_root }`). Heartbeats keep one compact digest for heads: `heads_digest = hash(sort(heads))`. They carry the full local seen frontier on every send: `seen_frontier = peer_seen_frontier[self]`. On receive, the receiver updates `peer_seen_frontier[q]` directly from the heartbeat, compares only `heads_digest`, requests the sender's full head set on mismatch, and then recursively pulls missing ancestor closure for `remote_heads ∪ received.seen_frontier` plus required root chunks. This removes the stale-frontier ambiguity from the digest-only design while keeping full-head-set transfer on-demand. The cost is slightly larger heartbeat control traffic; the benefit is simpler witness and anti-entropy semantics.
 
 ### 7.7 No pull-first optimization
 

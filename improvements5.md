@@ -75,73 +75,39 @@ Items below are ordered by remaining protocol-correctness importance. Resolved o
 
 ---
 
-## Correctness-Prioritized Open Items
+### 3. ~~Seen-frontier finalization fixes the witness semantics, but heartbeat anti-entropy still needs one more tightening~~ FIXED
 
-### 3. ~~Seen-frontier finalization fixes the witness semantics, but heartbeat anti-entropy still needs one more tightening~~ PARTIALLY FIXED
+**Refs:** protocol heartbeat payload/action and modeling notes; spec heartbeat note/commentary and pull-target helper.
 
-**Refs:** protocol heartbeat digests + pull-on-demand; spec heartbeat over-approximation note and heartbeat pull action.
+- Protocol: `doltswarm-protocol.md` lines 242, 363-378, 578-580, 779, 800-802.
+- Spec: `specs/doltswarm_verify.qnt` lines 14-17, 257-287, 905-917.
 
-- Protocol: `doltswarm-protocol.md` lines 361-376.
-- Spec: `specs/doltswarm_verify.qnt` lines 14-18, 252-284, 892-930.
+**Status.** Fixed by choosing **Option B** from this round: send the full `seen_frontier` on every heartbeat, while retaining only `heads_digest` as a compact change detector.
 
-**Status.** The major semantic problem is fixed. Finalization now depends on what the active witness set has actually observed, not on a scalar HLC proxy.
+**Implemented protocol behavior.**
+- `Heartbeat` now carries `{ peer, heads_digest, seen_frontier, finalized_root }`.
+- On send, the sender:
+  - computes `heads_digest = hash(sort(heads))`,
+  - includes the full `peer_seen_frontier[self]` in the heartbeat.
+- On receive, the receiver:
+  - still compares `heads_digest` and requests the sender's full head set only on mismatch,
+  - refreshes `peer_seen_frontier[q]` directly from `received.seen_frontier`,
+  - always uses `remote_heads ∪ received.seen_frontier` as the ancestor-pull target.
+- The design notes now say explicitly that the frontier itself is carried in full every heartbeat and that only the head set remains digest-gated.
 
-**Remaining problem.** Heartbeat still uses digest mismatch to decide when to refresh the remote head set and remote seen frontier. That is good for bandwidth, but it leaves one remaining ambiguity:
-- a peer can already know the remote heads/frontier by digest,
-- still be locally missing some ancestor closure for those already-known remote targets,
-- and have no explicit rule saying "continue closure pull even when digests still match".
+**Implemented spec behavior.**
+- No core state-machine change was required: `do_heartbeat` already refreshed `peer_seen_frontier[q]` directly from the sender's state and pulled closure for `remote.heads ∪ remote.peer_seen_frontier[q]`.
+- The module notes, pull-target helper comment, and `do_heartbeat` commentary were updated so the spec now matches the protocol exactly on the seen-frontier exchange semantics.
+- The only remaining abstraction gap is intentional and narrow: the spec still skips the message-level `heads_digest` compare and reads the sender's head set directly as a modeling simplification.
 
-The Quint model currently over-approximates this path by reading the remote state directly, so the spec is slightly stronger and simpler than the prose here.
-
-**Options.**
-
-**Option A (recommended if minimizing traffic is the higher priority): keep digests, add an explicit `closure_deficit(q)` rule.**
-
-Meaning: digest equality suppresses remote-set refresh only if the local peer has no known closure deficit for peer `q`.
-
-Pros:
-- keeps the common-case communication pattern compact;
-- closes the last stall case without changing message shapes.
-
-Cons:
-- adds one more abstract state concept.
-
-**Option B (recommended if proof/spec simplicity is the higher priority): send the full seen frontier on every heartbeat.**
-
-Pros:
-- simpler semantics;
-- easier to explain and model;
-- still much smaller than sending full remote clock state.
-
-Cons:
-- more control-plane traffic than digest-only comparison.
-
-**Option C: send both the full head set and the full seen frontier on every heartbeat.**
-
-Pros:
-- simplest protocol text.
-
-Cons:
-- highest heartbeat traffic;
-- least aligned with the protocol goal of minimizing communication.
-
-**Recommended protocol fix.**
-Pick one of two directions explicitly:
-- bandwidth-first: define `closure_deficit(q)` and require ancestor pull while it remains true, even if both digests match; or
-- proof-first: stop digesting `seen_frontier` and broadcast it in full every heartbeat.
-
-I would choose:
-- `closure_deficit(q)` if network minimization remains a hard design goal;
-- full `seen_frontier` if protocol/spec simplicity now matters more than a small amount of extra heartbeat traffic.
-
-**Recommended spec fix.**
-- If keeping digests, add an explicit modeled concept of known remote targets / closure deficit so the spec matches the prose.
-- If sending full frontier, simplify the heartbeat abstraction so the model no longer over-approximates a digest gate that the protocol depends on.
-
-**Why this should be done.**
-The seen-frontier move made the finalization witness correct. This last tightening makes the anti-entropy story congruent with it.
+**Why this closes the issue.**
+- The protocol no longer relies on a frontier-digest cache to decide whether witness metadata should be refreshed.
+- Anti-entropy and finalization now use the same explicit causal frontier object.
+- The spec is no longer stronger than the prose on frontier exchange; both now say the same thing about how witness frontiers propagate.
 
 ---
+
+## Remaining Open Items
 
 ### 4. Event admission/authentication semantics are still deployment-dependent
 
@@ -260,5 +226,4 @@ This issue is functionally closed. The remaining work is documentation clarity, 
 ## Recommended Next Order
 
 1. Make admission semantics swarm-uniform via `ValidEvent(e)`.
-2. Tighten heartbeat anti-entropy with either `closure_deficit(q)` or full seen-frontier exchange.
-3. Add the retained-subgraph closure sentence to the protocol invariants/state text.
+2. Add the retained-subgraph closure sentence to the protocol invariants/state text.
