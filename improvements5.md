@@ -107,65 +107,39 @@ Items below are ordered by remaining protocol-correctness importance. Resolved o
 
 ---
 
-## Remaining Open Items
+## Resolved in this round (continued)
 
-### 4. Event admission/authentication semantics are still deployment-dependent
+### 4. ~~Event admission/authentication semantics were deployment-dependent~~ FIXED
 
-**Refs:** protocol event-signing section and receive-path verification rule; spec `Event` / `do_receive` omit authentication semantics entirely.
+**Refs:** protocol event-admission contract, receive-path admission rule, spec modeling note, `validEvent`, `do_receive`, and admission invariants.
 
-- Protocol: `doltswarm-protocol.md` lines 248-259, 294-296.
-- Spec: `specs/doltswarm_verify.qnt` lines 68-75, 783-823.
+- Protocol: `doltswarm-protocol.md` lines 250-269, 305-306, 575, 583, 642, 774.
+- Spec: `specs/doltswarm_verify.qnt` lines 19-21, 157-170, 862-875, 1694-1704.
 
-**Problem.** The protocol still says:
-- verify signatures if an `IdentityResolver` is configured;
-- otherwise accept events best-effort.
+**Status.** Fixed by choosing **Option B** from this round: define a swarm-wide abstract `ValidEvent(e)` predicate and require every peer in one swarm to apply the same predicate.
 
-That means event admission is deployment-dependent. Two peers can apply different admission rules to the same event stream, which weakens any strong claim that the clock and finalized history converge deterministically for all compliant peers.
+**Implemented protocol behavior.**
+- The event-signing section now defines admission normatively in terms of `ValidEvent(e)`, not in terms of optional per-peer `IdentityResolver` checks.
+- The protocol now requires:
+  - every peer in one swarm to apply the same `ValidEvent(e)` predicate,
+  - `ValidEvent(e)` to be deterministic from event payload plus shared swarm configuration,
+  - `ValidEvent(e)` to reject malformed payloads, CID mismatches, and failures of the swarm's chosen authenticity/integrity checks.
+- The receive path now uses one explicit admission step: if `ValidEvent(e) = false`, discard; otherwise, if the event is new, it MUST be accepted into `clock`.
+- The document now treats concrete auth modes as non-normative deployment profiles above the protocol core (for example `signed` and `trusted`), rather than as peer-local discretion inside the protocol.
+- The architecture/boundary and spec-modeling notes were updated so they refer to `ValidEvent(e)` and `validEvent(e)` consistently.
 
-The Quint model currently abstracts signatures away completely, so it silently assumes a uniform admission predicate even though the protocol text does not require one.
+**Implemented spec behavior.**
+- Added an explicit abstract predicate `validEvent(e)` to the Quint model.
+- `do_receive` now processes only inbox events satisfying `validEvent(e)`, making the admission assumption visible in the state machine instead of implicit in commentary.
+- Added explicit invariants:
+  - `inv_clock_events_valid`,
+  - `inv_inbox_events_valid`,
+  so the model checks that retained and in-flight events stay within the abstract admission contract.
 
-**Options.**
-
-**Option A: make signature verification mandatory in the normative core.**
-
-Pros:
-- strongest convergence/security story;
-- simplest operational semantics once keys are configured.
-
-Cons:
-- pushes key-distribution assumptions into the normative protocol.
-
-**Option B (recommended): define a swarm-wide abstract `ValidEvent(e)` predicate and require every peer in one swarm to apply the same predicate.**
-
-Pros:
-- clean protocol/spec boundary;
-- transport/auth implementation stays pluggable;
-- easiest formalization.
-
-Cons:
-- the protocol no longer defines one concrete security profile by itself.
-
-**Option C: keep the current best-effort mode and weaken the convergence claims.**
-
-Pros:
-- least immediate change.
-
-Cons:
-- weakest semantics;
-- preserves avoidable deployment drift.
-
-**Recommended protocol fix.**
-- Replace the current `IdentityResolver`-optional wording with a swarm-level admission contract: all peers in one swarm MUST apply the same `ValidEvent(e)` predicate.
-- If desired, define deployment profiles above that contract, e.g. `trusted` and `signed`.
-- Keep transport/encoding/key-distribution details out of the protocol core.
-
-**Recommended spec fix.**
-- Add an abstract validity predicate or assumption.
-- State explicitly that `do_receive` models only valid events.
-- If you want to explore misconfiguration, make it a separate adversarial model rather than implicit behavior in the core correctness model.
-
-**Why this should be done.**
-This is mostly a semantics cleanup, but it matters. The current protocol is clearer than before on finalization, and that makes it more important that admission be equally uniform.
+**Why this closes the issue.**
+- Event admission is now swarm-uniform by definition, not deployment-dependent.
+- The protocol keeps auth/transport pluggable without letting different peers in the same swarm diverge on what enters the Merkle clock.
+- The protocol prose and the Quint model now say the same thing about admission semantics: the core correctness model assumes one shared event-validity predicate.
 
 ---
 
@@ -225,5 +199,4 @@ This issue is functionally closed. The remaining work is documentation clarity, 
 
 ## Recommended Next Order
 
-1. Make admission semantics swarm-uniform via `ValidEvent(e)`.
-2. Add the retained-subgraph closure sentence to the protocol invariants/state text.
+1. Add the retained-subgraph closure sentence to the protocol invariants/state text.

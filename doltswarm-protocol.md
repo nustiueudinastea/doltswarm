@@ -247,7 +247,7 @@ The protocol assumes a **direct mesh** network: every peer can send messages to 
 
 **No voting, no consensus, no coordinator.** There is no agreement mechanism in the protocol. Convergence follows from set union (the Merkle clock is a G-Set) and deterministic merge (same inputs → same output on every peer).
 
-### 2.3.1 Event Signing and Verification
+### 2.3.1 Event Signing and Admission
 
 Every event carries:
 - `cid = hash(CanonicalEncode(CIDPayload))`, where `CIDPayload` includes `root_hash`, `anchor_root_hash`, canonical parent list, `hlc`, `peer`, and `resolved_finalized_conflict_id`.
@@ -255,10 +255,18 @@ Every event carries:
 
 This signs exactly the core state-machine payload. The protocol remains codec-agnostic: implementations may choose any wire format, as long as they produce identical `CanonicalEncode(...)` bytes for the same logical payload. On the wire, `cid` is redundant (receivers recompute it) but useful for quick deduplication before full deserialization.
 
-On event receipt:
-- If the receiving peer has an `IdentityResolver` configured, the event's signature is verified against the sender's known public key.
-- Events that fail verification are **silently discarded** (not added to the clock, not forwarded).
-- If no `IdentityResolver` is configured, events are accepted best-effort (useful for testing or trusted networks).
+The normative admission rule is a swarm-wide predicate `ValidEvent(e)`.
+
+- Every peer in one swarm MUST apply the same `ValidEvent(e)` predicate to all received events.
+- `ValidEvent(e)` MUST be deterministic from the event payload plus shared swarm configuration.
+- `ValidEvent(e)` MUST reject malformed events, CID/payload mismatches, and any event that fails the swarm's configured authenticity/integrity checks.
+- Events for which `ValidEvent(e) = false` are **silently discarded** (not added to the clock, not forwarded).
+
+The protocol does not mandate one concrete security profile. It only mandates that the admission predicate be swarm-uniform. Non-normative examples:
+- `signed` profile: `ValidEvent(e)` verifies `e.signature` against a shared peer-identity mapping.
+- `trusted` profile: `ValidEvent(e)` relies on an out-of-band trusted membership/authenticated transport contract and treats the signature field as opaque or diagnostically useful.
+
+What is forbidden is per-peer discretion. One peer MUST NOT accept an event that another compliant peer in the same swarm would reject under the shared `ValidEvent(e)` definition.
 
 ### 2.4 Protocol Actions
 
@@ -294,7 +302,7 @@ Events follow a per-event lifecycle: **ANNOUNCED → PARENTS_READY → CHUNKS_RE
 Steps:
 
 1. If `e.cid ∈ clock ∨ e.cid ∈ finalized_events.keys()`: discard (idempotent).
-2. **Signature check:** If `IdentityResolver` is configured, verify `e.signature` against `e.peer`'s public key. If invalid, discard silently.
+2. **Admission check:** Evaluate the swarm-wide predicate `ValidEvent(e)`. If `ValidEvent(e) = false`, discard silently.
 3. **Strict admission rule:** If an event is valid and new, it MUST be accepted into `clock`. Peers MUST NOT discard based on local wall-time checks (e.g., `|now() - e.hlc.wall|`).
 4. `hlc ← merge(hlc, e.hlc)`.
 5. `clock[e.cid] ← e`. Event is now **ANNOUNCED**.
@@ -394,7 +402,7 @@ Let `CoveredBy(frontier, e)` mean: some `f ∈ frontier` has `e` in its ancestor
 7. Materialize deterministic Dolt commits (all fields from event metadata, HLC timestamp, deterministic parents).
 8. Replace tentative commits. `finalized_root ← acc`.
 9. If `acc ≠ prev_finalized_root`, update finalized checkpoint metadata:
-   - `finalized_parents[acc] ← finalized_parents[acc] ∪ {prev_finalized_root}` (self-edge excluded)
+   - `finalized_parents[acc] ← finalized_parents[acc] ∪ {prev_finalized_root}`, excluding self-edges and excluding any proposed parent already in `acc`'s descendant closure under the current `finalized_parents` graph. This preserves acyclic finalized lineage even if a previously-seen root hash reappears later.
 
 > **Why frontier-only?** Replaying every stable event root can re-apply causal chains in the same batch and create false conflicts (e.g., parent then child over the same row). Merging only stable frontier heads applies each stable branch exactly once, while `finalized_events` still records all stabilized events for accounting.
 
@@ -467,10 +475,10 @@ Triggered when a peer detects a different `finalized_root` from a reconnecting p
       - `finalized_events ← merged_finalized_events`
       - `finalized_parents ← merged_finalized_parents`
    7. Update finalized checkpoint metadata for the resulting root:
-      - `finalized_parents[finalized_root] ← finalized_parents[finalized_root] ∪ ({our_finalized_root, their_finalized_root} \ {finalized_root})`
+      - `finalized_parents[finalized_root] ← finalized_parents[finalized_root] ∪ ({our_finalized_root, their_finalized_root} \ {finalized_root})`, again excluding any proposed parent already in `finalized_root`'s descendant closure. This preserves acyclic finalized lineage when a merge result lands on a root hash already known in the lineage map.
       (This also handles the conflict path where `finalized_root = ours_finalized_root`: self-edge is excluded and the other side is recorded as an additional parent.)
    8. Create a deterministic Dolt merge commit with both finalized tips as parents. All metadata fields are derived deterministically from finalized states with deterministic parent ordering and standard merge metadata.
-4. **Retained finalized event bodies must stay chunk-ready:** After metadata exchange and branch application, if some `cid ∈ clock.keys()` is now also in `finalized_events.keys()`, the peer MUST ensure the chunks for that retained event body are locally available (fetch them if needed), or compact that event body out of `clock` immediately. A retained finalized clock event must not remain finalized-but-unready locally.
+4. **Retained finalized event bodies must stay ready or be compacted:** After metadata exchange and branch application, if some `cid ∈ clock.keys()` is now also in `finalized_events.keys()`, the peer MUST ensure that retained finalized event body remains both parent-closed in the retained `clock` subgraph and chunk-ready locally (fetch missing chunks if needed). If either condition cannot be maintained, that finalized event body MUST be compacted out of `clock` immediately. A retained finalized clock event must not remain finalized-but-unready or finalized-but-orphaned locally.
 5. **Re-anchor tentative events when finalized root changes:** Every tentative event carries the `anchor_root_hash` of the finalized root it was originally written on. If `finalized_root` changed (adopt or merge), replay all non-finalized events over the new accumulator via `RECONCILE`, using each event's recorded `anchor_root_hash` in `AnchoredFold`. This is CPU-only for already-mergeable heads. If some head is still missing ancestors or root/anchor chunks, this projection is explicitly provisional; implementations MUST NOT silently clear unresolved parked head IDs in this state, and MUST recompute on closure completion (ancestor pull completion, chunk completion, or subsequent `RECEIVE_EVENT`/heartbeat-triggered reconcile).
 
 > Optional optimization (non-normative): peers may exchange finalized-event deltas/suffixes on the wire, but the semantic contract is equivalent to full-map exchange and must produce the same post-merge `finalized_events` map.
@@ -564,7 +572,7 @@ The eventual-convergence claims in Goal/INV2/INV3 require the following fairness
 
 ## 3. Quint Formal Specification
 
-The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qnt` for the model-checkable specification with invariants. The spec is the source of truth for the **core state machine**: event write, receive, reconcile, heartbeat, finalize, finalized-event compaction (`do_gc`), **tentative conflict resolution** (resolve_conflict), **finalized conflict resolution** (resolve_finalized_conflict), **network partitions** (connectivity model, peer eviction), and **partition recovery** (sync_finalized). Partition conflicts from divergence merges in `SYNC_FINALIZED` are handled inline using the ours-side root (no blocking), while conflict metadata is persisted in `finalized_conflicts` until cleared by a local resolution action or a received resolution-reference event. The spec models chunk availability with an explicit `chunks_ready` abstraction (`do_chunks_ready`), while concrete data-plane transport/fetch mechanics remain document-only. Signature verification is also document-only. Membership actions (join, leave) are partially modeled: eviction and reconnection (via heartbeat re-adding to `active_peers`) are in the spec; `PEER_JOIN` state-transfer (§2.4) and graceful leave are document-only. The spec starts all peers with identical empty state, which subsumes the post-join steady state. The state-transfer snapshot mechanism is an implementation concern that does not affect core safety properties (the invariants hold regardless of how a peer acquires its initial state, as long as the snapshot is consistent).
+The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qnt` for the model-checkable specification with invariants. The spec is the source of truth for the **core state machine**: event write, receive, reconcile, heartbeat, finalize, finalized-event compaction (`do_gc`), **tentative conflict resolution** (resolve_conflict), **finalized conflict resolution** (resolve_finalized_conflict), **network partitions** (connectivity model, peer eviction), and **partition recovery** (sync_finalized). Partition conflicts from divergence merges in `SYNC_FINALIZED` are handled inline using the ours-side root (no blocking), while conflict metadata is persisted in `finalized_conflicts` until cleared by a local resolution action or a received resolution-reference event. The spec models chunk availability with an explicit `chunks_ready` abstraction (`do_chunks_ready`), while concrete data-plane transport/fetch mechanics remain document-only. The swarm-wide admission predicate is modeled abstractly as `validEvent(e)`; concrete auth/transport profiles remain document-only. Membership actions (join, leave) are partially modeled: eviction and reconnection (via heartbeat re-adding to `active_peers`) are in the spec; `PEER_JOIN` state-transfer (§2.4) and graceful leave are document-only. The spec starts all peers with identical empty state, which subsumes the post-join steady state. The state-transfer snapshot mechanism is an implementation concern that does not affect core safety properties (the invariants hold regardless of how a peer acquires its initial state, as long as the snapshot is consistent).
 
 **Modeling notes (spec vs. this document):**
 
@@ -572,7 +580,7 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 - **Finalized checkpoint lineage metadata:** The protocol treats `finalized_parents` as authoritative lineage state over finalized roots. Ancestor/depth views used for LCA may be derived on demand or maintained as optional local caches. `do_finalize` updates parents when `finalized_root` advances, and `do_sync_finalized` uses lineage-LCA (`lineageLcaRoot`) to compute `common_root` for divergence merges. This avoids unsound from-scratch replay of finalized events and preserves nested partition recovery correctness (INV3).
 - **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The protocol and Quint spec align on deterministic ours/theirs assignment in `do_sync_finalized`: lower finalized-root hash value = "ours". This is fully local and unambiguous after fork-and-join recoveries.
 - **EventCID representation:** The protocol defines `EventCID = hash(CanonicalEncode(CIDPayload))`, where `CIDPayload = (root_hash, anchor_root_hash, sorted parents, hlc, peer, resolved_finalized_conflict_id)`. Signature covers `SignedPayload = CIDPayload`. The protocol is codec-agnostic: implementations need canonical bytes, not a mandated wire format. The spec uses `EventCID = (peer, wall, logical)` — a tuple derived from HLC — to avoid modeling hashing/byte encodings while preserving uniqueness.
-- **Event fields:** The spec's `Event` includes `anchor_root_hash` and `resolved_finalized_conflicts` (a set model of optional `resolved_finalized_conflict_id`), but omits `signature`. `signature` omission is noted above (signature verification is document-only).
+- **Event fields and admission:** The spec's `Event` includes `anchor_root_hash` and `resolved_finalized_conflicts` (a set model of optional `resolved_finalized_conflict_id`), but omits `signature`. The swarm-wide admission predicate is abstracted as `validEvent(e)`, so the model captures uniform admission semantics without fixing one concrete auth profile.
 - **`parked_conflicts` type:** Authoritative semantics are set-based in both protocol and spec (`Set[EventCID]`). Optional local detail maps are implementation-local only.
 - **`finalized_conflicts` type:** The protocol defines `finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictInfo]` (includes table/detail presentation metadata). The spec models `finalized_conflicts` as a map keyed by the same deterministic conflict ID, but tracks only structural roots (`ours_root`, `theirs_root`, `common_root`) needed for state-machine checks.
 - **Heartbeat frontier exchange:** The protocol heartbeat carries `heads_digest`, the full `seen_frontier`, and `finalized_root`. The spec's `do_heartbeat` reads the sender's node state directly, updates the stored `peer_seen_frontier`, and pulls the same closure target without modeling message serialization.
@@ -631,7 +639,7 @@ doltswarm (Go)                              Dolt (Go, unmodified)
 ──────────────                              ─────────────────────
 RECEIVE_EVENT(e)
   │
-  ├─► Verify(e.signature, e.peer) ────► discard if invalid
+  ├─► ValidEvent(e) ───────────────► discard if false
   │
   ├─► ChunkSync(e.root_hash, e.peer) ► walk prolly tree from root
   │     p2p stream to e.peer               ChunkStore.HasMany (missing?)
@@ -754,7 +762,7 @@ A formerly-parked event's `root_hash` branches from an earlier state — it does
 
 This approach is receipt-order independent: frontier selection and HLC ordering are pure functions of `(clock, chunks_ready, peer_seen_frontier, active_peers, finalized_events, parked_conflicts, finalized_root)`.
 
-### 7.2 Event signing: required
+### 7.2 Event admission: swarm-uniform
 
 Every event identity/signature uses canonical abstract payloads:
 - `CIDPayload = (root_hash, anchor_root_hash, sorted parents, hlc, peer, resolved_finalized_conflict_id)`
@@ -763,7 +771,7 @@ Every event identity/signature uses canonical abstract payloads:
 `EventCID = hash(CanonicalEncode(CIDPayload))`, `Signature = Sign(private_key, CanonicalEncode(SignedPayload))`.
 `CanonicalEncode` is intentionally codec-agnostic but must be deterministic/injective with canonical ordering and Optional encoding.
 
-When an `IdentityResolver` is configured on a peer, incoming events are verified against the sender's public key. Invalid or unverifiable events are silently discarded. When no `IdentityResolver` is configured, events are accepted best-effort.
+Admission is defined by the swarm-wide predicate `ValidEvent(e)`, not by per-peer optional checks. Every peer in a swarm MUST apply the same predicate. `ValidEvent(e)` MUST reject malformed payloads, CID mismatches, and any failure of the swarm's chosen integrity/authenticity checks. Different deployments may choose different shared profiles (for example a signature-verifying profile or a trusted-transport profile), but those profiles are above the protocol core. What matters normatively is that admission is uniform within one swarm.
 
 ### 7.3 No epoch grouping
 

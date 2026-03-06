@@ -16,6 +16,10 @@
  * remote state directly, which matches the protocol's seen-frontier exchange
  * and only skips the message-level head-digest compare mechanics.
  *
+ * NOTE: The protocol defines admission via a swarm-uniform `ValidEvent(e)`
+ * predicate. The spec abstracts that contract as `validEvent(e)` and models
+ * only executions where every peer applies the same predicate.
+ *
  * Events carry anchor_root_hash in addition to root_hash. Reconciliation and
  * finalization start from the current finalized_root accumulator, but each
  * event is merged against its own recorded anchor_root_hash.
@@ -144,6 +148,26 @@ module doltswarm_verify {
   /// Encoded content-hash helpers for a 2-dimensional abstract row state.
   pure def isContentHash(h: Hash): bool =
     h == EMPTY_ROOT or CONTENTS.contains(h)
+
+  /// Root hashes used by protocol state are either empty, content roots,
+  /// or finalized merge roots synthesized above the content range.
+  pure def isProtocolRootHash(h: Hash): bool =
+    h == EMPTY_ROOT or CONTENTS.contains(h) or h >= 1000
+
+  /// Abstract swarm-uniform admission predicate.
+  /// This models structural validity plus "all peers use the same rule".
+  /// Concrete auth/transport profiles remain outside the core model.
+  pure def validEvent(e: Event): bool = all {
+    PEERS.contains(e.peer),
+    e.hlc.peer == e.peer,
+    e.cid == makeEventCID(e.peer, e.hlc.wall, e.hlc.logical),
+    isProtocolRootHash(e.root_hash),
+    isProtocolRootHash(e.anchor_root_hash),
+    e.root_hash != CONFLICT_HASH,
+    e.anchor_root_hash != CONFLICT_HASH,
+    e.resolved_finalized_conflicts.size() <= 1,
+    not(e.parents.contains(e.cid)),
+  }
 
   pure def decodeDimA(h: Hash): int =
     if (h == 11 or h == 13) 1 else 0
@@ -382,6 +406,29 @@ module doltswarm_verify {
       ))
     )
 
+  /// Optional compaction pass used after finalized sync to restore the
+  /// retained finalized subgraph to a parent-closed shape before reconcile.
+  pure def compactRetainedFinalized(st: NodeState): NodeState = {
+    val compacted = range(0, MAX_EVENTS).foldl(st, (accSt, _) => {
+      val pruneable = gcPruneable(accSt)
+      val newClock = pruneable.fold(accSt.clock, (clockAcc, cid) =>
+        dropEvent(clockAcc, cid)
+      )
+      val newChunksReady = pruneable.fold(accSt.chunks_ready, (readyAcc, cid) =>
+        readyAcc.exclude(Set(cid))
+      )
+      {
+        ...accSt,
+        clock: newClock,
+        chunks_ready: newChunksReady,
+      }
+    })
+    {
+      ...compacted,
+      heads: computeHeads(compacted.clock),
+    }
+  }
+
   /// Merge two maps Hash -> Set[Hash] by key union and value union.
   pure def mergeSetMap(m1: Hash -> Set[Hash], m2: Hash -> Set[Hash]): Hash -> Set[Hash] = {
     m1.keys().union(m2.keys()).mapBy(k => {
@@ -411,8 +458,11 @@ module doltswarm_verify {
   pure def lineageAddCheckpoint(parentsMap: Hash -> Set[Hash], child: Hash,
       parentRoots: Set[Hash]): (Hash -> Set[Hash]) = {
     val sanitizedParents = parentRoots.exclude(Set(child))
+    val acyclicParents = sanitizedParents.filter(parent =>
+      not(lineageAncestors(parentsMap, parent).contains(child))
+    )
     val priorParents = if (parentsMap.has(child)) parentsMap.get(child) else Set()
-    val allParents = priorParents.union(sanitizedParents)
+    val allParents = priorParents.union(acyclicParents)
     parentsMap.put(child, allParents)
   }
 
@@ -697,19 +747,44 @@ module doltswarm_verify {
     }
   }
 
-  /// Full SYNC_FINALIZED local result, including latest_root re-anchoring.
+  /// Full SYNC_FINALIZED local result, including retained-local closure
+  /// hydration from the remote clock, retained-finalized compaction,
+  /// and latest_root re-anchoring.
   pure def applySyncFinalized(st_local: NodeState, st_remote: NodeState): NodeState = {
+    val mode = syncMode(st_local, st_remote)
     val syncedState = syncFinalizedCore(st_local, st_remote)
-    val retainedFinalizedReady = syncedState.clock.keys().intersect(syncedState.finalized_events.keys())
-    val withRetainedFinalizedReady: NodeState = {
-      ...syncedState,
-      chunks_ready: syncedState.chunks_ready.union(retainedFinalizedReady),
-    }
-    val reconcileResult = computeMergedRoot(withRetainedFinalizedReady)
-    {
-      ...withRetainedFinalizedReady,
-      latest_root: reconcileResult._1,
-      parked_conflicts: reconcileResult._2,
+    if (mode == SYNC_NOOP) {
+      {
+        ...syncedState,
+        latest_root: st_local.latest_root,
+        parked_conflicts: st_local.parked_conflicts,
+      }
+    } else {
+      val hydratedClosure = pullClosureCIDs(
+        syncedState.clock,
+        st_remote.clock,
+        syncedState.clock.keys(),
+        Set()
+      )
+      val hydratedClock = applyRemoteEvents(
+        syncedState.clock,
+        st_remote.clock,
+        hydratedClosure
+      )
+      val retainedFinalizedReady = hydratedClock.keys().intersect(syncedState.finalized_events.keys())
+      val withRetainedFinalizedReady: NodeState = {
+        ...syncedState,
+        clock: hydratedClock,
+        heads: computeHeads(hydratedClock),
+        chunks_ready: syncedState.chunks_ready.union(retainedFinalizedReady),
+      }
+      val compactedState = compactRetainedFinalized(withRetainedFinalizedReady)
+      val reconcileResult = computeMergedRoot(compactedState)
+      {
+        ...compactedState,
+        latest_root: reconcileResult._1,
+        parked_conflicts: reconcileResult._2,
+      }
     }
   }
 
@@ -790,11 +865,12 @@ module doltswarm_verify {
   /// merge/parking is computed only from MERGEABLE heads
   /// (parent-closed + chunk-ready). Orphan/non-ready heads stay announced
   /// until ancestors/chunks arrive.
-  /// No local wall-time admission filter is modeled or permitted: any valid,
-  /// non-duplicate received event is accepted into the clock (G-Set behavior).
+  /// No local wall-time admission filter is modeled or permitted: any
+  /// `validEvent(e)` that is new is accepted into the clock (G-Set behavior).
   action do_receive(p: PeerID): bool = {
     val st = nodes.get(p)
     val processable = inbox.get(p).filter(e =>
+      validEvent(e) and
       not(st.clock.keys().contains(e.cid)) and
       not(st.finalized_events.has(e.cid))
     )
@@ -1080,11 +1156,18 @@ module doltswarm_verify {
     all {
       syncEnabled(connected, p, q, st_p, st_q),
       val syncedState: NodeState = applySyncFinalized(st_p, st_q)
+      val withLocalFrontier = {
+        ...syncedState,
+        peer_seen_frontier: syncedState.peer_seen_frontier.set(
+          p,
+          observedFrontier(syncedState.clock)
+        ),
+      }
       all {
         // Branch tag is kept here so any future change to the action still
         // must satisfy the explicit SYNC_FINALIZED contract helpers.
         mode == syncMode(st_p, st_q),
-        nodes' = nodes.set(p, syncedState),
+        nodes' = nodes.set(p, withLocalFrontier),
         inbox' = inbox,
         connected' = connected,
       }
@@ -1607,6 +1690,19 @@ module doltswarm_verify {
       not(st.clock.has(cid)) or st.finalized_events.get(cid) == st.clock.get(cid).root_hash
     )
   })
+
+  /// All retained events in clocks satisfy the abstract swarm-wide admission
+  /// predicate.
+  val inv_clock_events_valid = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.clock.keys().forall(cid => validEvent(st.clock.get(cid)))
+  })
+
+  /// Any event still waiting in an inbox is also admissible under the same
+  /// uniform predicate.
+  val inv_inbox_events_valid = PEERS.forall(p =>
+    inbox.get(p).forall(e => validEvent(e))
+  )
 
   /// Event roots in clocks must never use the conflict sentinel.
   val inv_event_root_not_conflict = PEERS.forall(p => {
