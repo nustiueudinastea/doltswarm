@@ -17,8 +17,9 @@
  * and only skips the message-level head-digest compare mechanics.
  *
  * NOTE: The protocol defines admission via a swarm-uniform `ValidEvent(e)`
- * predicate. The spec abstracts that contract as `validEvent(e)` and models
- * only executions where every peer applies the same predicate.
+ * predicate and leaves any concrete auth envelope outside the core `Event`.
+ * The spec abstracts that contract as `validEvent(e)` and models only
+ * executions where every peer applies the same predicate.
  *
  * Events carry anchor_root_hash in addition to root_hash. Reconciliation and
  * finalization start from the current finalized_root accumulator, but each
@@ -156,7 +157,7 @@ module doltswarm_verify {
 
   /// Abstract swarm-uniform admission predicate.
   /// This models structural validity plus "all peers use the same rule".
-  /// Concrete auth/transport profiles remain outside the core model.
+  /// Any concrete auth envelope remains outside the core model.
   pure def validEvent(e: Event): bool = all {
     PEERS.contains(e.peer),
     e.hlc.peer == e.peer,
