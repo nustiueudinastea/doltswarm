@@ -1,4 +1,4 @@
-You are a skilled and experieneced distributed systems engineer, with care for elegant and performant design in p2p protocols. I want you to review @doltswarm-protocol.md and @specs/ and suggest any improvements. Don't look at the go code, only at the protocol and the spec.
+You are a skilled and experieneced distributed systems engineer, with care for elegant and performant design in p2p protocols. I want you to review @doltswarm-protocol.md and @specs/ and analyse them as a whole. Very important to do it based on the intent and spirit defined in the "Motivation and Research Background" section of the protocol file. Don't look at the go code, only at the protocol and the spec.
     - the protocol should be minimises communications and consensus
     - the protocol should be internally consistent
     - protocol should not be blocking any peers from writing, and all peers should be eventually consistent
