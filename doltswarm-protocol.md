@@ -180,8 +180,12 @@ EventIDPayload = (
   parent_event_ids_sorted: List[EventID],         -- parents sorted by EventID bytes (lexicographic)
   hlc: HLC,
   peer: PeerID,
+  resolved_parked_event_id: Optional[EventID],    -- non-null only when resolving a tentative conflict
   resolved_finalized_conflict_id: Optional[FinalizedConflictID]
 )
+-- Mutual exclusivity: at most one of resolved_parked_event_id and
+-- resolved_finalized_conflict_id is present. An event resolves at most
+-- one conflict, either tentative or finalized.
 
 CanonicalEncode(v) = deterministic, injective byte encoding for protocol values.
                      -- This protocol does NOT mandate a concrete wire codec.
@@ -194,11 +198,20 @@ Event = {
   event_id:            EventID,               -- redundant on wire (receivers recompute), useful for quick dedup
   prolly_root_hash:     Hash,                  -- RootValue hash after this peer's local write
   anchor_prolly_root_hash: Hash,               -- finalized prolly-root hash against which this event's prolly_root_hash was produced
+  resolved_parked_event_id: Optional[EventID], -- non-null only when this event resolves a tentative conflict via RESOLVE_CONFLICT
   resolved_finalized_conflict_id: Optional[FinalizedConflictID], -- null unless this event claims to resolve a finalized conflict
   parent_event_ids:    Set[EventID],         -- causal parents in the Merkle clock
   hlc:            HLC,
   peer:           PeerID,
 }
+
+SubsumedEvents(clock) = {
+  e_id | ∃ r ∈ clock.values(): r.resolved_parked_event_id = e_id
+}
+-- Derived set of event IDs whose tentative conflict has been explicitly
+-- resolved. These events are accounted for during finalization as
+-- bookkeeping-only entries (no MergeRoots replay) because their content
+-- is subsumed by the resolution event.
 
 MergeResult =
   | Ok     { merged_root: Hash }
@@ -366,9 +379,9 @@ No conflict precondition — writes are never blocked.
 1. Apply `sql_ops` to local Dolt instance → new `RootValue` with hash `r`.
 2. `hlc ← tick(hlc)`.
 3. `projection_basis` is the authoritative local parent basis for the current tentative content projection.
-4. Build `event_id_payload = (r, finalized_prolly_root_hash, sort(projection_basis), hlc, peer, null)`.
+4. Build `event_id_payload = (r, finalized_prolly_root_hash, sort(projection_basis), hlc, peer, null, null)`.
 5. `event_id = hash(CanonicalEncode(event_id_payload))`.
-6. `e = Event { event_id, prolly_root_hash: r, anchor_prolly_root_hash: finalized_prolly_root_hash, resolved_finalized_conflict_id: null, parent_event_ids: projection_basis, hlc, peer }`.
+6. `e = Event { event_id, prolly_root_hash: r, anchor_prolly_root_hash: finalized_prolly_root_hash, resolved_parked_event_id: null, resolved_finalized_conflict_id: null, parent_event_ids: projection_basis, hlc, peer }`.
 7. `clock[e.event_id] ← e`.
 8. `chunks_ready ← chunks_ready ∪ {e.event_id}` (local writes are immediately chunk-ready).
 9. Recompute `head_event_ids` from clock. `computeHeadEventIDs` still returns parked event IDs as head event IDs when no event has them as parents. That is correct: they persist as forks until resolved.
@@ -397,6 +410,7 @@ Steps:
 6. If `e.resolved_finalized_conflict_id` is present, treat it as a **resolution claim**, not as immediate finalized-layer truth. Receiving the event MUST NOT directly remove the conflict from `finalized_conflicts`.
 7. Recompute `head_event_ids` from clock: `head_event_ids = { event_id ∈ clock | event_id is not a parent of any event in clock }`.
 8. Recompute local seen frontier: `peer_seen_frontier[self] ← SeenFrontier(clock)`. This frontier contains only locally **PARENTS_READY** events.
+9. If `e.resolved_parked_event_id` is present, it marks the referenced event as subsumed (its content is carried forward by this resolution event). Subsumption is derived from the clock and does not require separate bookkeeping.
 10. Obtain or schedule fetch of the content-addressed closure for `e.prolly_root_hash` and, if needed, `e.anchor_prolly_root_hash` via the content plane. The originating peer is only a hint; any reachable provider may satisfy the request.
 11. On completion of all required chunk sync for step 10: `chunks_ready ← chunks_ready ∪ {e.event_id}` (event becomes **CHUNKS_READY**).
 12. Parent-closure readiness is tracked independently: an event becomes **PARENTS_READY** only when all ancestor event IDs reachable from its parent links are present in the local `clock` (typically via control-plane anti-entropy driven by heartbeats).
@@ -432,9 +446,8 @@ Steps:
 User (typically the author of the parked event) provides `resolution_ops` (SQL that fixes conflicting rows/schema). Resolution is async — no peer is blocked waiting for it.
 
 1. Apply `resolution_ops` to local Dolt → `resolved_root`.
-2. Remove `event_id` from `parked_conflicts`.
-3. Create new `Event` with `resolved_root`, `resolve_parent_event_ids = projection_basis ∪ {event_id}`, and `resolved_finalized_conflict_id = null`.
-4. Normal `LOCAL_WRITE` flow from step 4 (same `EventID` construction, with `resolved_finalized_conflict_id = null`).
+2. Create new `Event` with `resolved_root`, `parent_event_ids = projection_basis ∪ {event_id}`, `resolved_parked_event_id = event_id`, and `resolved_finalized_conflict_id = null`.
+3. Normal `LOCAL_WRITE` flow from step 4 (same `EventID` construction, with `resolved_parked_event_id = event_id` and `resolved_finalized_conflict_id = null`). `RECONCILE` in the `LOCAL_WRITE` flow recomputes `parked_conflicts` from scratch — the resolved event is no longer a head (the resolution event parents from it), so it leaves `parked_conflicts` deterministically. No manual removal is needed.
 
 #### RESOLVE_FINALIZED_CONFLICT(peer, conflict_id, resolution_ops) → unit
 
@@ -442,8 +455,8 @@ User resolves a tracked finalized-layer conflict (created by `SYNC_FINALIZED` co
 
 1. Precondition: `conflict_id ∈ finalized_conflicts`.
 2. Apply `resolution_ops` to local Dolt → `resolved_root`.
-3. Create new `Event` with `resolved_root`, `parent_event_ids = projection_basis`, and `resolved_finalized_conflict_id = conflict_id`.
-4. Normal `LOCAL_WRITE` flow from step 4 (same `EventID` construction, but with `resolved_finalized_conflict_id = conflict_id` from step 3).
+3. Create new `Event` with `resolved_root`, `parent_event_ids = projection_basis`, `resolved_parked_event_id = null`, and `resolved_finalized_conflict_id = conflict_id`.
+4. Normal `LOCAL_WRITE` flow from step 4 (same `EventID` construction, but with `resolved_parked_event_id = null` and `resolved_finalized_conflict_id = conflict_id` from step 3).
 5. Event publication is only a **claim** that conflict `conflict_id` is resolved. The id moves to durable finalized-layer resolution state only when that event later finalizes, or when the peer learns the durable resolved-id set through finalized-state sync.
 6. `RESOLVE_FINALIZED_CONFLICT` MUST NOT directly mutate `finalized_commit_id`, `finalized_prolly_root_hash`, `finalized_events`, `finalized_conflicts`, or `resolved_finalized_conflict_ids`; those evolve only via existing finalization/sync paths.
 
@@ -491,23 +504,32 @@ Let `CoveredBy(frontier, e)` mean: some `f ∈ frontier` has `e` in its ancestor
 2. `newly_stable = { e ∈ clock | e.event_id ∉ finalized_events.keys() ∧ e.event_id ∉ parked_conflicts ∧ e is PARENTS_READY ∧ e is CHUNKS_READY ∧ ∀ q ∈ active_peers: CoveredBy(peer_seen_frontier[q], e) }`. Parked events cannot be finalized until resolved, and non-ready events (missing ancestors or chunks) cannot be finalized.
 3. `eligible_stable = { e ∈ newly_stable | e.parent_event_ids ⊆ finalized_events.keys() }`. This is the causal frontier of stable events whose stable ancestors are already compiled into finalized history.
 4. If `eligible_stable = ∅`, stop. Otherwise choose `next_event ∈ eligible_stable` with minimum HLC total order (deterministic).
-5. Snapshot previous finalized commit/root once for this step: `prev_finalized_commit_id = finalized_commit_id`, `prev_finalized_prolly_root_hash = finalized_prolly_root_hash`.
-6. Compute `merged = MergeRoots(prev_finalized_prolly_root_hash, next_event.prolly_root_hash, next_event.anchor_prolly_root_hash)`.
-   - **Normative requirement:** this merge MUST be conflict-free. A non-parked stable event whose parents are already finalized is required to be finalization-safe by construction. Encountering a conflict here is a protocol violation, not a third conflict mode.
-7. Bookkeeping finalization for exactly this event:
+5. Determine whether `next_event` is subsumed: `is_subsumed = next_event.event_id ∈ SubsumedEvents(clock)`.
+6. **If `is_subsumed`:** bookkeeping-only finalization — the resolution event already carries this event's content forward, so no `MergeRoots` replay is needed.
    - `finalized_events[next_event.event_id] ← next_event.prolly_root_hash`
    - if `next_event.resolved_finalized_conflict_id` is present, union that singleton id into durable `resolved_finalized_conflict_ids`
-8. Determine the real finalized commit parents for this checkpoint:
+   - `finalized_checkpoint_events[finalized_commit_id] ← finalized_checkpoint_events.get(finalized_commit_id, {}) ∪ { next_event.event_id → next_event.prolly_root_hash }`
+   - `finalized_commit_id`, `finalized_prolly_root_hash`, and `finalized_commit_parents` are unchanged. No new checkpoint commit is created.
+   - Remove any id now in `resolved_finalized_conflict_ids` from `finalized_conflicts`.
+   - Repeat from step 2.
+7. **If not `is_subsumed`:** normal replay finalization.
+8. Snapshot previous finalized commit/root once for this step: `prev_finalized_commit_id = finalized_commit_id`, `prev_finalized_prolly_root_hash = finalized_prolly_root_hash`.
+9. Compute `merged = MergeRoots(prev_finalized_prolly_root_hash, next_event.prolly_root_hash, next_event.anchor_prolly_root_hash)`.
+   - **Normative requirement:** this merge MUST be conflict-free for non-subsumed events. A non-parked, non-subsumed stable event whose parents are already finalized is required to be finalization-safe by construction. Encountering a conflict here is a protocol violation.
+10. Bookkeeping finalization for exactly this event:
+   - `finalized_events[next_event.event_id] ← next_event.prolly_root_hash`
+   - if `next_event.resolved_finalized_conflict_id` is present, union that singleton id into durable `resolved_finalized_conflict_ids`
+11. Determine the real finalized commit parents for this checkpoint:
    - if `prev_finalized_commit_id = EMPTY_FINALIZED_COMMIT_ID`, the deterministic finalized commit payload uses `parent_finalized_commit_ids_sorted = []`
    - otherwise it uses `parent_finalized_commit_ids_sorted = [prev_finalized_commit_id]`
-9. Materialize one deterministic **checkpoint** finalized commit in Layer 2 from `FinalizedCommitPayload = (merged, parent_finalized_commit_ids_sorted, CheckpointFinalize)`. The resulting commit hash is the new `finalized_commit_id`.
-10. Refresh tentative materialization, if any. `finalized_prolly_root_hash ← merged`.
-11. Update derived finalized lineage metadata to reflect the materialized checkpoint commit:
+12. Materialize one deterministic **checkpoint** finalized commit in Layer 2 from `FinalizedCommitPayload = (merged, parent_finalized_commit_ids_sorted, CheckpointFinalize)`. The resulting commit hash is the new `finalized_commit_id`.
+13. Refresh tentative materialization, if any. `finalized_prolly_root_hash ← merged`.
+14. Update derived finalized lineage metadata to reflect the materialized checkpoint commit:
    - `finalized_commit_parents[finalized_commit_id] ← set(parent_finalized_commit_ids_sorted)`
    - `finalized_checkpoint_events[finalized_commit_id] ← finalized_checkpoint_events.get(finalized_commit_id, {}) ∪ { next_event.event_id → next_event.prolly_root_hash }`
-   - lineage helpers MAY additionally treat `EMPTY_FINALIZED_COMMIT_ID` as a synthetic ancestry root for LCA/base-case purposes, but it is not part of the real Dolt commit payload
-12. Remove any id now in `resolved_finalized_conflict_ids` from `finalized_conflicts`.
-13. Repeat from step 2, because finalizing `next_event` can make additional stable events become eligible.
+   - lineage helpers may additionally treat `EMPTY_FINALIZED_COMMIT_ID` as a synthetic ancestry root for LCA/base-case purposes, but it is not part of the real Dolt commit payload
+15. Remove any id now in `resolved_finalized_conflict_ids` from `finalized_conflicts`.
+16. Repeat from step 2, because finalizing `next_event` can make additional stable events become eligible.
 
 > **Why one event at a time?** Once `FinalizedCommitID` is parent-sensitive, consuming an arbitrary stable batch would make the finalized commit DAG depend on local scheduling. Advancing one canonical eligible stable event per checkpoint makes finalized history a deterministic compilation of stable event history, without introducing coordination or consensus.
 
@@ -644,7 +666,7 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 
 **INV4 — Causal Consistency:** If `e1` is an ancestor of `e2` in the clock DAG, then `e1` precedes `e2` in the total order.
 
-**INV5 — No Silent Data Loss:** Every event either enters the finalized set or is parked (awaiting human resolution). No event disappears silently. Formerly-parked events whose content is subsumed by a later resolution event are still accounted for in `finalized_events`; finalized-root advancement is driven by stable frontier roots, so subsumed intermediate roots are not re-applied. If finalized event bodies are compacted from `clock`, finalized event IDs remain represented in the derived `finalized_events` bookkeeping view.
+**INV5 — No Silent Data Loss:** Every event either enters the finalized set or is parked (awaiting human resolution). No event disappears silently. Formerly-parked events whose content is subsumed by a later resolution event are still accounted for in `finalized_events` via bookkeeping-only finalization (no `MergeRoots` replay); their content is carried forward by the resolution event. If finalized event bodies are compacted from `clock`, finalized event IDs remain represented in the derived `finalized_events` bookkeeping view.
 
 **INV6 — Witness Frontier Soundness:** `peer_seen_frontier[q]` is always interpreted as an observed causal frontier, not a prediction. Finalization depends only on ancestor coverage by the currently active witness set, never on wall-clock progress. `finalized_commit_id` never moves backward in finalized-commit lineage. When a peer is re-added to `active_peers` after partition recovery with a frontier behind the current witness boundary, further finalization is delayed, but already-finalized history is unchanged.
 
@@ -663,6 +685,12 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 **INV8 — Head-Event-ID Derivation Consistency:** For every peer `p`, `p.head_event_ids == computeHeadEventIDs(p.clock)`. Head event IDs are a derived view of clock structure, never an independently-authoritative data source.
 
 **INV9 — Finalized/Parked Disjointness:** For every peer `p`, `p.finalized_events.keys() ∩ p.parked_conflicts == ∅`. An event cannot be both parked (unresolved conflict) and finalized.
+
+**INV9a — Parked/Subsumed Disjointness:** For every peer `p`, `p.parked_conflicts ∩ SubsumedEvents(p.clock) == ∅`. An event cannot be both parked and subsumed — it transitions from parked to subsumed when the resolution event arrives and `RECONCILE` recomputes.
+
+**INV9b — Subsumed Event Parent Link:** For every event `r` in `p.clock` with `r.resolved_parked_event_id = x` (non-null), `x ∈ r.parent_event_ids`. The resolution event causally parents from the event it subsumes.
+
+**INV9c — Subsumed Finalization Is Bookkeeping-Only:** For every peer `p`, subsumed events that are finalized do not change `finalized_prolly_root_hash`. Formally: if `ADVANCE_STABILITY` finalizes a subsumed event, `finalized_prolly_root_hash` and `finalized_commit_id` are unchanged.
 
 **INV10 — Reconcile Fixed-Point Consistency:** For every peer `p`, `p.tentative_prolly_root_hash`, `p.parked_conflicts`, and `p.projection_basis` must equal the deterministic reconcile projection of current state (including provisional closure-lag behavior). No action leaves stale reconcile outputs after changing `heads`, `clock`, `chunks_ready`, or finalized commit/content state.
 
@@ -686,13 +714,14 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 **Modeling notes (spec vs. this document):**
 
 - **Finalized-layer terminology:** In this document and in the spec, "authoritative finalized history" means `finalized_commit_id` + `finalized_prolly_root_hash`; "finalized sync metadata" means `finalized_commit_parents`, `finalized_checkpoint_events`, `finalized_conflicts`, and `resolved_finalized_conflict_ids`; and `finalized_events` is a local derived bookkeeping view reconstructed from the finalized tip plus reachable checkpoint descriptors. This naming split is intentional and avoids treating `finalized_events` as the primary synchronized finalized payload.
-- **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) is a deterministic single-step compiler repeated to fixpoint: compute `newly_stable` from active-peer seen-frontier coverage, restrict to `eligible_stable` events whose parents are already finalized, choose the minimum eligible event by HLC total order, merge just that event against the current `finalized_prolly_root_hash` using its recorded `anchor_prolly_root_hash`, materialize one deterministic checkpoint commit, then repeat. Stable non-parked eligible events are required to be finalization-safe by construction. The Quint spec models the same one-event checkpoint semantics via `nextFinalizationEvent`.
+- **Finalization ordering:** `ADVANCE_STABILITY` (§2.4) is a deterministic single-step compiler repeated to fixpoint: compute `newly_stable` from active-peer seen-frontier coverage, restrict to `eligible_stable` events whose parents are already finalized, choose the minimum eligible event by HLC total order. If the event is subsumed (`SubsumedEvents(clock)`), finalize it as bookkeeping-only (no replay, no new checkpoint); otherwise merge it against the current `finalized_prolly_root_hash` using its recorded `anchor_prolly_root_hash` and materialize one deterministic checkpoint commit. Then repeat. Non-subsumed stable non-parked eligible events are required to be finalization-safe by construction. The Quint spec models the same semantics via `nextFinalizationEvent` with a subsumed/replay split in `finalizeResult`.
 - **Finalized-commit lineage metadata:** The protocol treats `finalized_commit_id` as the authoritative finalized-history identity and `finalized_commit_parents` / `finalized_checkpoint_events` as derived metadata extracted from already-materialized finalized commits, while `finalized_prolly_root_hash` remains content payload. `do_finalize` computes a new deterministic `finalized_commit_id` only after the exact parent list for the checkpoint commit is known, unions the newly hardened event into that commit's checkpoint descriptor set, `do_sync_finalized` computes a deterministic merge commit id only after the two finalized parents are known, and lineage-LCA (`lineageLcaFinalizedCommit`) runs over the derived parent links. This keeps the finalized Dolt DAG identical across peers while allowing equal-tip metadata repair and preserves nested partition recovery correctness (INV3).
 - **Adapter boundaries:** The protocol abstracts two external planes around the core state machine: a control plane for event/frontier/finalized-metadata dissemination and a content plane for content-addressed root-closure fetch. The Quint spec models these abstractly as `inbox`/`connected`, direct-state heartbeat reads, and explicit `chunks_ready`, without committing to topology, provider selection, or wire mechanics.
 - **Bootstrap/join boundary:** The protocol treats bootstrap/join as an out-of-model transport/bootstrap contract rather than a core state-machine transition. The Quint spec therefore does not simulate snapshot transfer; it states the required postconditions as `bootstrapBoundaryReady`, and `init` is the already-bootstrapped empty case.
 - **`mergeRoots` asymmetry:** In real Dolt, `MergeRoots(ours, theirs, ancestor)` is asymmetric — conflict markers reference "ours" vs "theirs". The protocol and Quint spec align on deterministic ours/theirs assignment in `do_sync_finalized`: lower finalized-commit id = "ours". This is fully local and unambiguous after fork-and-join recoveries.
-- **EventID representation:** The protocol defines `EventID = hash(CanonicalEncode(EventIDPayload))`, where `EventIDPayload = (prolly_root_hash, anchor_prolly_root_hash, sorted parent_event_ids, hlc, peer, resolved_finalized_conflict_id)`. The core protocol is codec-agnostic: implementations need canonical bytes, not a mandated wire format. The spec uses `EventID = (peer, wall, logical)` — a tuple derived from HLC — to avoid modeling hashing/byte encodings while preserving uniqueness.
-- **Event fields and admission:** The spec's `Event` includes `anchor_prolly_root_hash` and `resolved_finalized_conflicts` (a set-model encoding of protocol field `resolved_finalized_conflict_id`) and matches the core protocol event shape. The swarm-wide admission predicate is abstracted as `validEvent(e)`, so the model captures uniform admission semantics without fixing one concrete auth envelope.
+- **EventID representation:** The protocol defines `EventID = hash(CanonicalEncode(EventIDPayload))`, where `EventIDPayload = (prolly_root_hash, anchor_prolly_root_hash, sorted parent_event_ids, hlc, peer, resolved_parked_event_id, resolved_finalized_conflict_id)`. The core protocol is codec-agnostic: implementations need canonical bytes, not a mandated wire format. The spec uses `EventID = (peer, wall, logical)` — a tuple derived from HLC — to avoid modeling hashing/byte encodings while preserving uniqueness.
+- **Event fields and admission:** The spec's `Event` includes `anchor_prolly_root_hash`, `resolved_parked_event_ids` (a set-model encoding of protocol field `resolved_parked_event_id`, constrained to size ≤ 1), and `resolved_finalized_conflicts` (a set-model encoding of protocol field `resolved_finalized_conflict_id`, constrained to size ≤ 1) and matches the core protocol event shape. `validEvent(e)` enforces mutual exclusivity: at most one of the two resolution fields is non-empty. The swarm-wide admission predicate is abstracted as `validEvent(e)`, so the model captures uniform admission semantics without fixing one concrete auth envelope.
+- **Subsumption:** The protocol defines `SubsumedEvents(clock)` as the set of event IDs referenced by any clock event's `resolved_parked_event_id`. The spec models this identically via `subsumedEvents(st)`. `ADVANCE_STABILITY` / `do_finalize` checks subsumption before replay: subsumed events get bookkeeping-only finalization (no `MergeRoots`, no new checkpoint commit), while non-subsumed events follow the normal replay path.
 - **`parked_conflicts` type:** Authoritative semantics are set-based in both protocol and spec (`Set[EventID]`).
 - **`finalized_conflicts` type:** The protocol defines `finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictInfo]` (includes table/detail presentation metadata). The spec models `finalized_conflicts` as a map keyed by the same deterministic conflict ID, but tracks only the structural finalized-commit tuple (`ours_finalized_commit_id`, `theirs_finalized_commit_id`, `common_finalized_commit_id`) needed for state-machine checks.
 - **Heartbeat frontier exchange:** The protocol heartbeat carries `head_event_ids_digest`, the full `seen_frontier`, the finalized commit/prolly-root pair, and a `finalized_metadata_digest` over the abstract control plane. The spec's `do_heartbeat` reads the sender's node state directly, updates the stored `peer_seen_frontier`, and pulls the same closure target without modeling message serialization.
@@ -711,7 +740,7 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 - **Finalized metadata exchange:** The protocol's `SYNC_FINALIZED` exchanges commit-centric finalized metadata: finalized tip/root, derived lineage parents (`finalized_commit_parents`), per-commit checkpoint event-set descriptors (`finalized_checkpoint_events`), open finalized conflicts (`finalized_conflicts`), and durable resolved conflict ids (`resolved_finalized_conflict_ids`). `finalized_events` is reconstructed locally from the resulting finalized tip plus reachable checkpoint descriptors instead of being synchronized as the primary payload. The spec reads full remote state directly (over-approximation) and then applies the same merge/filter/derive contract before case-split execution.
 - **Action decoupling from heartbeat:** The protocol (§2.4 HEARTBEAT steps 5-6) triggers `SYNC_FINALIZED` inline whenever finalized commit ids or finalized metadata digests differ, and implicitly triggers `ADVANCE_STABILITY` when witness inputs change (`peer_seen_frontier` or `active_peers`). The spec decouples both into standalone nondeterministic actions (`do_sync_finalized`, `do_finalize`) that can fire independently in the `step` relation. The preconditions are equivalent, so the reachable state space is the same — the spec just does not model the causal triggering chain.
 - **`localWall` state variable:** The spec adds `localWall: int` to `NodeState`, not present in the protocol's §2.2 per-peer state table. This separates wall-clock progression into explicit `do_tick` actions, giving the model checker control over time advancement. In the protocol, wall time is implicit (read from the system clock).
-- **`mergeRoots` abstraction:** The protocol delegates to Dolt's `MergeRoots`, which performs cell-level three-way merge over prolly trees. The spec now models two independent writable dimensions so disjoint concurrent writes auto-merge and only overlapping writes conflict. `CONFLICT_HASH` remains the model sentinel.
+- **`mergeRoots` abstraction:** The protocol delegates to Dolt's `MergeRoots`, which performs cell-level three-way merge over prolly trees. The spec models two independent writable dimensions (`A ∈ {0,1,2}`, `B ∈ {0,1}`) so disjoint concurrent writes auto-merge and overlapping writes to the same dimension with different values produce a conflict. Three values in dimension A are required to make same-dimension conflicts reachable, exercising the parking, resolution, and subsumption paths. `CONFLICT_HASH` remains the model sentinel.
 - **Event-only inbox:** The spec's `inbox: PeerID → Set[Event]` carries only `Event` messages. Heartbeats use direct state reads (`do_heartbeat`). This follows from the "heartbeat as direct state read" simplification above.
 - **Chunk and parent-closure gates:** The protocol defines a per-event lifecycle (ANNOUNCED → PARENTS_READY → CHUNKS_READY → MERGEABLE). `CHUNKS_READY` means both `prolly_root_hash` and `anchor_prolly_root_hash` are locally available for that event. The spec models this with explicit `chunks_ready` state and a bounded `do_chunks_ready` action; reconciliation and finalization both require parent-closure and chunk-readiness for events they fold.
 To run the spec: `task quint:run`
@@ -838,20 +867,26 @@ Earlier designs blocked the conflicting peer from `LOCAL_WRITE` until resolution
 
 When a parked event is resolved via `RESOLVE_CONFLICT`, it leaves `parked_conflicts` (the resolution event references it as a parent, making it no longer a head). The event is then in the clock, not finalized, not parked — eligible for finalization.
 
-A formerly-parked event's `prolly_root_hash` branches from an earlier state — it does not incorporate concurrent changes that caused the parking. Replaying every stable event root can therefore re-introduce the same conflict at finalized layer.
+A formerly-parked event's `prolly_root_hash` branches from an earlier state — it does not incorporate concurrent changes that caused the parking. Replaying its root via `MergeRoots` against the current finalized accumulator re-introduces the same conflict that caused parking.
 
-**Fix:** `ADVANCE_STABILITY` finalizes exactly one canonical eligible stable event at a time, starting from the current `finalized_prolly_root_hash` accumulator and using that event's recorded `anchor_prolly_root_hash`. Eligible means stable, ready, unparked, not yet finalized, and all parents already finalized. Stable non-parked eligible events are required to be finalization-safe by construction, so a merge conflict here is a protocol violation rather than a recoverable third conflict mode. This is safe because:
+**Fix: explicit subsumption.** `RESOLVE_CONFLICT` emits a resolution event with `resolved_parked_event_id = event_id`, marking the parked event as subsumed. `SubsumedEvents(clock)` is derived from the clock: the set of event IDs referenced by any resolution event's `resolved_parked_event_id` field. `ADVANCE_STABILITY` checks subsumption before replay:
 
-1. Events still in `parked_conflicts` are excluded from finalization candidates by step 1.
-2. Finalization follows parent order: an event is only finalized after its causal parents are already in `finalized_events`.
-3. Replaying one event against its recorded anchor applies exactly that event's delta over the current finalized accumulator, avoiding duplicate application and scheduler-dependent batching artifacts.
+- **Subsumed events** are finalized as bookkeeping-only entries: added to `finalized_events` and attached to the current checkpoint descriptor, but no `MergeRoots` replay, no change to `finalized_prolly_root_hash`, and no new checkpoint commit. Their content is already carried forward by the resolution event.
+- **Non-subsumed events** follow the normal replay path. A `MergeRoots` conflict for a non-subsumed event is a protocol violation.
 
-This approach is receipt-order independent: eligibility and HLC ordering are pure functions of `(clock, chunks_ready, peer_seen_frontier, active_peers, finalized_events, parked_conflicts, finalized_commit_id, finalized_prolly_root_hash)`.
+This is safe because:
+
+1. Events still in `parked_conflicts` are excluded from finalization candidates.
+2. An event can only leave `parked_conflicts` when the resolution event (which carries `resolved_parked_event_id`) arrives and `RECONCILE` recomputes. At that point, `SubsumedEvents(clock)` includes it — there is never a window where an event is non-parked, non-subsumed, and conflict-producing.
+3. Finalization follows parent order: an event is only finalized after its causal parents are already in `finalized_events`.
+4. Subsumption is derived from the clock, not from separate synchronized state. The resolution event propagates through the event DAG and is available on every peer before the subsumed event becomes eligible.
+
+This approach is receipt-order independent: eligibility, subsumption, and HLC ordering are pure functions of `(clock, chunks_ready, peer_seen_frontier, active_peers, finalized_events, parked_conflicts, finalized_commit_id, finalized_prolly_root_hash)`.
 
 ### 7.2 Event identity and admission: swarm-uniform
 
 Every core event identity uses the canonical abstract payload:
-- `EventIDPayload = (prolly_root_hash, anchor_prolly_root_hash, sorted parent_event_ids, hlc, peer, resolved_finalized_conflict_id)`
+- `EventIDPayload = (prolly_root_hash, anchor_prolly_root_hash, sorted parent_event_ids, hlc, peer, resolved_parked_event_id, resolved_finalized_conflict_id)`
 
 `EventID = hash(CanonicalEncode(EventIDPayload))`.
 `CanonicalEncode` is codec-agnostic and must be deterministic/injective with canonical ordering and Optional encoding.

@@ -76,8 +76,14 @@ module doltswarm_verify {
 
   pure val PEERS: Set[PeerID] = Set(1, 2, 3)
   // Encoded two-dimension content states:
-  // 10 => (A0, B0), 11 => (A1, B0), 12 => (A0, B1), 13 => (A1, B1)
-  pure val CONTENTS: Set[int] = Set(10, 11, 12, 13)
+  // Dimension A has 3 values {0,1,2}, dimension B has 2 values {0,1}.
+  // Three values in A are required so that concurrent writes to A can
+  // produce genuinely different values (e.g., A=1 vs A=2 from ancestor A=0),
+  // making same-dimension conflicts reachable and exercising the parking,
+  // resolution, and subsumption paths.
+  // 10 => (A0, B0), 11 => (A1, B0), 12 => (A0, B1), 13 => (A1, B1),
+  // 14 => (A2, B0), 15 => (A2, B1)
+  pure val CONTENTS: Set[int] = Set(10, 11, 12, 13, 14, 15)
   pure val MAX_WALL: int = 6
   pure val MAX_EVENTS: int = 8
   pure val EMPTY_ROOT: int = 0
@@ -114,6 +120,7 @@ module doltswarm_verify {
     prolly_root_hash: ProllyRootHash,
     anchor_prolly_root_hash: ProllyRootHash,
     parent_event_ids: Set[EventID],
+    resolved_parked_event_ids: Set[EventID],
     resolved_finalized_conflicts: Set[FinalizedConflictID],
     hlc: HLC,
     peer: PeerID,
@@ -285,21 +292,30 @@ module doltswarm_verify {
     isProtocolRootHash(e.anchor_prolly_root_hash),
     e.prolly_root_hash != CONFLICT_HASH,
     e.anchor_prolly_root_hash != CONFLICT_HASH,
+    e.resolved_parked_event_ids.size() <= 1,
     e.resolved_finalized_conflicts.size() <= 1,
+    // Mutual exclusivity: at most one resolution field is non-empty.
+    not(e.resolved_parked_event_ids.size() > 0 and e.resolved_finalized_conflicts.size() > 0),
+    // If resolving a parked event, that event must be a parent.
+    e.resolved_parked_event_ids.subseteq(e.parent_event_ids),
     not(e.parent_event_ids.contains(e.event_id)),
   }
 
   pure def decodeDimA(h: ProllyRootHash): int =
-    if (h == 11 or h == 13) 1 else 0
+    if (h == 11 or h == 13) 1
+    else if (h == 14 or h == 15) 2
+    else 0
 
   pure def decodeDimB(h: ProllyRootHash): int =
-    if (h == 12 or h == 13) 1 else 0
+    if (h == 12 or h == 13 or h == 15) 1 else 0
 
   pure def encodeContent(a: int, b: int): ProllyRootHash = {
     if (a == 0 and b == 0) 10
     else if (a == 1 and b == 0) 11
     else if (a == 0 and b == 1) 12
-    else 13
+    else if (a == 1 and b == 1) 13
+    else if (a == 2 and b == 0) 14
+    else 15  // a == 2 and b == 1
   }
 
   /// Deterministic merge model with 2 independent writable dimensions.
@@ -348,6 +364,13 @@ module doltswarm_verify {
     )
     clock.keys().exclude(allParents)
   }
+
+  /// Derived set of event IDs whose tentative conflict has been explicitly
+  /// resolved. These events are finalized as bookkeeping-only entries.
+  pure def subsumedEvents(clock: EventID -> Event): Set[EventID] =
+    clock.keys().fold(Set(), (acc, event_id) =>
+      acc.union(clock.get(event_id).resolved_parked_event_ids)
+    )
 
   /// Ancestor-ID closure from a seed set by repeatedly following parent links.
   ///
@@ -794,6 +817,7 @@ module doltswarm_verify {
       prolly_root_hash: resolvedContent,
       anchor_prolly_root_hash: st.finalized_prolly_root_hash,
       parent_event_ids: activeHeads,
+      resolved_parked_event_ids: Set(),
       resolved_finalized_conflicts: Set(conflictID),
       hlc: newHLC,
       peer: p,
@@ -831,6 +855,7 @@ module doltswarm_verify {
       prolly_root_hash: content,
       anchor_prolly_root_hash: st.finalized_prolly_root_hash,
       parent_event_ids: st.projection_basis,
+      resolved_parked_event_ids: Set(),
       resolved_finalized_conflicts: Set(),
       hlc: newHLC,
       peer: p,
@@ -883,55 +908,95 @@ module doltswarm_verify {
   /// ADVANCE_STABILITY enable gate and pure local post-state helper.
   pure def finalizeEnabled(st: NodeState): bool =
     nextFinalizationEventID(st) != EMPTY_EVENT_ID and
-      nextFinalizationMergeRoot(st) != CONFLICT_HASH
+      (nextFinalizationIsSubsumed(st) or nextFinalizationMergeRoot(st) != CONFLICT_HASH)
+
+  /// Check if the next finalization event is subsumed.
+  pure def nextFinalizationIsSubsumed(st: NodeState): bool = {
+    val nextEventID = nextFinalizationEventID(st)
+    nextEventID != EMPTY_EVENT_ID and subsumedEvents(st.clock).contains(nextEventID)
+  }
 
   pure def finalizeResult(st: NodeState): NodeState = {
     val nextEventID = nextFinalizationEventID(st)
-    val nextRoot = nextFinalizationMergeRoot(st)
-    if (nextEventID == EMPTY_EVENT_ID or nextRoot == CONFLICT_HASH) st
+    if (nextEventID == EMPTY_EVENT_ID) st
     else {
       val nextEvent = st.clock.get(nextEventID)
-      val nextParents = if (st.finalized_commit_id == EMPTY_FINALIZED_COMMIT_ID)
-        Set()
-      else
-        Set(st.finalized_commit_id)
-      val nextFinalizedCommit = makeFinalizedCheckpointCommitID(nextRoot, nextParents)
-      val nextResolvedClaims = nextEvent.resolved_finalized_conflicts
-      val nextCheckpoint = if (st.finalized_checkpoint_events.has(nextFinalizedCommit))
-        st.finalized_checkpoint_events.get(nextFinalizedCommit).put(nextEventID, nextEvent.prolly_root_hash)
-      else
-        Map().put(nextEventID, nextEvent.prolly_root_hash)
-      val withBatch: NodeState = {
-        ...st,
-        finalized_commit_id: nextFinalizedCommit,
-        finalized_prolly_root_hash: nextRoot,
-        finalized_events: st.finalized_events.put(nextEventID, nextEvent.prolly_root_hash),
-        finalized_checkpoint_events: st.finalized_checkpoint_events.put(nextFinalizedCommit, nextCheckpoint),
-        resolved_finalized_conflict_ids: st.resolved_finalized_conflict_ids.union(nextResolvedClaims),
-        finalized_conflicts: dropFinalizedConflicts(
-          st.finalized_conflicts,
-          st.resolved_finalized_conflict_ids.union(nextResolvedClaims)
-        ),
-      }
-      val withLineage: NodeState = if (nextFinalizedCommit != st.finalized_commit_id) {
-        val lineage = lineageAddFinalizedCommit(
-          st.finalized_commit_parents,
-          nextFinalizedCommit,
-          nextParents
-        )
+      val isSubsumed = subsumedEvents(st.clock).contains(nextEventID)
+      if (isSubsumed) {
+        // Bookkeeping-only finalization: no MergeRoots replay, no new checkpoint.
+        // Attach to the current checkpoint descriptor.
+        val currentCheckpoint = if (st.finalized_checkpoint_events.has(st.finalized_commit_id))
+          st.finalized_checkpoint_events.get(st.finalized_commit_id).put(nextEventID, nextEvent.prolly_root_hash)
+        else
+          Map().put(nextEventID, nextEvent.prolly_root_hash)
+        val nextResolvedClaims = nextEvent.resolved_finalized_conflicts
+        val withSubsumed: NodeState = {
+          ...st,
+          // finalized_commit_id unchanged
+          // finalized_prolly_root_hash unchanged
+          finalized_events: st.finalized_events.put(nextEventID, nextEvent.prolly_root_hash),
+          finalized_checkpoint_events: st.finalized_checkpoint_events.put(st.finalized_commit_id, currentCheckpoint),
+          resolved_finalized_conflict_ids: st.resolved_finalized_conflict_ids.union(nextResolvedClaims),
+          finalized_conflicts: dropFinalizedConflicts(
+            st.finalized_conflicts,
+            st.resolved_finalized_conflict_ids.union(nextResolvedClaims)
+          ),
+        }
+        val reconcile = computeTentativeProjection(withSubsumed)
         {
-          ...withBatch,
-          finalized_commit_parents: lineage,
+          ...withSubsumed,
+          tentative_prolly_root_hash: reconcile._1,
+          parked_conflicts: reconcile._2,
+          projection_basis: reconcile._3,
         }
       } else {
-        withBatch
-      }
-      val reconcile = computeTentativeProjection(withLineage)
-      {
-        ...withLineage,
-        tentative_prolly_root_hash: reconcile._1,
-        parked_conflicts: reconcile._2,
-        projection_basis: reconcile._3,
+        // Normal replay finalization.
+        val nextRoot = nextFinalizationMergeRoot(st)
+        if (nextRoot == CONFLICT_HASH) st
+        else {
+          val nextParents = if (st.finalized_commit_id == EMPTY_FINALIZED_COMMIT_ID)
+            Set()
+          else
+            Set(st.finalized_commit_id)
+          val nextFinalizedCommit = makeFinalizedCheckpointCommitID(nextRoot, nextParents)
+          val nextResolvedClaims = nextEvent.resolved_finalized_conflicts
+          val nextCheckpoint = if (st.finalized_checkpoint_events.has(nextFinalizedCommit))
+            st.finalized_checkpoint_events.get(nextFinalizedCommit).put(nextEventID, nextEvent.prolly_root_hash)
+          else
+            Map().put(nextEventID, nextEvent.prolly_root_hash)
+          val withBatch: NodeState = {
+            ...st,
+            finalized_commit_id: nextFinalizedCommit,
+            finalized_prolly_root_hash: nextRoot,
+            finalized_events: st.finalized_events.put(nextEventID, nextEvent.prolly_root_hash),
+            finalized_checkpoint_events: st.finalized_checkpoint_events.put(nextFinalizedCommit, nextCheckpoint),
+            resolved_finalized_conflict_ids: st.resolved_finalized_conflict_ids.union(nextResolvedClaims),
+            finalized_conflicts: dropFinalizedConflicts(
+              st.finalized_conflicts,
+              st.resolved_finalized_conflict_ids.union(nextResolvedClaims)
+            ),
+          }
+          val withLineage: NodeState = if (nextFinalizedCommit != st.finalized_commit_id) {
+            val lineage = lineageAddFinalizedCommit(
+              st.finalized_commit_parents,
+              nextFinalizedCommit,
+              nextParents
+            )
+            {
+              ...withBatch,
+              finalized_commit_parents: lineage,
+            }
+          } else {
+            withBatch
+          }
+          val reconcile = computeTentativeProjection(withLineage)
+          {
+            ...withLineage,
+            tentative_prolly_root_hash: reconcile._1,
+            parked_conflicts: reconcile._2,
+            projection_basis: reconcile._3,
+          }
+        }
       }
     }
   }
@@ -953,6 +1018,7 @@ module doltswarm_verify {
       prolly_root_hash: resolvedContent,
       anchor_prolly_root_hash: st.finalized_prolly_root_hash,
       parent_event_ids: resolveParents,
+      resolved_parked_event_ids: Set(parkedEventID),
       resolved_finalized_conflicts: Set(),
       hlc: newHLC,
       peer: p,
@@ -1163,33 +1229,37 @@ module doltswarm_verify {
   /// hydration from the remote clock, retained-finalized compaction,
   /// and tentative_prolly_root_hash re-anchoring.
   pure def applySyncFinalized(st_local: NodeState, st_remote: NodeState): NodeState = {
-    val mode = syncMode(st_local, st_remote)
     val syncedState = syncFinalizedCore(st_local, st_remote)
-    if (mode == SYNC_NOOP) {
-      {
-        ...syncedState,
-        tentative_prolly_root_hash: st_local.tentative_prolly_root_hash,
-        parked_conflicts: st_local.parked_conflicts,
-        projection_basis: st_local.projection_basis,
-      }
-    } else {
+    val tipChanged =
+      syncedState.finalized_commit_id != st_local.finalized_commit_id or
+      syncedState.finalized_prolly_root_hash != st_local.finalized_prolly_root_hash
+    val bookkeepingChanged =
+      syncedState.finalized_events != st_local.finalized_events
+    // Step 4: retained-finalized cleanup runs whenever finalized bookkeeping
+    // changed, even in SYNC_NOOP (equal-tip metadata repair can expand
+    // finalized_events via merged checkpoint metadata).
+    val cleaned =
+      if (bookkeepingChanged) compactRetainedFinalized(syncedState)
+      else syncedState
+    if (tipChanged) {
+      // ADOPT or MERGE: full hydration + reconcile.
       val hydratedClosure = pullClosureEventIDs(
-        syncedState.clock,
+        cleaned.clock,
         st_remote.clock,
-        syncedState.clock.keys(),
+        cleaned.clock.keys(),
         Set()
       )
       val hydratedClock = applyRemoteEvents(
-        syncedState.clock,
+        cleaned.clock,
         st_remote.clock,
         hydratedClosure
       )
-      val retainedFinalizedReady = hydratedClock.keys().intersect(syncedState.finalized_events.keys())
+      val retainedFinalizedReady = hydratedClock.keys().intersect(cleaned.finalized_events.keys())
       val withRetainedFinalizedReady: NodeState = {
-        ...syncedState,
+        ...cleaned,
         clock: hydratedClock,
         head_event_ids: computeHeadEventIDs(hydratedClock),
-        chunks_ready: syncedState.chunks_ready.union(retainedFinalizedReady),
+        chunks_ready: cleaned.chunks_ready.union(retainedFinalizedReady),
       }
       val compactedState = compactRetainedFinalized(withRetainedFinalizedReady)
       val reconcileResult = computeTentativeProjection(compactedState)
@@ -1198,6 +1268,15 @@ module doltswarm_verify {
         tentative_prolly_root_hash: reconcileResult._1,
         parked_conflicts: reconcileResult._2,
         projection_basis: reconcileResult._3,
+      }
+    } else {
+      // NOOP: tip unchanged, preserve tentative state. Compaction (if any)
+      // already handled above via bookkeepingChanged.
+      {
+        ...cleaned,
+        tentative_prolly_root_hash: st_local.tentative_prolly_root_hash,
+        parked_conflicts: st_local.parked_conflicts,
+        projection_basis: st_local.projection_basis,
       }
     }
   }
@@ -1248,6 +1327,7 @@ module doltswarm_verify {
         prolly_root_hash: content,
         anchor_prolly_root_hash: st.finalized_prolly_root_hash,
         parent_event_ids: st.projection_basis,
+        resolved_parked_event_ids: Set(),
         resolved_finalized_conflicts: Set(),
         hlc: newHLC,
         peer: p,
@@ -1606,6 +1686,7 @@ module doltswarm_verify {
         prolly_root_hash: resolvedContent,
         anchor_prolly_root_hash: st.finalized_prolly_root_hash,
         parent_event_ids: resolveParents,
+        resolved_parked_event_ids: Set(parkedEventID),
         resolved_finalized_conflicts: Set(),
         hlc: newHLC,
         peer: p,
@@ -1987,6 +2068,20 @@ module doltswarm_verify {
     }
   }))
 
+  /// Regression invariant: after any SYNC_NOOP (including equal-tip metadata
+  /// repair), retained finalized events in clock must satisfy parent-closure
+  /// and chunk-readiness. Compaction from bookkeeping changes must not leave
+  /// finalized-but-unready or finalized-but-orphaned events in clock.
+  val inv_sync_noop_retained_finalized_clean = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val synced = applySyncFinalized(st_p, st_q)
+    (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_NOOP) implies
+      retainedFinalizedEventIDs(synced).forall(event_id =>
+        isParentClosed(synced.clock, event_id) and synced.chunks_ready.contains(event_id)
+      )
+  }))
+
   /// SYNC_FINALIZED contract (merge branch): divergence produces merged
   /// finalized events and never leaks CONFLICT_HASH to finalized_prolly_root_hash.
   val inv_sync_contract_merge = PEERS.forall(p => PEERS.forall(q => {
@@ -2345,6 +2440,7 @@ module doltswarm_verify {
           post.clock.has(emittedEventID),
           emitted.parent_event_ids == st.projection_basis.union(Set(parkedEventID)),
           emitted.anchor_prolly_root_hash == st.finalized_prolly_root_hash,
+          emitted.resolved_parked_event_ids == Set(parkedEventID),
           emitted.resolved_finalized_conflicts.empty(),
           not(post.head_event_ids.contains(parkedEventID)),
           not(post.parked_conflicts.contains(parkedEventID)),
@@ -2383,12 +2479,24 @@ module doltswarm_verify {
   /// Disjoint concurrent writes must auto-merge and be commutative.
   /// Scenario checks over the abstract 2D state space.
   val inv_merge_disjoint_commutative = all {
+    // Disjoint writes: A and B dimensions changed independently auto-merge.
     mergeRoots(11, 12, 10) == 13,
     mergeRoots(12, 11, 10) == 13,
     mergeRoots(11, 12, 10) == mergeRoots(12, 11, 10),
     mergeRoots(10, 13, 11) == 12,
     mergeRoots(13, 10, 11) == 12,
     mergeRoots(10, 13, 11) == mergeRoots(13, 10, 11),
+    // Same-dimension conflict: concurrent A=1 vs A=2 from A=0 => CONFLICT.
+    mergeRoots(11, 14, 10) == CONFLICT_HASH,
+    mergeRoots(14, 11, 10) == CONFLICT_HASH,
+    mergeRoots(11, 14, 10) == mergeRoots(14, 11, 10),
+    // Same-dimension conflict with B also changed: (A1,B1) vs (A2,B1) from (A0,B0) => CONFLICT.
+    mergeRoots(13, 15, 10) == CONFLICT_HASH,
+    mergeRoots(15, 13, 10) == CONFLICT_HASH,
+    // Disjoint with expanded values: A=2 and B=1 from (A0,B0) => (A2,B1).
+    mergeRoots(14, 12, 10) == 15,
+    mergeRoots(12, 14, 10) == 15,
+    mergeRoots(14, 12, 10) == mergeRoots(12, 14, 10),
   }
 
   /// No unhandled tentative conflict (INV7a): tentative_prolly_root_hash is never
@@ -2728,6 +2836,51 @@ module doltswarm_verify {
   val inv_heads_consistent = PEERS.forall(p => {
     val st = nodes.get(p)
     st.head_event_ids == computeHeadEventIDs(st.clock)
+  })
+
+  /// INV9a: Parked and subsumed events are disjoint.
+  /// A subsumed event has been resolved; it must not remain parked.
+  val inv_parked_subsumed_disjoint = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.parked_conflicts.intersect(subsumedEvents(st.clock)).empty()
+  })
+
+  /// INV9b: Every subsumed event has a parent link from its resolver.
+  /// The event that carries resolved_parked_event_ids must include the
+  /// subsumed event in its parent_event_ids.
+  val inv_subsumed_parent_link = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.clock.keys().forall(event_id => {
+      val ev = st.clock.get(event_id)
+      ev.resolved_parked_event_ids.forall(sub_id =>
+        ev.parent_event_ids.contains(sub_id)
+      )
+    })
+  })
+
+  /// INV9c: Subsumed events finalize as bookkeeping-only.
+  /// When a subsumed event is finalized, the finalized_prolly_root_hash and
+  /// finalized_commit_id must not change (they stay at the pre-subsumption
+  /// values). We check this indirectly: a subsumed finalized event's
+  /// prolly_root_hash is recorded in finalized_events but must not equal
+  /// the finalized_prolly_root_hash (unless coincidentally the same content).
+  /// More precisely: subsumed events attach to the existing checkpoint, so
+  /// the checkpoint descriptor that contains them must have been created
+  /// by a non-subsumed event.
+  val inv_subsumed_finalize_bookkeeping_only = PEERS.forall(p => {
+    val st = nodes.get(p)
+    val subsumed = subsumedEvents(st.clock)
+    val finalizedSubsumed = st.finalized_events.keys().intersect(subsumed)
+    // Each finalized subsumed event must be attached to a checkpoint that
+    // also contains at least one non-subsumed event (the original creator).
+    finalizedSubsumed.forall(sub_id =>
+      st.finalized_checkpoint_events.keys().exists(commit_id =>
+        st.finalized_checkpoint_events.get(commit_id).has(sub_id) and
+        st.finalized_checkpoint_events.get(commit_id).keys().exists(eid =>
+          not(subsumed.contains(eid))
+        )
+      )
+    )
   })
 
   /// Finalization and parking are disjoint: parked events are never finalized.
