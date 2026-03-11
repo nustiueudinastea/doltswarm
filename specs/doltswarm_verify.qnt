@@ -1162,6 +1162,90 @@ module doltswarm_verify {
     st_a.resolved_finalized_conflict_ids == st_b.resolved_finalized_conflict_ids,
   }
 
+  pure def sameFinalizedStateAcross(peerStatesA: PeerID -> NodeState,
+      peerStatesB: PeerID -> NodeState): bool =
+    PEERS.forall(p => sameFinalizedState(peerStatesA.get(p), peerStatesB.get(p)))
+
+  pure def peersShareSameFinalizedState(peerStates: PeerID -> NodeState,
+      peers: Set[PeerID]): bool =
+    peers.forall(p => peers.forall(q =>
+      sameFinalizedState(peerStates.get(p), peerStates.get(q))
+    ))
+
+  pure def allPeersSameFinalizedState(peerStates: PeerID -> NodeState): bool =
+    peersShareSameFinalizedState(peerStates, PEERS)
+
+  pure def connectedComponent(conn: Set[(PeerID, PeerID)], seed: PeerID): Set[PeerID] =
+    range(0, PEERS.size()).foldl(Set(seed), (acc, _) =>
+      acc.union(PEERS.filter(q =>
+        acc.exists(p => p == q or isConnected(conn, p, q))
+      ))
+    )
+
+  pure def mergedFinalizedParentsFor(peerStates: PeerID -> NodeState,
+      peers: Set[PeerID]):
+      FinalizedCommitID -> Set[FinalizedCommitID] =
+    peers.fold(Map().put(EMPTY_FINALIZED_COMMIT_ID, Set()), (acc, p) =>
+      mergeSetMap(acc, peerStates.get(p).finalized_commit_parents)
+    )
+
+  pure def mergedFinalizedParentsAcross(peerStates: PeerID -> NodeState):
+      FinalizedCommitID -> Set[FinalizedCommitID] =
+    mergedFinalizedParentsFor(peerStates, PEERS)
+
+  pure def finalizedTipSetFor(peerStates: PeerID -> NodeState,
+      peers: Set[PeerID]): Set[FinalizedCommitID] =
+    peers.fold(Set(), (acc, p) =>
+      acc.union(Set(peerStates.get(p).finalized_commit_id))
+    )
+
+  pure def finalizedTipSetAcross(peerStates: PeerID -> NodeState): Set[FinalizedCommitID] =
+    finalizedTipSetFor(peerStates, PEERS)
+
+  pure def finalizedFrontierFor(peerStates: PeerID -> NodeState,
+      peers: Set[PeerID]): Set[FinalizedCommitID] =
+    finalizedTipFrontier(
+      finalizedTipSetFor(peerStates, peers),
+      mergedFinalizedParentsFor(peerStates, peers)
+    )
+
+  pure def finalizedFrontierRankFor(peerStates: PeerID -> NodeState,
+      peers: Set[PeerID]): int =
+    finalizedFrontierFor(peerStates, peers).size() - 1
+
+  pure def globalFinalizedFrontier(peerStates: PeerID -> NodeState): Set[FinalizedCommitID] =
+    finalizedFrontierFor(peerStates, PEERS)
+
+  pure def globalFinalizedFrontierRank(peerStates: PeerID -> NodeState): int =
+    finalizedFrontierRankFor(peerStates, PEERS)
+
+  pure def syncPeerIfEnabled(peerStates: PeerID -> NodeState,
+      p: PeerID, q: PeerID): PeerID -> NodeState = {
+    val st_p = peerStates.get(p)
+    val st_q = peerStates.get(q)
+    if (syncEnabled(allPairs(PEERS), p, q, st_p, st_q))
+      peerStates.set(p, applySyncFinalized(st_p, st_q))
+    else
+      peerStates
+  }
+
+  /// Deterministic fairness approximation for finalized healing in a fully
+  /// connected 3-peer swarm: every ordered pair gets one sync chance.
+  pure def healRoundFullMesh(peerStates: PeerID -> NodeState): PeerID -> NodeState = {
+    val after12 = syncPeerIfEnabled(peerStates, 1, 2)
+    val after21 = syncPeerIfEnabled(after12, 2, 1)
+    val after13 = syncPeerIfEnabled(after21, 1, 3)
+    val after31 = syncPeerIfEnabled(after13, 3, 1)
+    val after23 = syncPeerIfEnabled(after31, 2, 3)
+    syncPeerIfEnabled(after23, 3, 2)
+  }
+
+  pure val FULL_MESH_HEAL_ROUNDS: int = 3
+
+  pure def healRoundsFullMesh(peerStates: PeerID -> NodeState, rounds: int):
+      PeerID -> NodeState =
+    range(0, rounds).foldl(peerStates, (acc, _) => healRoundFullMesh(acc))
+
   /// Finalized-state update for SYNC_FINALIZED (without tentative_prolly_root_hash re-anchoring).
   pure def syncFinalizedCore(st_local: NodeState, st_remote: NodeState): NodeState = {
     val mode = syncMode(st_local, st_remote)
@@ -1836,10 +1920,13 @@ module doltswarm_verify {
   // ===========================================================================
   // Invariants
   // ===========================================================================
+  // @default_steps annotations are benchmark-derived suite defaults consumed by
+  // specs/quint_invariants.py and task quint:run. Pass STEPS=... to override them.
 
   /// INV1b retained-structure convergence:
   /// peers with the same retained clock keys have the same derived heads.
   /// INV1a logical identity is represented by logicalEventIDs(clock ∪ finalized).
+  /// @default_steps 20
   val inv_retained_structure_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
@@ -1848,6 +1935,7 @@ module doltswarm_verify {
 
   /// Current finalized commit must match the finalized content root plus the
   /// actual parent set of the materialized finalized commit at the tip.
+  /// @default_steps 20
   val inv_finalized_commit_id_matches_state = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_commit_id == derivedFinalizedCommitID(st)
@@ -1856,6 +1944,7 @@ module doltswarm_verify {
   /// Finalized agreement (INV3, tip form): same finalized commit id implies
   /// the same finalized content root. History equality itself is carried by the
   /// finalized commit id plus derived lineage metadata, not by finalized_events.
+  /// @default_steps 20
   val inv_finalized_agreement = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
@@ -1868,6 +1957,7 @@ module doltswarm_verify {
   /// - finalized_commit_id is present in lineage known finalized commits
   /// - every known finalized commit is its own ancestor
   /// - every parent edge points to a strictly shallower finalized commit (derived depth)
+  /// @default_steps 20
   val inv_lineage_well_formed = PEERS.forall(p => {
     val st = nodes.get(p)
     val knownFinalizedCommits = lineageKnownFinalizedCommits(st.finalized_commit_parents)
@@ -1892,6 +1982,7 @@ module doltswarm_verify {
   /// Finalized lineage closure:
   /// - parents of a finalized commit are included in its ancestor set
   /// - every referenced parent is a known lineage finalized commit
+  /// @default_steps 20
   val inv_lineage_closure = PEERS.forall(p => {
     val st = nodes.get(p)
     val knownFinalizedCommits = lineageKnownFinalizedCommits(st.finalized_commit_parents)
@@ -1906,6 +1997,7 @@ module doltswarm_verify {
 
   /// LCA soundness over lineage metadata:
   /// lineageLcaFinalizedCommit(a, b) must be a common ancestor with maximal depth.
+  /// @default_steps 10
   val inv_lineage_lca_sound = PEERS.forall(p => {
     val st = nodes.get(p)
     val knownFinalizedCommits = lineageKnownFinalizedCommits(st.finalized_commit_parents)
@@ -1931,6 +2023,7 @@ module doltswarm_verify {
 
   /// SYNC_FINALIZED metadata-union contract:
   /// output lineage metadata includes merged local+remote parent metadata.
+  /// @default_steps 20
   val inv_sync_metadata_union = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -1954,8 +2047,37 @@ module doltswarm_verify {
     }
   }))
 
+  /// SYNC_FINALIZED only adds finalized-lineage knowledge:
+  /// parent metadata is monotone, checkpoint descriptors are union-preserving,
+  /// and durable resolved finalized-conflict ids never move backward.
+  /// @default_steps 20
+  val inv_sync_lineage_union_monotone = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val mergedParents = mergeSetMap(st_p.finalized_commit_parents, st_q.finalized_commit_parents)
+    val mergedCheckpoints = mergeFinalizedCheckpointMap(
+      st_p.finalized_checkpoint_events,
+      st_q.finalized_checkpoint_events
+    )
+    val mergedResolvedIDs = st_p.resolved_finalized_conflict_ids
+      .union(st_q.resolved_finalized_conflict_ids)
+    val synced = applySyncFinalized(st_p, st_q)
+    syncEnabled(connected, p, q, st_p, st_q) implies all {
+      mergedParents.keys().forall(k =>
+        synced.finalized_commit_parents.has(k) and
+          mergedParents.get(k).subseteq(synced.finalized_commit_parents.get(k))
+      ),
+      mergedCheckpoints.keys().forall(k =>
+        synced.finalized_checkpoint_events.has(k) and
+          synced.finalized_checkpoint_events.get(k) == mergedCheckpoints.get(k)
+      ),
+      mergedResolvedIDs.subseteq(synced.resolved_finalized_conflict_ids),
+    }
+  }))
+
   /// SYNC_FINALIZED merge branch must record lineage links to both input
   /// finalized commits (excluding self-edge if resulting finalized commit equals one input).
+  /// @default_steps 20
   val inv_sync_merge_parent_edges = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -1972,6 +2094,7 @@ module doltswarm_verify {
 
   /// SYNC_FINALIZED merge branch reduces the pairwise finalized frontier to a
   /// single descendant tip while preserving both inputs as ancestors.
+  /// @default_steps 20
   val inv_sync_merge_frontier_reduction = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -1994,6 +2117,7 @@ module doltswarm_verify {
   /// different 3-way heal orders may produce different intermediate merge
   /// commits, but those commits must themselves be merge-reconcilable later
   /// without rewriting earlier finalized history.
+  /// @default_steps 20
   val inv_sync_nested_merge_reconcilable = PEERS.forall(p => PEERS.forall(q => PEERS.forall(r => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2030,6 +2154,7 @@ module doltswarm_verify {
 
   /// SYNC_FINALIZED contract (adopt branch): behind peer adopts remote
   /// finalized root/events while preserving unresolved conflict visibility.
+  /// @default_steps 20
   val inv_sync_contract_adopt = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2062,6 +2187,7 @@ module doltswarm_verify {
 
   /// SYNC_FINALIZED empty-root adoption contract: a peer at EMPTY_ROOT adopts
   /// a connected peer's non-empty finalized state through the normal ADOPT path.
+  /// @default_steps 20
   val inv_sync_empty_root_adopts = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2088,6 +2214,7 @@ module doltswarm_verify {
   /// SYNC_FINALIZED contract (no-op branch): ahead peer does not change
   /// finalized root/events, but unresolved finalized conflicts still propagate
   /// monotonically (minus durable resolved ids).
+  /// @default_steps 20
   val inv_sync_contract_noop = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2128,6 +2255,7 @@ module doltswarm_verify {
   /// Equal-tip finalized sync is a metadata repair no-op for the finalized
   /// commit DAG: tip/root stay fixed while lineage/checkpoint/conflict metadata
   /// is merged.
+  /// @default_steps 20
   val inv_sync_equal_tip_metadata_repair = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2164,6 +2292,7 @@ module doltswarm_verify {
   /// repair), retained finalized events in clock must satisfy parent-closure
   /// and chunk-readiness. Compaction from bookkeeping changes must not leave
   /// finalized-but-unready or finalized-but-orphaned events in clock.
+  /// @default_steps 20
   val inv_sync_noop_retained_finalized_clean = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2176,6 +2305,7 @@ module doltswarm_verify {
 
   /// SYNC_FINALIZED contract (merge branch): divergence produces merged
   /// finalized events and never leaks CONFLICT_HASH to finalized_prolly_root_hash.
+  /// @default_steps 20
   val inv_sync_contract_merge = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2206,6 +2336,7 @@ module doltswarm_verify {
   /// SYNC_FINALIZED unresolved-conflict monotonicity:
   /// unresolved conflict ids cannot disappear without entering the durable
   /// resolved set.
+  /// @default_steps 20
   val inv_sync_unresolved_conflicts_monotone = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2221,6 +2352,7 @@ module doltswarm_verify {
 
   /// SYNC_FINALIZED conflict-tracking contract: when merge branch conflict occurs,
   /// the deterministic finalized conflict id must be present in the synced state.
+  /// @default_steps 20
   val inv_sync_conflict_recorded = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2251,6 +2383,7 @@ module doltswarm_verify {
 
   /// SYNC_FINALIZED conflict-id symmetry: when both directions take merge+conflict,
   /// they derive and record the same deterministic conflict id.
+  /// @default_steps 20
   val inv_sync_conflict_id_symmetric = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2317,6 +2450,7 @@ module doltswarm_verify {
   /// RESOLVE_FINALIZED_CONFLICT contract: enabled resolution emits an anchored
   /// write claim, leaves finalized history untouched, and does not immediately
   /// mark the conflict durably resolved.
+  /// @default_steps 20
   val inv_resolve_finalized_conflict_contract = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_conflicts.keys().forall(conflictID => {
@@ -2353,6 +2487,7 @@ module doltswarm_verify {
 
   /// Scenario check: ancestor/descendant finalized-root pair converges when the
   /// ahead peer no-ops and the behind peer syncs back.
+  /// @default_steps 20
   val inv_sync_subset_roundtrip_converges = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2372,6 +2507,7 @@ module doltswarm_verify {
 
   /// Scenario check: incomparable peers independently converge to the same
   /// merged finalized state under deterministic merge tie-breaking.
+  /// @default_steps 20
   val inv_sync_incomparable_pairwise_converges = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2391,8 +2527,128 @@ module doltswarm_verify {
     }
   }))
 
+  /// Deterministic fair-healing approximation for the 3-peer model:
+  /// in a fully connected swarm with no new writes, one full ordered-pair sync
+  /// round must not increase the incomparable finalized frontier.
+  /// @default_steps 20
+  val inv_fullmesh_heal_round_frontier_nonincreasing = {
+    val healed = healRoundFullMesh(nodes)
+    allPairs(PEERS).subseteq(connected) implies
+      globalFinalizedFrontier(healed).size() <= globalFinalizedFrontier(nodes).size()
+  }
+
+  /// Rank/progress phase 1 for deterministic full-mesh healing:
+  /// while more than one incomparable finalized tip remains, one heal round
+  /// must strictly reduce the finalized frontier rank.
+  /// @default_steps 20
+  val inv_fullmesh_frontier_rank_strict_progress = {
+    val healed = healRoundFullMesh(nodes)
+    (allPairs(PEERS).subseteq(connected) and
+      globalFinalizedFrontierRank(nodes) > 0) implies
+      globalFinalizedFrontierRank(healed) < globalFinalizedFrontierRank(nodes)
+  }
+
+  /// Connected-component frontier monotonicity for one heal step:
+  /// a single SYNC_FINALIZED application inside a connected component must not
+  /// increase that component's incomparable finalized frontier.
+  /// @default_steps 20
+  val inv_heal_frontier_nonincreasing = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val component = connectedComponent(connected, p)
+    val before = finalizedFrontierFor(nodes, component)
+    val afterNodes = nodes.set(p, syncPeerIfEnabled(nodes, p, q).get(p))
+    val after = finalizedFrontierFor(afterNodes, component)
+    syncEnabled(connected, p, q, st_p, st_q) implies
+      after.size() <= before.size()
+  }))
+
+  /// If SYNC_MERGE joins two current maximal incomparable frontier tips in a
+  /// connected component, that component frontier size drops by exactly one.
+  /// @default_steps 20
+  val inv_frontier_merge_strictly_decreases = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val component = connectedComponent(connected, p)
+    val before = finalizedFrontierFor(nodes, component)
+    val afterNodes = nodes.set(p, applySyncFinalized(st_p, st_q))
+    val after = finalizedFrontierFor(afterNodes, component)
+    (syncEnabled(connected, p, q, st_p, st_q) and
+      syncMode(st_p, st_q) == SYNC_MERGE and
+      before.contains(st_p.finalized_commit_id) and
+      before.contains(st_q.finalized_commit_id)) implies
+      after.size() + 1 == before.size()
+  }))
+
+  /// Bounded eventual-convergence regression for the 3-peer model:
+  /// under a deterministic full-mesh sync schedule and no new writes, repeated
+  /// heal rounds should collapse the finalized frontier to one shared tip while
+  /// preserving all initially-visible finalized tips as ancestors.
+  /// @default_steps 20
+  val inv_fullmesh_heal_bounded_converges = {
+    val initialTips = finalizedTipSetAcross(nodes)
+    val healed = healRoundsFullMesh(nodes, FULL_MESH_HEAL_ROUNDS)
+    val healedParents = mergedFinalizedParentsAcross(healed)
+    allPairs(PEERS).subseteq(connected) implies all {
+      allPeersSameFinalizedState(healed),
+      globalFinalizedFrontier(healed) == Set(healed.get(1).finalized_commit_id),
+      finalizedDescendsFromAll(
+        healed.get(1).finalized_commit_id,
+        initialTips,
+        healedParents
+      ),
+    }
+  }
+
+  /// Once a connected component already has one unique maximal finalized tip,
+  /// later heal steps inside that component must not create a second
+  /// incomparable frontier tip.
+  /// @default_steps 20
+  val inv_unique_frontier_tip_is_absorbing = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val component = connectedComponent(connected, p)
+    val before = finalizedFrontierFor(nodes, component)
+    val afterNodes = nodes.set(p, syncPeerIfEnabled(nodes, p, q).get(p))
+    val after = finalizedFrontierFor(afterNodes, component)
+    (syncEnabled(connected, p, q, st_p, st_q) and before.size() == 1) implies
+      after.size() == 1
+  }))
+
+  /// Rank/progress phase 2 for deterministic full-mesh healing:
+  /// once the finalized frontier rank reaches zero (one maximal tip remains),
+  /// one more full-mesh round must make all peers share the same finalized state.
+  /// @default_steps 20
+  val inv_fullmesh_unique_frontier_round_converges = {
+    val healed = healRoundFullMesh(nodes)
+    (allPairs(PEERS).subseteq(connected) and
+      globalFinalizedFrontierRank(nodes) == 0) implies
+      allPeersSameFinalizedState(healed)
+  }
+
+  /// Sync-only absorbing property for a converged healed full mesh:
+  /// if all peers already share the same finalized state, one deterministic
+  /// full-mesh heal round leaves finalized state unchanged.
+  /// @default_steps 20
+  val inv_converged_finalized_state_absorbing = {
+    val healed = healRoundFullMesh(nodes)
+    (allPairs(PEERS).subseteq(connected) and allPeersSameFinalizedState(nodes)) implies
+      sameFinalizedStateAcross(healed, nodes)
+  }
+
+  /// Once the bounded heal schedule has converged, one more full-mesh heal round
+  /// should be a finalized-state fixpoint.
+  /// @default_steps 20
+  val inv_fullmesh_heal_converged_absorbing = {
+    val healed = healRoundsFullMesh(nodes, FULL_MESH_HEAL_ROUNDS)
+    val healedAgain = healRoundFullMesh(healed)
+    allPairs(PEERS).subseteq(connected) implies
+      sameFinalizedStateAcross(healedAgain, healed)
+  }
+
   /// Data convergence: peers with the same retained clock state and the same
   /// finalized root must derive the same reconcile projection.
+  /// @default_steps 20
   val inv_data_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
@@ -2408,6 +2664,7 @@ module doltswarm_verify {
   /// Causal consistency (INV4): if e1 is a parent of e2 in the clock DAG,
   /// then e1 precedes e2 in the HLC total order. Since HLC total order is
   /// transitive, checking direct parents suffices for full ancestry chains.
+  /// @default_steps 20
   val inv_causal_consistency = PEERS.forall(p => {
     val st = nodes.get(p)
     st.clock.keys().forall(event_id => {
@@ -2426,6 +2683,7 @@ module doltswarm_verify {
   /// The full INV5 ("every event *eventually* enters finalized set") is a
   /// liveness property that cannot be checked as a state invariant. This safety
   /// version ensures the precondition: events are never dropped without a trace.
+  /// @default_steps 20
   val inv_no_silent_data_loss = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_events.keys().forall(event_id =>
@@ -2435,6 +2693,7 @@ module doltswarm_verify {
 
   /// Finalized-event bookkeeping is derived from the finalized commit DAG plus
   /// checkpoint descriptors, not synchronized as an authoritative catalog.
+  /// @default_steps 20
   val inv_finalized_events_derived_from_checkpoints = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_events == derivedFinalizedEventMap(
@@ -2446,6 +2705,7 @@ module doltswarm_verify {
 
   /// LOCAL_WRITE must not directly mutate finalized state. Concurrent writes
   /// remain below the finalized-history boundary.
+  /// @default_steps 3
   val inv_write_preserves_finalized_state = PEERS.forall(p => {
     val st = nodes.get(p)
     writeEnabled(st) implies CONTENTS.forall(content => {
@@ -2464,6 +2724,7 @@ module doltswarm_verify {
 
   /// RECONCILE is a tentative-layer projection only; it must never mutate the
   /// finalized catalog, lineage, or finalized conflict state.
+  /// @default_steps 20
   val inv_reconcile_preserves_finalized_state = PEERS.forall(p => {
     val st = nodes.get(p)
     val post = reconcileResult(st)
@@ -2482,6 +2743,7 @@ module doltswarm_verify {
   /// from the new finalized_commit_id back to the prior finalized_commit_id.
   /// This is the model-level form of "merge commits only when finalized
   /// lineages meet" — do_finalize itself must not synthesize multi-parent joins.
+  /// @default_steps 19
   val inv_finalize_linear_extension_only = PEERS.forall(p => {
     val st = nodes.get(p)
     val post = finalizeResult(st)
@@ -2504,6 +2766,7 @@ module doltswarm_verify {
 
   /// Normal finalization materializes exactly one canonical stable event per
   /// checkpoint, not an arbitrary stable batch.
+  /// @default_steps 19
   val inv_finalize_one_event_per_checkpoint = PEERS.forall(p => {
     val st = nodes.get(p)
     val post = finalizeResult(st)
@@ -2517,6 +2780,7 @@ module doltswarm_verify {
 
   /// Tentative conflict resolution emits a normal anchored write that
   /// references the resolved parked head and leaves finalized state untouched.
+  /// @default_steps 20
   val inv_resolve_conflict_contract = PEERS.forall(p => {
     val st = nodes.get(p)
     st.parked_conflicts.forall(parkedEventID => {
@@ -2551,6 +2815,7 @@ module doltswarm_verify {
 
   /// All retained events in clocks satisfy the abstract swarm-wide admission
   /// predicate.
+  /// @default_steps 20
   val inv_clock_events_valid = PEERS.forall(p => {
     val st = nodes.get(p)
     st.clock.keys().forall(event_id => validEvent(st.clock.get(event_id)))
@@ -2558,11 +2823,13 @@ module doltswarm_verify {
 
   /// Any event still waiting in an inbox is also admissible under the same
   /// uniform predicate.
+  /// @default_steps 20
   val inv_inbox_events_valid = PEERS.forall(p =>
     inbox.get(p).forall(e => validEvent(e))
   )
 
   /// Event roots in clocks must never use the conflict sentinel.
+  /// @default_steps 20
   val inv_event_root_not_conflict = PEERS.forall(p => {
     val st = nodes.get(p)
     st.clock.keys().forall(event_id => st.clock.get(event_id).prolly_root_hash != CONFLICT_HASH)
@@ -2570,6 +2837,7 @@ module doltswarm_verify {
 
   /// Disjoint concurrent writes must auto-merge and be commutative.
   /// Scenario checks over the abstract 2D state space.
+  /// @default_steps 16
   val inv_merge_disjoint_commutative = all {
     // Disjoint writes: A and B dimensions changed independently auto-merge.
     mergeRoots(11, 12, 10) == 13,
@@ -2595,6 +2863,7 @@ module doltswarm_verify {
   /// CONFLICT_HASH. Every conflict detected by mergeRoots during
   /// reconciliation is captured in parked_conflicts — none leaks
   /// into the working state.
+  /// @default_steps 20
   val inv_no_conflict_tentative_root = PEERS.forall(p => {
     val st = nodes.get(p)
     st.tentative_prolly_root_hash != CONFLICT_HASH
@@ -2604,6 +2873,7 @@ module doltswarm_verify {
   /// CONFLICT_HASH. SYNC_FINALIZED divergence merges handle conflicts by using the
   /// ours-side root (deterministic) — no conflict sentinel leaks into
   /// the finalized state.
+  /// @default_steps 20
   val inv_no_conflict_finalized_prolly_root = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_prolly_root_hash != CONFLICT_HASH
@@ -2611,6 +2881,7 @@ module doltswarm_verify {
 
   /// Parked event integrity (INV7c): every parked conflict references
   /// a known event in the clock. No conflict is silently discarded.
+  /// @default_steps 20
   val inv_conflict_visibility = PEERS.forall(p => {
     val st = nodes.get(p)
     st.parked_conflicts.forall(event_id => st.clock.has(event_id))
@@ -2618,6 +2889,7 @@ module doltswarm_verify {
 
   /// Finalized conflict integrity (INV7e): every tracked finalized conflict
   /// is well-formed and references known lineage finalized commits.
+  /// @default_steps 20
   val inv_finalized_conflict_visibility = PEERS.forall(p => {
     val st = nodes.get(p)
     val knownFinalizedCommits = lineageKnownFinalizedCommits(st.finalized_commit_parents)
@@ -2636,6 +2908,7 @@ module doltswarm_verify {
 
   /// Finalized conflict authenticity: tracked finalized conflicts must correspond
   /// to a real merge conflict under mergeRoots.
+  /// @default_steps 20
   val inv_finalized_conflict_authenticity = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_conflicts.keys().forall(conflictID => {
@@ -2650,24 +2923,28 @@ module doltswarm_verify {
 
   /// Finalized conflict resolution propagation: once a conflict id is durably
   /// resolved at the finalized layer, that id must not remain tracked.
+  /// @default_steps 20
   val inv_finalized_conflict_no_resurrection = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_conflicts.keys().intersect(st.resolved_finalized_conflict_ids).empty()
   })
 
   /// Chunk-readiness integrity: only known clock events can be chunk-ready.
+  /// @default_steps 20
   val inv_chunks_ready_known = PEERS.forall(p => {
     val st = nodes.get(p)
     st.chunks_ready.subseteq(st.clock.keys())
   })
 
   /// Self must always remain in the current witness set.
+  /// @default_steps 20
   val inv_self_in_active_peers = PEERS.forall(p => {
     val st = nodes.get(p)
     st.active_peers.contains(p)
   })
 
   /// Parked integrity: parked conflicts always reference current heads.
+  /// @default_steps 20
   val inv_parked_are_heads = PEERS.forall(p => {
     val st = nodes.get(p)
     st.parked_conflicts.subseteq(st.head_event_ids)
@@ -2675,6 +2952,7 @@ module doltswarm_verify {
 
   /// Closure-ready parking safety: once all heads are mergeable, parked events
   /// are a subset of mergeable heads.
+  /// @default_steps 20
   val inv_parked_mergeable_when_closure_ready = PEERS.forall(p => {
     val st = nodes.get(p)
     (mergeableHeadEventIDs(st) == st.head_event_ids) implies st.parked_conflicts.subseteq(mergeableHeadEventIDs(st))
@@ -2682,6 +2960,7 @@ module doltswarm_verify {
 
   /// Retained finalized subgraph closure: any finalized event body retained in
   /// clock keeps its required retained ancestry.
+  /// @default_steps 20
   val inv_retained_finalized_subgraph_parent_closed = PEERS.forall(p => {
     val st = nodes.get(p)
     retainedFinalizedEventIDs(st).forall(event_id =>
@@ -2691,6 +2970,7 @@ module doltswarm_verify {
 
   /// Finalization safety: every retained finalized event in clock is
   /// parent-closed and chunk-ready.
+  /// @default_steps 20
   val inv_finalized_parent_closed = PEERS.forall(p => {
     val st = nodes.get(p)
     retainedFinalizedEventIDs(st).forall(event_id =>
@@ -2700,6 +2980,7 @@ module doltswarm_verify {
 
   /// Reconcile fixed-point safety: tentative_prolly_root_hash is always equal to the
   /// deterministic merged-root projection from current state.
+  /// @default_steps 20
   val inv_tentative_root_is_compute_projection = PEERS.forall(p => {
     val st = nodes.get(p)
     st.tentative_prolly_root_hash == computeTentativeProjection(st)._1
@@ -2707,6 +2988,7 @@ module doltswarm_verify {
 
   /// Reconcile fixed-point safety: parked_conflicts is always equal to the
   /// deterministic parked-set projection from current state.
+  /// @default_steps 20
   val inv_parked_conflicts_is_compute_projection = PEERS.forall(p => {
     val st = nodes.get(p)
     st.parked_conflicts == computeTentativeProjection(st)._2
@@ -2714,6 +2996,7 @@ module doltswarm_verify {
 
   /// Projection-basis safety: emitted-parent basis is always the deterministic
   /// basis associated with the current tentative root.
+  /// @default_steps 20
   val inv_projection_basis_is_compute_projection = PEERS.forall(p => {
     val st = nodes.get(p)
     st.projection_basis == computeTentativeProjection(st)._3
@@ -2722,6 +3005,7 @@ module doltswarm_verify {
   /// Bounded anti-entropy scenario check: if p can heartbeat q and q's head has
   /// full ancestry in q's local clock, then one closure pull plus enough
   /// do_receive steps yields parent-closed remote heads in p's projected clock.
+  /// @default_steps 15
   val inv_heartbeat_closure_catchup_bounded = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2737,6 +3021,7 @@ module doltswarm_verify {
   /// Re-anchoring conservative retention check: when SYNC_FINALIZED changes the
   /// anchor and mergeable heads are still missing, unresolved parked heads that
   /// remain heads must not disappear from parked_conflicts.
+  /// @default_steps 20
   val inv_reanchor_provisional_parked_retained = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2753,6 +3038,7 @@ module doltswarm_verify {
   /// Once required closure and chunks are available and introduce mergeable
   /// heads whose anchored merge step is not a no-op, recomputation must change
   /// the stale projection.
+  /// @default_steps 20
   val inv_reanchor_after_closure_lag = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2785,6 +3071,7 @@ module doltswarm_verify {
 
   /// Heartbeats should not keep requesting closure once the remote frontier
   /// and head ancestry are already present locally.
+  /// @default_steps 20
   val inv_heartbeat_no_redundant_pull_when_closed = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2803,6 +3090,7 @@ module doltswarm_verify {
   }))
 
   /// Heartbeat witness refresh is exact and must not mutate finalized state.
+  /// @default_steps 20
   val inv_heartbeat_refreshes_remote_witness_exactly = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2823,6 +3111,7 @@ module doltswarm_verify {
   /// Witness-frontier soundness (INV6): each peer records its own observed
   /// frontier exactly, and finalization with singleton membership reduces to
   /// local readiness because self coverage is immediate.
+  /// @default_steps 20
   val inv_self_seen_frontier_exact = PEERS.forall(p => {
     val st = nodes.get(p)
     st.peer_seen_frontier.get(p) == observedFrontier(st.clock)
@@ -2830,6 +3119,7 @@ module doltswarm_verify {
 
   /// The local seen frontier is an antichain: no frontier element is an
   /// ancestor of any other frontier element.
+  /// @default_steps 20
   val inv_self_seen_frontier_antichain = PEERS.forall(p => {
     val st = nodes.get(p)
     val frontier = st.peer_seen_frontier.get(p)
@@ -2842,6 +3132,7 @@ module doltswarm_verify {
   })
 
   /// Every locally parent-closed event is covered by the local seen frontier.
+  /// @default_steps 19
   val inv_self_seen_frontier_covers_parent_closed_clock = PEERS.forall(p => {
     val st = nodes.get(p)
     st.clock.keys().forall(event_id =>
@@ -2852,6 +3143,7 @@ module doltswarm_verify {
 
   /// The model treats bootstrap/join as external to the core protocol, so all
   /// reachable states must already satisfy the bootstrap boundary contract.
+  /// @default_steps 16
   val inv_bootstrap_boundary_ready = PEERS.forall(p => {
     val st = nodes.get(p)
     bootstrapBoundaryReady(p, st)
@@ -2865,6 +3157,7 @@ module doltswarm_verify {
       st.chunks_ready.contains(event_id)
     )
 
+  /// @default_steps 20
   val inv_singleton_membership_self_coverage = PEERS.forall(p => {
     val st = nodes.get(p)
     (st.active_peers == Set(p)) implies
@@ -2872,6 +3165,7 @@ module doltswarm_verify {
   })
 
   /// Conflicts do not block LOCAL_WRITE when model resource bounds permit it.
+  /// @default_steps 20
   val inv_write_enabled_despite_conflicts = PEERS.forall(p => {
     val st = nodes.get(p)
     (((not(st.parked_conflicts.empty())) or
@@ -2892,6 +3186,7 @@ module doltswarm_verify {
 
   /// Re-adding a lagging peer to active_peers via heartbeat may delay future
   /// finalization, but it must not rewind or rewrite already-finalized history.
+  /// @default_steps 20
   val inv_rejoin_does_not_rewind_finalized = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
@@ -2912,6 +3207,7 @@ module doltswarm_verify {
   /// Parking agreement (INV7d, closure-ready):
   /// peers with the same events/chunk-readiness and same finalized_prolly_root_hash
   /// deterministically agree on parked events once head closure is complete.
+  /// @default_steps 20
   val inv_parking_agreement = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
@@ -2925,6 +3221,7 @@ module doltswarm_verify {
   }))
 
   /// Heads are always derived from clock structure (no hidden divergence).
+  /// @default_steps 20
   val inv_heads_consistent = PEERS.forall(p => {
     val st = nodes.get(p)
     st.head_event_ids == computeHeadEventIDs(st.clock)
@@ -2932,6 +3229,7 @@ module doltswarm_verify {
 
   /// INV9a: Parked and subsumed events are disjoint.
   /// A subsumed event has been resolved; it must not remain parked.
+  /// @default_steps 20
   val inv_parked_subsumed_disjoint = PEERS.forall(p => {
     val st = nodes.get(p)
     st.parked_conflicts.intersect(subsumedEvents(st.clock)).empty()
@@ -2940,6 +3238,7 @@ module doltswarm_verify {
   /// INV9b: Every subsumed event has a parent link from its resolver.
   /// The event that carries resolved_parked_event_id must include the
   /// subsumed event in its parent_event_ids.
+  /// @default_steps 20
   val inv_subsumed_parent_link = PEERS.forall(p => {
     val st = nodes.get(p)
     st.clock.keys().forall(event_id => {
@@ -2960,6 +3259,7 @@ module doltswarm_verify {
   /// More precisely: subsumed events attach to the existing checkpoint, so
   /// the checkpoint descriptor that contains them must have been created
   /// by a non-subsumed event.
+  /// @default_steps 20
   val inv_subsumed_finalize_bookkeeping_only = PEERS.forall(p => {
     val st = nodes.get(p)
     val subsumed = subsumedEvents(st.clock)
@@ -2977,6 +3277,7 @@ module doltswarm_verify {
   })
 
   /// Finalization and parking are disjoint: parked events are never finalized.
+  /// @default_steps 20
   val inv_finalized_parked_disjoint = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_events.keys().intersect(st.parked_conflicts).empty()
@@ -2986,6 +3287,7 @@ module doltswarm_verify {
   /// if two different merge-first choices produce different intermediate heal
   /// tips, one later merge-of-merges step must reconcile them symmetrically
   /// while preserving all original finalized histories as ancestors.
+  /// @default_steps 20
   val inv_three_peer_partition_heal_reconcilable = PEERS.forall(p => PEERS.forall(q => PEERS.forall(r => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)

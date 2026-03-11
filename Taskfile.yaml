@@ -157,28 +157,52 @@ tasks:
 
       Options:
         SAMPLES     Number of random traces (default: 10000)
-        STEPS       Max steps per trace (default: 20)
-        INVARIANT   Specific invariant to check (default: all four)
+        STEPS       Max steps per trace; overrides annotated per-invariant defaults
+        VERBOSITY   Passed to quint --verbosity for richer trace output
+        INVARIANT   Specific invariant to check (default: all inv_* checks)
 
       Examples:
-        task quint:run                          # All invariants, 10k samples
-        task quint:run SAMPLES=50000 STEPS=30   # More thorough
-        task quint:run INVARIANT=agreement      # Single invariant
+        task quint:run                                                       # Full suite using per-invariant default steps
+        task quint:run STEPS=30                                              # Override annotated defaults for every invariant
+        task quint:run VERBOSITY=3 > /tmp/tests.log 2>&1                     # Capture more detailed output
+        task quint:run INVARIANT=inv_fullmesh_heal_bounded_converges         # Single invariant using its annotated step budget
+        task quint:run INVARIANT=inv_fullmesh_heal_bounded_converges SAMPLES=50000 STEPS=30
     dir: specs
     vars:
       SAMPLES: '{{.SAMPLES | default "10000"}}'
-      STEPS: '{{.STEPS | default "20"}}'
+      STEPS_ARG: "{{if .STEPS}} --steps={{.STEPS}}{{end}}"
+      VERBOSITY_ARG: "{{if .VERBOSITY}} --verbosity={{.VERBOSITY}}{{end}}"
+      INVARIANT_ARG: "{{if .INVARIANT}} --invariant={{.INVARIANT}}{{end}}"
+    cmds:
+      - python3 quint_invariants.py run --spec doltswarm_verify.qnt --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.VERBOSITY_ARG}}{{.INVARIANT_ARG}}
+
+  quint:benchmark:
+    desc: Benchmark Quint invariants and regenerate annotated step budgets
+    summary: |
+      Benchmark every inv_* check, estimate runtime at a chosen suite sample
+      count, regenerate specs/invariant-benchmarks.md, and rewrite the
+      @default_steps annotations in doltswarm_verify.qnt.
+
+      Options:
+        BENCH_SAMPLES   Number of benchmark traces per invariant (default: 1000)
+        BENCH_STEPS     Max steps for the benchmark pass (default: 20)
+        DEFAULT_SAMPLES Suite sample count used for estimates (default: 10000)
+        TARGET_SECONDS  Target engine time budget per invariant (default: 5)
+
+      Example:
+        task quint:benchmark
+    dir: specs
+    vars:
+      BENCH_SAMPLES: '{{.BENCH_SAMPLES | default "1000"}}'
+      BENCH_STEPS: '{{.BENCH_STEPS | default "20"}}'
+      DEFAULT_SAMPLES: '{{.DEFAULT_SAMPLES | default "10000"}}'
+      TARGET_SECONDS: '{{.TARGET_SECONDS | default "5"}}'
     cmds:
       - |
-        {{if .INVARIANT}}
-          quint run doltswarm_verify.qnt --backend=rust --invariant={{.INVARIANT}} --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
-        {{else}}
-          INVS=$(grep -o 'val inv_[a-z_]*' doltswarm_verify.qnt | sed 's/val //')
-          for inv in $INVS; do
-            echo "=== Checking $inv ==="
-            quint run doltswarm_verify.qnt --backend=rust --invariant=$inv --max-samples={{.SAMPLES}} --max-steps={{.STEPS}}
-          done
-        {{end}}
+        python3 quint_invariants.py benchmark --spec doltswarm_verify.qnt \
+        --benchmark-samples={{.BENCH_SAMPLES}} --benchmark-steps={{.BENCH_STEPS}} \
+        --default-samples={{.DEFAULT_SAMPLES}} --target-seconds={{.TARGET_SECONDS}} \
+        --output-markdown=invariant-benchmarks.md --write-annotations
 
   default:
     desc: Show available tasks

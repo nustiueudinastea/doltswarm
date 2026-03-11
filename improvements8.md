@@ -128,6 +128,26 @@ That is not the right safety target for an append-only merge-of-merges design. T
   - different 3-way heal orders may differ in the middle, but one later merge-of-merges step must reconcile them symmetrically.
 - Added `inv_three_peer_partition_heal_reconcilable`:
   - two different merge-first choices across three pairwise-divergent peers must remain joinable later while preserving the original finalized histories as ancestors.
+- Added a deterministic repeated-round heal harness for the 3-peer full-mesh case:
+  - `healRoundFullMesh`
+  - `healRoundsFullMesh`
+- Added bounded repeated-round convergence checks:
+  - `inv_fullmesh_heal_round_frontier_nonincreasing`
+  - `inv_fullmesh_heal_bounded_converges`
+  - `inv_fullmesh_heal_converged_absorbing`
+- Added explicit monotonicity / progress checks toward a bounded rank argument:
+  - `inv_sync_lineage_union_monotone`
+  - `inv_heal_frontier_nonincreasing`
+  - `inv_frontier_merge_strictly_decreases`
+  - `inv_unique_frontier_tip_is_absorbing`
+  - `inv_converged_finalized_state_absorbing`
+  - `inv_fullmesh_frontier_rank_strict_progress`
+  - `inv_fullmesh_unique_frontier_round_converges`
+- Added benchmark-driven execution support for the growing invariant suite:
+  - every `inv_*` now carries an `@default_steps` annotation in `specs/doltswarm_verify.qnt`
+  - `specs/quint_invariants.py` benchmarks invariants, rewrites those annotations, and runs the suite using them
+  - `specs/invariant-benchmarks.md` records the latest benchmark table and estimated runtime budgets
+  - `task quint:run` now uses the annotated per-invariant step defaults unless `STEPS=...` is supplied explicitly
 - Kept the existing bounded pairwise convergence checks in the liveness-oriented regression section, since they are still useful as lower-level guards.
 
 **Validation run.**
@@ -137,8 +157,22 @@ The following checks were run successfully after the protocol/spec change:
   - `inv_sync_merge_frontier_reduction`
   - `inv_sync_nested_merge_reconcilable`
   - `inv_three_peer_partition_heal_reconcilable`
+  - `inv_sync_lineage_union_monotone`
+  - `inv_heal_frontier_nonincreasing`
+  - `inv_frontier_merge_strictly_decreases`
+  - `inv_unique_frontier_tip_is_absorbing`
+  - `inv_converged_finalized_state_absorbing`
+  - `inv_fullmesh_heal_round_frontier_nonincreasing`
+  - `inv_fullmesh_frontier_rank_strict_progress`
+  - `inv_fullmesh_unique_frontier_round_converges`
+  - `inv_fullmesh_heal_bounded_converges`
+  - `inv_fullmesh_heal_converged_absorbing`
 - full bounded suite:
   - `task quint:run SAMPLES=300 STEPS=20`
+- benchmarked suite plumbing:
+  - `task quint:run INVARIANT=inv_lineage_lca_sound SAMPLES=20`
+  - `task quint:run INVARIANT=inv_finalized_agreement SAMPLES=20`
+  - `task quint:run INVARIANT=inv_finalized_agreement SAMPLES=5 STEPS=7`
 
 **Why this closes the issue.**
 
@@ -149,12 +183,19 @@ The spec now tests the actual protocol claim for partition healing:
 
 ## Remaining Follow-Up
 
-Round 8 fixes the protocol/spec mismatch and the immediate regression coverage, but one larger proof obligation remains open:
+Round 8 now covers both:
+- local merge-of-merges reconcilability, and
+- bounded repeated-round convergence under a deterministic fair full-mesh sync schedule in the 3-peer model,
+- plus a concrete two-phase progress story in that bounded model:
+  - frontier rank strictly decreases while the frontier is larger than one,
+  - once frontier rank reaches zero, one more full-mesh round converges finalized state.
+
+One larger proof obligation still remains open:
 
 - The current Quint checks are still bounded safety/regression checks.
-- They do not yet constitute a full liveness proof that, after quiescence and under the fairness assumptions in `doltswarm-protocol.md`, repeated healing rounds must eventually collapse any connected component's finalized frontier to one common tip.
+- They do not yet constitute a full liveness proof that, after quiescence and under the fairness assumptions in `doltswarm-protocol.md`, arbitrary fair healing schedules must eventually collapse any connected component's finalized frontier to one common tip.
 
 That follow-up should likely be done by adding:
-- stronger frontier-monotonicity invariants,
-- a component-level rank/progress measure,
+- arbitrary-schedule frontier-monotonicity invariants beyond the current deterministic full-mesh harness,
+- a component-level rank/progress measure for arbitrary schedules,
 - and possibly a dedicated heal-round harness or temporal property for `quint verify`.
