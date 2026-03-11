@@ -730,6 +730,24 @@ module doltswarm_verify {
       finalized_commit: FinalizedCommitID): Set[FinalizedCommitID] =
     lineageAncestors(parentsMap, finalized_commit)
 
+  /// Maximal finalized tips in a candidate set under the known finalized
+  /// lineage. Used by bounded partition-heal regressions to check that
+  /// repeated binary merges collapse the remaining incomparable frontier.
+  pure def finalizedTipFrontier(candidateTips: Set[FinalizedCommitID],
+      parentsMap: FinalizedCommitID -> Set[FinalizedCommitID]): Set[FinalizedCommitID] =
+    candidateTips.filter(tip =>
+      not(candidateTips.exists(other =>
+        other != tip and finalizedCommitIsAncestor(tip, other, parentsMap)
+      ))
+    )
+
+  pure def finalizedDescendsFromAll(finalized_commit: FinalizedCommitID,
+      requiredAncestors: Set[FinalizedCommitID],
+      parentsMap: FinalizedCommitID -> Set[FinalizedCommitID]): bool =
+    requiredAncestors.forall(ancestor =>
+      ancestorsAt(parentsMap, finalized_commit).contains(ancestor)
+    )
+
   pure def finalizedConflictID(oursFinalizedCommit: FinalizedCommitID,
       theirsFinalizedCommit: FinalizedCommitID,
       commonFinalizedCommit: FinalizedCommitID): FinalizedConflictID =
@@ -1134,6 +1152,16 @@ module doltswarm_verify {
     syncLineageReady(st_local, st_remote),
   }
 
+  pure def sameFinalizedState(st_a: NodeState, st_b: NodeState): bool = all {
+    st_a.finalized_commit_id == st_b.finalized_commit_id,
+    st_a.finalized_prolly_root_hash == st_b.finalized_prolly_root_hash,
+    st_a.finalized_events == st_b.finalized_events,
+    st_a.finalized_checkpoint_events == st_b.finalized_checkpoint_events,
+    st_a.finalized_commit_parents == st_b.finalized_commit_parents,
+    st_a.finalized_conflicts == st_b.finalized_conflicts,
+    st_a.resolved_finalized_conflict_ids == st_b.resolved_finalized_conflict_ids,
+  }
+
   /// Finalized-state update for SYNC_FINALIZED (without tentative_prolly_root_hash re-anchoring).
   pure def syncFinalizedCore(st_local: NodeState, st_remote: NodeState): NodeState = {
     val mode = syncMode(st_local, st_remote)
@@ -1189,6 +1217,10 @@ module doltswarm_verify {
         st_remote.finalized_commit_id,
         mergedParents
       )
+      // One binary finalized frontier-reduction step. This is deterministic for
+      // the current pair of incomparable tips, but nested partition recovery is
+      // not modeled as one-shot associativity over >2 tips. Later sync rounds
+      // may merge these merge commits again without rewriting history.
       // Deterministic ours/theirs: compare finalized-commit ids lexicographically.
       val oursFinalizedCommit = if (finalizedCommitLess(st_local.finalized_commit_id, st_remote.finalized_commit_id))
         st_local.finalized_commit_id else st_remote.finalized_commit_id
@@ -1938,15 +1970,47 @@ module doltswarm_verify {
     }
   }))
 
-  /// Nested-merge determinism check:
-  /// sync(sync(A,B),C) and sync(A,sync(B,C)) converge on finalized state
-  /// under merge-mode preconditions.
-  val inv_sync_nested_merge_determinism = PEERS.forall(p => PEERS.forall(q => PEERS.forall(r => {
+  /// SYNC_FINALIZED merge branch reduces the pairwise finalized frontier to a
+  /// single descendant tip while preserving both inputs as ancestors.
+  val inv_sync_merge_frontier_reduction = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = nodes.get(p)
+    val st_q = nodes.get(q)
+    val synced = applySyncFinalized(st_p, st_q)
+    val frontierAfter = finalizedTipFrontier(
+      Set(st_p.finalized_commit_id, st_q.finalized_commit_id, synced.finalized_commit_id),
+      synced.finalized_commit_parents
+    )
+    (syncEnabled(connected, p, q, st_p, st_q) and syncMode(st_p, st_q) == SYNC_MERGE) implies all {
+      frontierAfter == Set(synced.finalized_commit_id),
+      finalizedDescendsFromAll(
+        synced.finalized_commit_id,
+        Set(st_p.finalized_commit_id, st_q.finalized_commit_id),
+        synced.finalized_commit_parents
+      ),
+    }
+  }))
+
+  /// Nested partition-heal regression:
+  /// different 3-way heal orders may produce different intermediate merge
+  /// commits, but those commits must themselves be merge-reconcilable later
+  /// without rewriting earlier finalized history.
+  val inv_sync_nested_merge_reconcilable = PEERS.forall(p => PEERS.forall(q => PEERS.forall(r => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
     val st_r = nodes.get(r)
     val left = applySyncFinalized(applySyncFinalized(st_p, st_q), st_r)
     val right = applySyncFinalized(st_p, applySyncFinalized(st_q, st_r))
+    val reconciled = applySyncFinalized(left, right)
+    val reconciledRev = applySyncFinalized(right, left)
+    val frontierAfter = finalizedTipFrontier(
+      Set(
+        st_p.finalized_commit_id,
+        st_q.finalized_commit_id,
+        st_r.finalized_commit_id,
+        reconciled.finalized_commit_id
+      ),
+      reconciled.finalized_commit_parents
+    )
     (p != q and q != r and p != r and
       syncEnabled(connected, p, q, st_p, st_q) and
       syncEnabled(connected, q, r, st_q, st_r) and
@@ -1954,11 +2018,13 @@ module doltswarm_verify {
       syncMode(st_p, st_q) == SYNC_MERGE and
       syncMode(st_q, st_r) == SYNC_MERGE and
       syncMode(st_p, st_r) == SYNC_MERGE) implies all {
-      left.finalized_commit_id == right.finalized_commit_id,
-      left.finalized_prolly_root_hash == right.finalized_prolly_root_hash,
-      left.finalized_events == right.finalized_events,
-      left.finalized_checkpoint_events == right.finalized_checkpoint_events,
-      left.resolved_finalized_conflict_ids == right.resolved_finalized_conflict_ids,
+      sameFinalizedState(reconciled, reconciledRev),
+      frontierAfter == Set(reconciled.finalized_commit_id),
+      finalizedDescendsFromAll(
+        reconciled.finalized_commit_id,
+        Set(st_p.finalized_commit_id, st_q.finalized_commit_id, st_r.finalized_commit_id),
+        reconciled.finalized_commit_parents
+      ),
     }
   })))
 
@@ -2916,15 +2982,27 @@ module doltswarm_verify {
     st.finalized_events.keys().intersect(st.parked_conflicts).empty()
   })
 
-  /// Three-peer partition-heal regression: if three peers have pairwise
-  /// divergent finalized histories and all pairwise finalized syncs are in
-  /// merge mode, healing/sync order must converge on the same finalized state.
-  val inv_three_peer_partition_heal_converges = PEERS.forall(p => PEERS.forall(q => PEERS.forall(r => {
+  /// Three-peer partition-heal regression:
+  /// if two different merge-first choices produce different intermediate heal
+  /// tips, one later merge-of-merges step must reconcile them symmetrically
+  /// while preserving all original finalized histories as ancestors.
+  val inv_three_peer_partition_heal_reconcilable = PEERS.forall(p => PEERS.forall(q => PEERS.forall(r => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
     val st_r = nodes.get(r)
     val left = applySyncFinalized(applySyncFinalized(st_p, st_q), st_r)
     val right = applySyncFinalized(applySyncFinalized(st_p, st_r), st_q)
+    val reconciled = applySyncFinalized(left, right)
+    val reconciledRev = applySyncFinalized(right, left)
+    val frontierAfter = finalizedTipFrontier(
+      Set(
+        st_p.finalized_commit_id,
+        st_q.finalized_commit_id,
+        st_r.finalized_commit_id,
+        reconciled.finalized_commit_id
+      ),
+      reconciled.finalized_commit_parents
+    )
     (p != q and q != r and p != r and
       syncEnabled(connected, p, q, st_p, st_q) and
       syncEnabled(connected, p, r, st_p, st_r) and
@@ -2932,13 +3010,13 @@ module doltswarm_verify {
       syncMode(st_p, st_q) == SYNC_MERGE and
       syncMode(st_p, st_r) == SYNC_MERGE and
       syncMode(st_q, st_r) == SYNC_MERGE) implies all {
-        left.finalized_commit_id == right.finalized_commit_id,
-        left.finalized_prolly_root_hash == right.finalized_prolly_root_hash,
-        left.finalized_events == right.finalized_events,
-        left.finalized_commit_parents == right.finalized_commit_parents,
-        left.finalized_checkpoint_events == right.finalized_checkpoint_events,
-        left.finalized_conflicts == right.finalized_conflicts,
-        left.resolved_finalized_conflict_ids == right.resolved_finalized_conflict_ids,
+        sameFinalizedState(reconciled, reconciledRev),
+        frontierAfter == Set(reconciled.finalized_commit_id),
+        finalizedDescendsFromAll(
+          reconciled.finalized_commit_id,
+          Set(st_p.finalized_commit_id, st_q.finalized_commit_id, st_r.finalized_commit_id),
+          reconciled.finalized_commit_parents
+        ),
       }
   })))
 
