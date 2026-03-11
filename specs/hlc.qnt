@@ -5,6 +5,8 @@
  *
  * Provides a total order over distributed events using (wall, logical, peer)
  * tuples. This is the foundation for deterministic event ordering.
+ * The module is intentionally independent of transport and Dolt adapter
+ * mechanics; it models only identity/ordering semantics.
  *
  * Abstraction: wall times are small integers (1..MAX_WALL) rather than
  * nanoseconds. The ordering math is identical.
