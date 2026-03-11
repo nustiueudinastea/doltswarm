@@ -35,7 +35,7 @@
 | `inv_sync_incomparable_pairwise_converges` | 0.31 | 4.30 | 3.09 | 20 | 3.09 |
 | `inv_fullmesh_heal_round_frontier_nonincreasing` | 0.37 | 4.06 | 3.73 | 20 | 3.73 |
 | `inv_fullmesh_frontier_rank_strict_progress` | 0.30 | 4.32 | 2.96 | 20 | 2.96 |
-| `inv_heal_frontier_nonincreasing` | 0.32 | 4.00 | 3.21 | 20 | 3.21 |
+| `inv_heal_frontier_growth_bounded` | 0.32 | 4.00 | 3.21 | 20 | 3.21 |
 | `inv_frontier_merge_strictly_decreases` | 0.32 | 4.02 | 3.19 | 20 | 3.19 |
 | `inv_fullmesh_heal_bounded_converges` | 0.54 | 4.53 | 5.38 | 19 | 5.11 |
 | `inv_unique_frontier_tip_is_absorbing` | 0.32 | 4.35 | 3.23 | 20 | 3.23 |

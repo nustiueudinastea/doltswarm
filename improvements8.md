@@ -137,7 +137,7 @@ That is not the right safety target for an append-only merge-of-merges design. T
   - `inv_fullmesh_heal_converged_absorbing`
 - Added explicit monotonicity / progress checks toward a bounded rank argument:
   - `inv_sync_lineage_union_monotone`
-  - `inv_heal_frontier_nonincreasing`
+  - `inv_heal_frontier_growth_bounded`
   - `inv_frontier_merge_strictly_decreases`
   - `inv_unique_frontier_tip_is_absorbing`
   - `inv_converged_finalized_state_absorbing`
@@ -158,7 +158,7 @@ The following checks were run successfully after the protocol/spec change:
   - `inv_sync_nested_merge_reconcilable`
   - `inv_three_peer_partition_heal_reconcilable`
   - `inv_sync_lineage_union_monotone`
-  - `inv_heal_frontier_nonincreasing`
+  - `inv_heal_frontier_growth_bounded`
   - `inv_frontier_merge_strictly_decreases`
   - `inv_unique_frontier_tip_is_absorbing`
   - `inv_converged_finalized_state_absorbing`

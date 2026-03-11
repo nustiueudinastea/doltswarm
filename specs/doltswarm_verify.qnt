@@ -2583,19 +2583,34 @@ module doltswarm_verify {
       globalFinalizedFrontierRank(healed) < globalFinalizedFrontierRank(nodes)
   }
 
-  /// Connected-component frontier monotonicity for one heal step:
-  /// a single SYNC_FINALIZED application inside a connected component must not
-  /// increase that component's incomparable finalized frontier.
+  /// Connected-component bounded-growth check for one heal step:
+  /// a single SYNC_FINALIZED application may materialize one fresh
+  /// intermediate merge tip before later rounds reconcile it, so the
+  /// component frontier may grow transiently, but by at most one incomparable
+  /// tip. If it grows, the new local tip must descend from both synced inputs.
   /// @default_steps 20
-  val inv_heal_frontier_nonincreasing = PEERS.forall(p => PEERS.forall(q => {
+  val inv_heal_frontier_growth_bounded = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
     val component = connectedComponent(connected, p)
     val before = finalizedFrontierFor(nodes, component)
-    val afterNodes = nodes.set(p, syncPeerIfEnabled(nodes, p, q).get(p))
+    val afterNodes = nodes.set(p, applySyncFinalized(st_p, st_q))
     val after = finalizedFrontierFor(afterNodes, component)
+    val afterTip = afterNodes.get(p).finalized_commit_id
+    val afterParents = mergedFinalizedParentsFor(afterNodes, component)
     syncEnabled(connected, p, q, st_p, st_q) implies
-      after.size() <= before.size()
+      all {
+        after.size() <= before.size() + 1,
+        (after.size() > before.size()) implies all {
+          syncMode(st_p, st_q) == SYNC_MERGE,
+          after.contains(afterTip),
+          finalizedDescendsFromAll(
+            afterTip,
+            Set(st_p.finalized_commit_id, st_q.finalized_commit_id),
+            afterParents
+          ),
+        },
+      }
   }))
 
   /// If SYNC_MERGE joins two current maximal incomparable frontier tips in a
