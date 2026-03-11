@@ -120,8 +120,8 @@ module doltswarm_verify {
     prolly_root_hash: ProllyRootHash,
     anchor_prolly_root_hash: ProllyRootHash,
     parent_event_ids: Set[EventID],
-    resolved_parked_event_ids: Set[EventID],
-    resolved_finalized_conflicts: Set[FinalizedConflictID],
+    resolved_parked_event_id: Option[EventID],
+    resolved_finalized_conflict_id: Option[FinalizedConflictID],
     hlc: HLC,
     peer: PeerID,
   }
@@ -292,12 +292,13 @@ module doltswarm_verify {
     isProtocolRootHash(e.anchor_prolly_root_hash),
     e.prolly_root_hash != CONFLICT_HASH,
     e.anchor_prolly_root_hash != CONFLICT_HASH,
-    e.resolved_parked_event_ids.size() <= 1,
-    e.resolved_finalized_conflicts.size() <= 1,
-    // Mutual exclusivity: at most one resolution field is non-empty.
-    not(e.resolved_parked_event_ids.size() > 0 and e.resolved_finalized_conflicts.size() > 0),
+    // Mutual exclusivity: at most one resolution field is present.
+    not(e.resolved_parked_event_id != None and e.resolved_finalized_conflict_id != None),
     // If resolving a parked event, that event must be a parent.
-    e.resolved_parked_event_ids.subseteq(e.parent_event_ids),
+    match e.resolved_parked_event_id {
+      | Some(pid) => e.parent_event_ids.contains(pid)
+      | None => true
+    },
     not(e.parent_event_ids.contains(e.event_id)),
   }
 
@@ -369,7 +370,10 @@ module doltswarm_verify {
   /// resolved. These events are finalized as bookkeeping-only entries.
   pure def subsumedEvents(clock: EventID -> Event): Set[EventID] =
     clock.keys().fold(Set(), (acc, event_id) =>
-      acc.union(clock.get(event_id).resolved_parked_event_ids)
+      match clock.get(event_id).resolved_parked_event_id {
+        | Some(pid) => acc.union(Set(pid))
+        | None => acc
+      }
     )
 
   /// Ancestor-ID closure from a seed set by repeatedly following parent links.
@@ -817,8 +821,8 @@ module doltswarm_verify {
       prolly_root_hash: resolvedContent,
       anchor_prolly_root_hash: st.finalized_prolly_root_hash,
       parent_event_ids: activeHeads,
-      resolved_parked_event_ids: Set(),
-      resolved_finalized_conflicts: Set(conflictID),
+      resolved_parked_event_id: None,
+      resolved_finalized_conflict_id: Some(conflictID),
       hlc: newHLC,
       peer: p,
     }
@@ -855,8 +859,8 @@ module doltswarm_verify {
       prolly_root_hash: content,
       anchor_prolly_root_hash: st.finalized_prolly_root_hash,
       parent_event_ids: st.projection_basis,
-      resolved_parked_event_ids: Set(),
-      resolved_finalized_conflicts: Set(),
+      resolved_parked_event_id: None,
+      resolved_finalized_conflict_id: None,
       hlc: newHLC,
       peer: p,
     }
@@ -929,7 +933,10 @@ module doltswarm_verify {
           st.finalized_checkpoint_events.get(st.finalized_commit_id).put(nextEventID, nextEvent.prolly_root_hash)
         else
           Map().put(nextEventID, nextEvent.prolly_root_hash)
-        val nextResolvedClaims = nextEvent.resolved_finalized_conflicts
+        val nextResolvedClaims = match nextEvent.resolved_finalized_conflict_id {
+          | Some(cid) => Set(cid)
+          | None => Set()
+        }
         val withSubsumed: NodeState = {
           ...st,
           // finalized_commit_id unchanged
@@ -959,7 +966,10 @@ module doltswarm_verify {
           else
             Set(st.finalized_commit_id)
           val nextFinalizedCommit = makeFinalizedCheckpointCommitID(nextRoot, nextParents)
-          val nextResolvedClaims = nextEvent.resolved_finalized_conflicts
+          val nextResolvedClaims = match nextEvent.resolved_finalized_conflict_id {
+            | Some(cid) => Set(cid)
+            | None => Set()
+          }
           val nextCheckpoint = if (st.finalized_checkpoint_events.has(nextFinalizedCommit))
             st.finalized_checkpoint_events.get(nextFinalizedCommit).put(nextEventID, nextEvent.prolly_root_hash)
           else
@@ -1018,8 +1028,8 @@ module doltswarm_verify {
       prolly_root_hash: resolvedContent,
       anchor_prolly_root_hash: st.finalized_prolly_root_hash,
       parent_event_ids: resolveParents,
-      resolved_parked_event_ids: Set(parkedEventID),
-      resolved_finalized_conflicts: Set(),
+      resolved_parked_event_id: Some(parkedEventID),
+      resolved_finalized_conflict_id: None,
       hlc: newHLC,
       peer: p,
     }
@@ -1327,8 +1337,8 @@ module doltswarm_verify {
         prolly_root_hash: content,
         anchor_prolly_root_hash: st.finalized_prolly_root_hash,
         parent_event_ids: st.projection_basis,
-        resolved_parked_event_ids: Set(),
-        resolved_finalized_conflicts: Set(),
+        resolved_parked_event_id: None,
+        resolved_finalized_conflict_id: None,
         hlc: newHLC,
         peer: p,
       }
@@ -1686,8 +1696,8 @@ module doltswarm_verify {
         prolly_root_hash: resolvedContent,
         anchor_prolly_root_hash: st.finalized_prolly_root_hash,
         parent_event_ids: resolveParents,
-        resolved_parked_event_ids: Set(parkedEventID),
-        resolved_finalized_conflicts: Set(),
+        resolved_parked_event_id: Some(parkedEventID),
+        resolved_finalized_conflict_id: None,
         hlc: newHLC,
         peer: p,
       }
@@ -2245,7 +2255,7 @@ module doltswarm_verify {
             resolvedState.finalized_checkpoint_events == st.finalized_checkpoint_events,
             resolvedState.finalized_conflicts == st.finalized_conflicts,
             resolvedState.resolved_finalized_conflict_ids == st.resolved_finalized_conflict_ids,
-            emitted.resolved_finalized_conflicts == Set(conflictID),
+            emitted.resolved_finalized_conflict_id == Some(conflictID),
             emitted.anchor_prolly_root_hash == st.finalized_prolly_root_hash,
             resolvedState.chunks_ready.contains(emittedEventID),
             resolvedState.peer_seen_frontier.get(p) == observedFrontier(resolvedState.clock),
@@ -2440,8 +2450,8 @@ module doltswarm_verify {
           post.clock.has(emittedEventID),
           emitted.parent_event_ids == st.projection_basis.union(Set(parkedEventID)),
           emitted.anchor_prolly_root_hash == st.finalized_prolly_root_hash,
-          emitted.resolved_parked_event_ids == Set(parkedEventID),
-          emitted.resolved_finalized_conflicts.empty(),
+          emitted.resolved_parked_event_id == Some(parkedEventID),
+          emitted.resolved_finalized_conflict_id == None,
           not(post.head_event_ids.contains(parkedEventID)),
           not(post.parked_conflicts.contains(parkedEventID)),
           post.finalized_commit_id == st.finalized_commit_id,
@@ -2846,15 +2856,16 @@ module doltswarm_verify {
   })
 
   /// INV9b: Every subsumed event has a parent link from its resolver.
-  /// The event that carries resolved_parked_event_ids must include the
+  /// The event that carries resolved_parked_event_id must include the
   /// subsumed event in its parent_event_ids.
   val inv_subsumed_parent_link = PEERS.forall(p => {
     val st = nodes.get(p)
     st.clock.keys().forall(event_id => {
       val ev = st.clock.get(event_id)
-      ev.resolved_parked_event_ids.forall(sub_id =>
-        ev.parent_event_ids.contains(sub_id)
-      )
+      match ev.resolved_parked_event_id {
+        | Some(sub_id) => ev.parent_event_ids.contains(sub_id)
+        | None => true
+      }
     })
   })
 
