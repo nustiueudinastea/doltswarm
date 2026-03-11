@@ -246,21 +246,27 @@ TentativeCommitID = optional local-only tentative materialization handle
                   -- branch/ref name, working-set handle, or keep it implicit
 
 FinalizedConflictID = Hash
-                    -- hash(serialize(ours_finalized_commit_id, theirs_finalized_commit_id, common_finalized_commit_id))
+                    -- hash(CanonicalEncode(
+                    --   ours_finalized_commit_id,
+                    --   theirs_finalized_commit_id,
+                    --   common_finalized_commit_id
+                    -- ))
+                    -- Only this structural triple participates in finalized-conflict identity.
+                    -- Presentation fields such as table names, row details, and human-readable
+                    -- diagnostics MUST NOT affect FinalizedConflictID, finalized metadata digests,
+                    -- or finalized-state sync behavior.
 
-FinalizedConflictInfo = {
+FinalizedConflictRecord = {
   id:         FinalizedConflictID,
   ours_finalized_commit_id:  FinalizedCommitID,
   theirs_finalized_commit_id: FinalizedCommitID,
   common_finalized_commit_id: FinalizedCommitID,
-  tables:     Set[string],
-  details:    string,
 }
 
 FinalizedMetadataPayload = (
   finalized_commit_parents: Map[FinalizedCommitID, Set[FinalizedCommitID]],
   finalized_checkpoint_events: Map[FinalizedCommitID, FinalizedCheckpointDescriptor],
-  finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictInfo],
+  finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictRecord],
   resolved_finalized_conflict_ids: Set[FinalizedConflictID]
 )
 
@@ -298,7 +304,7 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 | `finalized_commit_parents` | `Map[FinalizedCommitID, Set[FinalizedCommitID]]` | Synchronized finalized-history lineage metadata (`child_commit_id -> parent_commit_ids`) extracted from already-materialized finalized commit payloads. Used for ancestry/LCA and sync, but not the source of finalized commit identity. |
 | `finalized_checkpoint_events` | `Map[FinalizedCommitID, FinalizedCheckpointDescriptor]` | Synchronized per-checkpoint finalized metadata: for each checkpoint finalized commit, the set of hardened event ids whose compilation collapsed to that finalized commit id (`event_id -> prolly_root_hash`). Used to reconstruct local `finalized_events` from finalized history without synchronizing a full event catalog. Merge commits have no entry. |
 | `parked_conflicts` | `Set[EventID]` | Authoritative set of parked events (later in total order, conflicted at merge). Excluded from LOCAL_WRITE parents and finalization. During closure lag (some heads not mergeable yet), unresolved parked head IDs are retained conservatively until closure completes and reconciliation recomputes against a complete mergeable set. |
-| `finalized_conflicts` | `Map[FinalizedConflictID, FinalizedConflictInfo]` | Synchronized finalized-layer conflict metadata: open conflicts detected in `SYNC_FINALIZED` divergence merges. These remain open until the corresponding resolution claim hardens into finalized state. |
+| `finalized_conflicts` | `Map[FinalizedConflictID, FinalizedConflictRecord]` | Synchronized finalized-layer conflict metadata: open structural conflict records detected in `SYNC_FINALIZED` divergence merges. These remain open until the corresponding resolution claim hardens into finalized state. Human-readable diagnostics are local-only and are not synchronized. |
 | `resolved_finalized_conflict_ids` | `Set[FinalizedConflictID]` | Durable synchronized finalized-layer resolution state: the set of conflict ids already resolved in finalized state. This is the authoritative anti-resurrection state; event-carried resolution refs are claims, not the source of truth. |
 | `active_peers` | `Set[PeerID]` | Peers seen in the last heartbeat window; this is the current witness set for finalization |
 
@@ -567,7 +573,7 @@ Triggered when a peer detects either a different `finalized_commit_id` or a diff
    - current finalized commit/prolly-root pair (`finalized_commit_id`, `finalized_prolly_root_hash`)
    - derived finalized commit lineage metadata (`finalized_commit_parents`)
    - derived checkpoint-commit descriptors (`finalized_checkpoint_events`)
-   - open finalized-conflict metadata (`finalized_conflicts`)
+   - open finalized-conflict records (`finalized_conflicts`)
    - durable finalized conflict resolutions (`resolved_finalized_conflict_ids`)
    Compute merged metadata:
    - `merged_finalized_commit_parents = our_finalized_commit_parents ∪ their_finalized_commit_parents`
@@ -575,6 +581,7 @@ Triggered when a peer detects either a different `finalized_commit_id` or a diff
    - `merged_resolved_ids = our_resolved_finalized_conflict_ids ∪ their_resolved_finalized_conflict_ids`
    - `merged_conflicts = (our_finalized_conflicts ∪ their_finalized_conflicts) \ merged_resolved_ids`
    - `finalized_events` is then reconstructed locally as `DeriveFinalizedEventCatalog(resulting_finalized_commit_id, merged_finalized_commit_parents, merged_finalized_checkpoint_events)`: the union of checkpoint descriptors reachable from the resulting finalized tip.
+   - Any table names, row details, or human-readable diagnostics for a finalized conflict are local advisory metadata derived from the structural triple `(ours_finalized_commit_id, theirs_finalized_commit_id, common_finalized_commit_id)` and MUST NOT be synchronized or hashed into `finalized_metadata_digest`.
 2. Classify sync mode from finalized-commit lineage (not event-set subset):
    - **ADOPT** if `our_finalized_commit_id` is an ancestor of `their_finalized_commit_id` in `merged_finalized_commit_parents`.
    - **NOOP** if `our_finalized_commit_id = their_finalized_commit_id` OR `their_finalized_commit_id` is an ancestor of `our_finalized_commit_id` in `merged_finalized_commit_parents`.
@@ -606,10 +613,10 @@ Triggered when a peer detects either a different `finalized_commit_id` or a diff
       - `Ok(merged)`: `finalized_prolly_root_hash ← merged`
       - `Conflict(tables, details)`:
         - `finalized_prolly_root_hash ← content(our_finalized_commit_id)` (deterministic)
-        - `conflict_id = hash(serialize(our_finalized_commit_id, their_finalized_commit_id, common_finalized_commit_id))`
+        - `conflict_id = hash(CanonicalEncode(our_finalized_commit_id, their_finalized_commit_id, common_finalized_commit_id))`
         - Start from `base_conflicts = merged_conflicts`.
-        - If `conflict_id ∉ merged_resolved_ids`, set `finalized_conflicts[conflict_id] ← { id: conflict_id, ours_finalized_commit_id: our_finalized_commit_id, theirs_finalized_commit_id: their_finalized_commit_id, common_finalized_commit_id, tables, details }` on top of `base_conflicts`; otherwise keep `base_conflicts` unchanged.
-        - Surface conflict to user (which tables, which rows, `conflict_id`). No blocking — finalization continues immediately.
+        - If `conflict_id ∉ merged_resolved_ids`, set `finalized_conflicts[conflict_id] ← { id: conflict_id, ours_finalized_commit_id: our_finalized_commit_id, theirs_finalized_commit_id: their_finalized_commit_id, common_finalized_commit_id }` on top of `base_conflicts`; otherwise keep `base_conflicts` unchanged.
+        - Surface conflict to the user using locally-derived diagnostics (for example which tables or rows conflict) keyed by `conflict_id`. Those diagnostics are advisory only and MUST NOT affect synchronized finalized metadata. No blocking — finalization continues immediately.
    6. Merge finalized bookkeeping:
       - `finalized_commit_parents ← merged_finalized_commit_parents`
       - `finalized_checkpoint_events ← merged_finalized_checkpoint_events`
@@ -723,7 +730,7 @@ The formal Quint specification lives in `specs/`. See `specs/doltswarm_verify.qn
 - **Event fields and admission:** The spec's `Event` includes `anchor_prolly_root_hash`, `resolved_parked_event_id: Option[EventID]`, and `resolved_finalized_conflict_id: Option[FinalizedConflictID]`, matching the protocol's `Optional` representation directly. `validEvent(e)` enforces mutual exclusivity: at most one of the two resolution fields is `Some`. The swarm-wide admission predicate is abstracted as `validEvent(e)`, so the model captures uniform admission semantics without fixing one concrete auth envelope.
 - **Subsumption:** The protocol defines `SubsumedEvents(clock)` as the set of event IDs referenced by any clock event's `resolved_parked_event_id`. The spec models this identically via `subsumedEvents(st)`. `ADVANCE_STABILITY` / `do_finalize` checks subsumption before replay: subsumed events get bookkeeping-only finalization (no `MergeRoots`, no new checkpoint commit), while non-subsumed events follow the normal replay path.
 - **`parked_conflicts` type:** Authoritative semantics are set-based in both protocol and spec (`Set[EventID]`).
-- **`finalized_conflicts` type:** The protocol defines `finalized_conflicts: Map[FinalizedConflictID, FinalizedConflictInfo]` (includes table/detail presentation metadata). The spec models `finalized_conflicts` as a map keyed by the same deterministic conflict ID, but tracks only the structural finalized-commit tuple (`ours_finalized_commit_id`, `theirs_finalized_commit_id`, `common_finalized_commit_id`) needed for state-machine checks.
+- **`finalized_conflicts` type:** The protocol and spec both define `finalized_conflicts` as structural conflict records keyed by the deterministic `FinalizedConflictID`, containing only the finalized-commit triple (`ours_finalized_commit_id`, `theirs_finalized_commit_id`, `common_finalized_commit_id`). Any human-readable diagnostics (table names, row details, messages) are local advisory metadata and are outside synchronized protocol state.
 - **Heartbeat frontier exchange:** The protocol heartbeat carries `head_event_ids_digest`, the full `seen_frontier`, the finalized commit/prolly-root pair, and a `finalized_metadata_digest` over the abstract control plane. The spec's `do_heartbeat` reads the sender's node state directly, updates the stored `peer_seen_frontier`, and pulls the same closure target without modeling message serialization.
 - **Heartbeat as direct state read:** The protocol disseminates heartbeat messages carrying `head_event_ids_digest` plus the full seen frontier. Receivers compare only the head-event-id digest; the frontier itself is refreshed directly from the heartbeat. The spec's `do_heartbeat` reads the sender's node state directly (no heartbeat inbox, no digest compare for head event IDs) as a standard model-checking simplification; it does not model heartbeat loss or reordering.
 - **Pull-on-demand scope:** The protocol (§2.4 HEARTBEAT steps 2-4) compares `head_event_ids_digest`, obtains the full remote head-event-id set only on mismatch, and always uses the received full seen frontier when recursively pulling missing ancestor closure for their union. The spec models the same closure pull target while still treating heartbeat as direct state read and skipping the digest message mechanics.

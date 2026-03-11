@@ -42,6 +42,9 @@
  *   metadata derived from materialized finalized commits, not the source of
  *   finalized commit identity. One finalized checkpoint commit may subsume
  *   multiple hardened event ids without changing the finalized commit DAG.
+ *   finalized_conflicts is structural-only metadata keyed by the finalized
+ *   conflict triple; any table names, row details, or human-readable
+ *   diagnostics are local advisory metadata and remain outside the model.
  * - Local finalized bookkeeping:
  *   finalized_events, reconstructed from the finalized tip plus reachable
  *   checkpoint descriptors rather than synchronized directly as the primary
@@ -112,7 +115,9 @@ module doltswarm_verify {
   type FinalizedCommitID = (ProllyRootHash, int, int)
 
   /// Deterministic identity for a finalized-layer conflict from SYNC_FINALIZED.
-  /// Canonical tuple: (ours_finalized_commit_id, theirs_finalized_commit_id, common_finalized_commit_id).
+  /// Canonical tuple: (ours_finalized_commit_id, theirs_finalized_commit_id,
+  /// common_finalized_commit_id). Only this structural triple participates in
+  /// identity; local diagnostics are intentionally out of model.
   type FinalizedConflictID = (FinalizedCommitID, FinalizedCommitID, FinalizedCommitID)
 
   type Event = {
@@ -126,6 +131,8 @@ module doltswarm_verify {
     peer: PeerID,
   }
 
+  /// Structural finalized-conflict record synchronized by the protocol.
+  /// Human-readable diagnostics are intentionally omitted from replicated state.
   type FinalizedConflict = {
     id: FinalizedConflictID,
     ours_finalized_commit_id: FinalizedCommitID,
@@ -616,6 +623,7 @@ module doltswarm_verify {
   }
 
   /// Merge two finalized-conflict maps by key union.
+  /// Because records are structural-only, equal keys imply equal logical facts.
   pure def mergeFinalizedConflictMap(
       m1: FinalizedConflictID -> FinalizedConflict,
       m2: FinalizedConflictID -> FinalizedConflict): FinalizedConflictID -> FinalizedConflict = {
@@ -725,6 +733,7 @@ module doltswarm_verify {
   pure def finalizedConflictID(oursFinalizedCommit: FinalizedCommitID,
       theirsFinalizedCommit: FinalizedCommitID,
       commonFinalizedCommit: FinalizedCommitID): FinalizedConflictID =
+    // Structural-only identity: no presentation metadata participates.
     (oursFinalizedCommit, theirsFinalizedCommit, commonFinalizedCommit)
 
   /// Remove one key from a map via key reconstruction (portable Quint idiom).
