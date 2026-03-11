@@ -563,6 +563,15 @@ module doltswarm_verify {
   pure def retainedFinalizedEventIDs(st: NodeState): Set[EventID] =
     st.finalized_events.keys().intersect(st.clock.keys())
 
+  /// Retained finalized events that cannot safely remain materialized locally.
+  /// These must be compacted even if some non-finalized retained event still
+  /// points at them; the tentative side then remains provisional until closure
+  /// is repaired later.
+  pure def invalidRetainedFinalizedEventIDs(st: NodeState): Set[EventID] =
+    retainedFinalizedEventIDs(st).filter(event_id =>
+      not(isParentClosed(st.clock, event_id) and st.chunks_ready.contains(event_id))
+    )
+
   pure def gcPruneable(st: NodeState): Set[EventID] =
     retainedFinalizedEventIDs(st).filter(finalized_event_id =>
       not(st.clock.keys().exists(event_id =>
@@ -572,10 +581,12 @@ module doltswarm_verify {
     )
 
   /// Optional compaction pass used after finalized sync to restore the
-  /// retained finalized subgraph to a parent-closed shape before reconcile.
+  /// retained finalized subgraph to a parent-closed, ready-only shape before
+  /// reconcile. Finalized event bodies that remain orphaned or unready are
+  /// compacted even if a non-finalized retained event still depends on them.
   pure def compactRetainedFinalized(st: NodeState): NodeState = {
     val compacted = range(0, MAX_EVENTS).foldl(st, (accSt, _) => {
-      val pruneable = gcPruneable(accSt)
+      val pruneable = gcPruneable(accSt).union(invalidRetainedFinalizedEventIDs(accSt))
       val newClock = pruneable.fold(accSt.clock, (clockAcc, event_id) =>
         dropEvent(clockAcc, event_id)
       )
@@ -1405,13 +1416,37 @@ module doltswarm_verify {
         projection_basis: reconcileResult._3,
       }
     } else {
-      // NOOP: tip unchanged, but compaction (if any) may have changed the
-      // retained clock and head_event_ids, so tentative projection must be
-      // recomputed from the post-compaction state rather than preserved from
-      // the pre-sync local state.
-      val noopReconcile = computeTentativeProjection(cleaned)
-      {
+      // NOOP: tip unchanged, but equal-tip metadata repair can still expose
+      // retained finalized event bodies that must be hydrated/marked ready
+      // before local compaction + tentative projection recomputation.
+      val noopHydratedClosure =
+        if (bookkeepingChanged)
+          pullClosureEventIDs(
+            cleaned.clock,
+            st_remote.clock,
+            retainedFinalizedEventIDs(cleaned),
+            Set()
+          )
+        else
+          Set()
+      val noopHydratedClock = applyRemoteEvents(
+        cleaned.clock,
+        st_remote.clock,
+        noopHydratedClosure
+      )
+      val noopRetainedFinalizedReady = noopHydratedClock.keys().intersect(cleaned.finalized_events.keys())
+      val withNoopRetainedFinalizedReady: NodeState = {
         ...cleaned,
+        clock: noopHydratedClock,
+        head_event_ids: computeHeadEventIDs(noopHydratedClock),
+        chunks_ready: cleaned.chunks_ready.union(noopRetainedFinalizedReady),
+      }
+      val noopCompactedState =
+        if (bookkeepingChanged) compactRetainedFinalized(withNoopRetainedFinalizedReady)
+        else withNoopRetainedFinalizedReady
+      val noopReconcile = computeTentativeProjection(noopCompactedState)
+      {
+        ...noopCompactedState,
         tentative_prolly_root_hash: noopReconcile._1,
         parked_conflicts: noopReconcile._2,
         projection_basis: noopReconcile._3,
