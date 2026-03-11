@@ -1280,13 +1280,16 @@ module doltswarm_verify {
         projection_basis: reconcileResult._3,
       }
     } else {
-      // NOOP: tip unchanged, preserve tentative state. Compaction (if any)
-      // already handled above via bookkeepingChanged.
+      // NOOP: tip unchanged, but compaction (if any) may have changed the
+      // retained clock and head_event_ids, so tentative projection must be
+      // recomputed from the post-compaction state rather than preserved from
+      // the pre-sync local state.
+      val noopReconcile = computeTentativeProjection(cleaned)
       {
         ...cleaned,
-        tentative_prolly_root_hash: st_local.tentative_prolly_root_hash,
-        parked_conflicts: st_local.parked_conflicts,
-        projection_basis: st_local.projection_basis,
+        tentative_prolly_root_hash: noopReconcile._1,
+        parked_conflicts: noopReconcile._2,
+        projection_basis: noopReconcile._3,
       }
     }
   }
@@ -2037,9 +2040,13 @@ module doltswarm_verify {
       ),
       synced.finalized_conflicts == unresolvedUnion,
       synced.resolved_finalized_conflict_ids == mergedResolvedIDs,
-      synced.tentative_prolly_root_hash == st_p.tentative_prolly_root_hash,
-      synced.parked_conflicts == st_p.parked_conflicts,
-      synced.projection_basis == st_p.projection_basis,
+      // Tentative projection is recomputed from post-compaction state, not
+      // preserved from pre-sync. Equal-tip metadata repair can expand
+      // finalized_events, causing compaction of retained finalized heads,
+      // which changes head_event_ids and invalidates the old projection.
+      synced.tentative_prolly_root_hash == computeTentativeProjection(synced)._1,
+      synced.parked_conflicts == computeTentativeProjection(synced)._2,
+      synced.projection_basis == computeTentativeProjection(synced)._3,
     }
   }))
 
