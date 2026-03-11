@@ -163,7 +163,7 @@ Three layers, two provided by Dolt, one new:
 ### 2.1 Data Types
 
 ```
-Hash        = byte[20]                    -- SHA-512/20
+Hash        = opaque content-address       -- e.g. Dolt uses SHA-512/20 (byte[20])
 PeerID      = opaque peer identifier
 HLC         = { wall: uint64, logical: uint16, peer: PeerID }
                 -- Total order: (wall, logical, peer) lexicographic.
@@ -388,8 +388,9 @@ No conflict precondition — writes are never blocked.
 10. Recompute local seen frontier: `peer_seen_frontier[self] ← SeenFrontier(clock)`.
 11. `RECONCILE(peer)` recomputes `(tentative_prolly_root_hash, parked_conflicts, projection_basis)` from the new clock/head state.
 12. After any change that can enlarge the finalization candidate set, call `ADVANCE_STABILITY(peer)`. This includes at minimum the local frontier update in step 10, any chunk-readiness change, any parked-state change, any finalized-anchor change, and any witness-set change.
-13. Implementation MAY create or refresh a local tentative materialization (for example a temporary commit, ref update, or working-set projection), possibly yielding a local `tentative_commit_id`. This is Layer 2 convenience state, not shared protocol identity.
-14. Disseminate `e` through the control plane.
+13. Disseminate `e` through the control plane.
+
+> **(Non-normative)** After step 12, an implementation may create or refresh a local tentative materialization (for example a temporary commit, ref update, or working-set projection), possibly yielding a local `tentative_commit_id`. This is Layer 2 convenience state, not shared protocol identity.
 
 #### RECEIVE_EVENT(peer, e) → Accept | Discard
 
@@ -443,7 +444,7 @@ Steps:
 
 #### RESOLVE_CONFLICT(peer, event_id, resolution_ops) → unit
 
-User (typically the author of the parked event) provides `resolution_ops` (SQL that fixes conflicting rows/schema). Resolution is async — no peer is blocked waiting for it.
+Any peer with the event in its `parked_conflicts` provides `resolution_ops` (SQL that fixes conflicting rows/schema). Resolution is async — no peer is blocked waiting for it.
 
 1. Apply `resolution_ops` to local Dolt → `resolved_root`.
 2. Create new `Event` with `resolved_root`, `parent_event_ids = projection_basis ∪ {event_id}`, `resolved_parked_event_id = event_id`, and `resolved_finalized_conflict_id = null`.
@@ -464,8 +465,7 @@ User resolves a tracked finalized-layer conflict (created by `SYNC_FINALIZED` co
 
 Adaptive policy:
 - Event-driven heartbeat on local frontier/finalized changes (new event, head-event-id digest change, finalized commit/prolly-root change, or finalized metadata digest change).
-- Idle keepalive heartbeat at low rate (default `HEARTBEAT_IDLE_INTERVAL = 10s`) with bounded jitter.
-- Optional direct probe heartbeat on suspected peer lag.
+- Idle keepalive heartbeat at low rate with bounded jitter (non-normative default: `HEARTBEAT_IDLE_INTERVAL = 10s`).
 
 On heartbeat send:
 
@@ -537,7 +537,7 @@ Let `CoveredBy(frontier, e)` mean: some `f ∈ frontier` has `e` in its ancestor
 
 #### GC_CLOCK(peer) → unit
 
-Optional local compaction for finalized history retention.
+Local compaction for finalized history retention. A peer that never runs `GC_CLOCK` remains correct; compaction is a local resource-management concern, not a protocol obligation.
 
 1. `pruneable = { event_id ∈ finalized_events.keys() ∩ clock.keys() | event_id is not an ancestor of any other retained event in clock }`.
 2. For each `event_id ∈ pruneable`:
@@ -551,7 +551,7 @@ Optional local compaction for finalized history retention.
 
 #### EVICT_PEER(peer) → unit
 
-After `HEARTBEAT_TIMEOUT` (10s) with no heartbeat from peer `q`:
+After `HEARTBEAT_TIMEOUT` (non-normative default: 10s) with no heartbeat from peer `q`:
 
 1. `active_peers ← active_peers \ {q}`.
 2. Keep `peer_seen_frontier[q]` as cached metadata, but it no longer participates in the witness set.
