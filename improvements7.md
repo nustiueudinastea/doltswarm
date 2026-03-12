@@ -200,15 +200,15 @@ The spec still models this as a singleton set for convenience:
 
 The normative protocol prose now explicitly performs singleton union at finalization time instead of mixing singular and plural wording.
 
-### E. Post-review fix: the Quint `FinalizedCommitID` abstraction is now injective
+### E. Post-review fix: the Quint `FinalizedCommitID` abstraction is now injective and overflow-safe
 
 One correctness issue remained after the main Round 7 rewrite, but it was in the
 **spec abstraction**, not in the protocol direction itself.
 
 **Problem.**
 
-The Quint model encoded the parent-set portion of `FinalizedCommitID` with a
-fixed-base accumulation:
+The Quint model originally encoded the parent-set portion of
+`FinalizedCommitID` with a fixed-base accumulation:
 - `encodeFinalizedCommitIDSet(...)`
 - `finalizedCommitKey(...)`
 
@@ -217,18 +217,28 @@ grew beyond the chosen radix. Distinct finalized parent sets could therefore
 alias to the same abstract `FinalizedCommitID`, weakening the model's claim that
 commit identity was faithfully represented.
 
+A later spec implementation of that repair switched to a quadratic pairing
+encoding (`natPair(a, b)`). That removed the aliasing problem, but it still
+depended on unbounded integer arithmetic and became evaluator-fragile once the
+Rust backend moved to checked `i64` arithmetic.
+
 **Implemented fix.**
 
-- Added an injective pairing helper:
-  - `natPair(a, b)`
-- Replaced the old fixed-base `finalizedCommitKey(...)` encoding with a nested
-  structural pairing over:
+- Replaced arithmetic parent fingerprints with a pure canonical finalized-commit encoding.
+- The Quint spec now represents `FinalizedCommitID` as:
   - finalized prolly-root hash,
-  - parent-set fingerprint,
+  - a canonical token list,
   - finalized commit kind.
-- Replaced `encodeFinalizedCommitIDSet(...)` with a fold that repeatedly pairs:
-  - the accumulated prefix encoding,
-  - the next sorted finalized-commit key.
+- That token list is built deterministically from:
+  - the finalized prolly-root hash,
+  - the finalized commit kind,
+  - the exact sorted parent finalized-commit ids.
+- Finalized checkpoint and merge commit creation are pure functions again:
+  - the same finalized payload always yields the same abstract finalized commit id,
+  - identity no longer depends on arithmetic growth or mutable allocation order.
+- The spec now checks the resulting abstraction via:
+  - `inv_finalized_commit_id_matches_state`,
+  - `inv_finalized_events_derived_from_checkpoints`.
 - Tightened the protocol text for `CanonicalEncode(...)` so it now explicitly
   requires canonical **map** ordering in addition to set/list ordering and
   Optional encoding.
@@ -239,8 +249,8 @@ The real protocol semantics already rely on:
 - `FinalizedCommitID = hash(CanonicalEncode(FinalizedCommitPayload))`
 
 So the model should use an abstraction that preserves structural uniqueness of
-commit payloads, not one that can silently alias distinct parent sets. This fix
-restores alignment between:
+commit payloads, not one that can silently alias distinct parent sets or depend
+on overflow-sensitive arithmetic. This fix restores alignment between:
 - the protocol's intended finalized commit identity,
 - the spec's abstract finalized commit identity,
 - the Round 7 claim that finalized history is commit-centric and parent-sensitive.
