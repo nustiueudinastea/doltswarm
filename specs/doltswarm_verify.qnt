@@ -3092,9 +3092,10 @@ module doltswarm_verify {
 
   /// Re-anchoring under closure lag: after SYNC_FINALIZED changes finalized_prolly_root_hash,
   /// projection may remain provisional while mergeable heads are missing.
-  /// Once required closure and chunks are available and introduce mergeable
-  /// heads whose anchored merge step is not a no-op, recomputation must change
-  /// the stale projection.
+  /// Once required closure and chunks are available and the full anchored fold
+  /// over the newly mergeable ready-head set differs from the stale
+  /// root/parked/basis projection, recomputation must change that stale
+  /// projection accordingly.
   /// @default_steps 20
   val inv_reanchor_after_closure_lag = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
@@ -3108,22 +3109,33 @@ module doltswarm_verify {
       head_event_ids: computeHeadEventIDs(caughtClock),
       chunks_ready: caughtChunksReady,
     }
+    val readyHeads = mergeableHeadEventIDs(caughtState)
+    val folded = anchoredFold(readyHeads, caughtState, caughtState.finalized_prolly_root_hash)
+    val retainedUnreadyParked = caughtState.parked_conflicts.intersect(
+      caughtState.head_event_ids.exclude(readyHeads)
+    )
+    val expectedParked = folded._2.union(retainedUnreadyParked)
+    val expectedBasis = readyHeads.exclude(folded._2)
     val recomputed = computeTentativeProjection(caughtState)
     (syncEnabled(connected, p, q, st_p, st_q) and
       synced.finalized_commit_id != st_p.finalized_commit_id and
       not(synced.head_event_ids.empty()) and
       mergeableHeadEventIDs(synced).empty() and
-      not(mergeableHeadEventIDs(caughtState).empty()) and
-      mergeableHeadEventIDs(caughtState).exists(h => {
-        val candidate = mergeRoots(
-          synced.tentative_prolly_root_hash,
-          caughtState.clock.get(h).prolly_root_hash,
-          caughtState.clock.get(h).anchor_prolly_root_hash
-        )
-        candidate == CONFLICT_HASH or candidate != synced.tentative_prolly_root_hash
-      })
+      not(readyHeads.empty()) and
+      (
+        folded._1 != synced.tentative_prolly_root_hash or
+        expectedParked != synced.parked_conflicts or
+        expectedBasis != synced.projection_basis
+      )
     ) implies
-      (recomputed._1 != synced.tentative_prolly_root_hash or recomputed._2 != synced.parked_conflicts)
+      all {
+        recomputed._1 == folded._1,
+        recomputed._2 == expectedParked,
+        recomputed._3 == expectedBasis,
+        recomputed._1 != synced.tentative_prolly_root_hash or
+          recomputed._2 != synced.parked_conflicts or
+          recomputed._3 != synced.projection_basis,
+      }
   }))
 
   /// Heartbeats should not keep requesting closure once the remote frontier
