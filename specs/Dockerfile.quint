@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Install quint CLI globally
-RUN npm install -g @informalsystems/quint@0.30.0
+RUN npm install -g @informalsystems/quint@0.31.0
 
 # Pre-download the Rust evaluator binary so containers start instantly.
 COPY <<'SPEC' /tmp/quint-init/__init.qnt
