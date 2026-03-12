@@ -1,0 +1,23 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates nodejs npm && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install quint CLI globally
+RUN npm install -g @informalsystems/quint@0.30.0
+
+# Pre-download the Rust evaluator binary so containers start instantly.
+COPY <<'SPEC' /tmp/quint-init/__init.qnt
+module __init {
+  var x: int
+  action init = x' = 0
+  action step = x' = x + 1
+  val inv = x >= 0
+}
+SPEC
+RUN cd /tmp/quint-init && \
+    quint run __init.qnt --backend=rust --invariant=inv --max-samples=1 --max-steps=1 && \
+    rm -rf /tmp/quint-init
+
+WORKDIR /specs

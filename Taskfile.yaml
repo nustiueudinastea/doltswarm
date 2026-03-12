@@ -204,6 +204,47 @@ tasks:
         --default-samples={{.DEFAULT_SAMPLES}} --target-seconds={{.TARGET_SECONDS}} \
         --output-markdown=invariant-benchmarks.md --write-annotations
 
+  quint:cloud:
+    desc: Run Quint invariants in parallel on cloud VMs (Scaleway or Hetzner)
+    summary: |
+      Provision cloud VMs, pull the quint Docker image, and distribute
+      invariant checks across VMs using all available CPUs.
+
+      Scaleway (default): uses ~/.config/scw/config.yaml, deploys to "testing" project
+      Hetzner:            requires HCLOUD_TOKEN env var
+
+      pip install paramiko scaleway   # or: pip install paramiko hcloud
+
+      Options:
+        VMS         Number of VMs to run in parallel (required)
+        PROVIDER    Cloud provider: scaleway (default) or hetzner
+        SAMPLES     Number of random traces per invariant (default: 10000)
+        STEPS       Override max steps for all invariants
+        VM_TYPE     VM type (default: POP2-HC-8C-16G for Scaleway, ccx33 for Hetzner)
+        INVARIANT   Run only this specific invariant
+        KEEP_VMS    Set to 1 to keep VMs alive after run
+
+      Examples:
+        task quint:cloud VMS=3
+        task quint:cloud VMS=2 PROVIDER=hetzner SAMPLES=50000
+        task quint:cloud VMS=4 VM_TYPE=POP2-HC-16C-32G SAMPLES=10000
+        task quint:cloud VMS=1 KEEP_VMS=1 SAMPLES=1000
+    dir: specs
+    vars:
+      VMS: '{{.VMS | default ""}}'
+      SAMPLES: '{{.SAMPLES | default "10000"}}'
+      PROVIDER: '{{.PROVIDER | default "scaleway"}}'
+      PROVIDER_ARG: "--provider={{.PROVIDER}}"
+      VM_TYPE_ARG: "{{if .VM_TYPE}} --vm-type={{.VM_TYPE}}{{end}}"
+      STEPS_ARG: "{{if .STEPS}} --steps={{.STEPS}}{{end}}"
+      INVARIANT_ARG: "{{if .INVARIANT}} --invariant={{.INVARIANT}}{{end}}"
+      KEEP_ARG: '{{if eq .KEEP_VMS "1"}} --keep-vms{{end}}'
+    preconditions:
+      - sh: '[ -n "{{.VMS}}" ]'
+        msg: "VMS parameter is required. Example: task quint:cloud VMS=3"
+    cmds:
+      - python3 quint_cloud_runner.py --vms={{.VMS}} {{.PROVIDER_ARG}}{{.VM_TYPE_ARG}} --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.INVARIANT_ARG}}{{.KEEP_ARG}}
+
   default:
     desc: Show available tasks
     cmds:
