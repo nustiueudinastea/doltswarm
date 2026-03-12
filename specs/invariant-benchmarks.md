@@ -38,7 +38,7 @@
 | `inv_heal_frontier_growth_bounded` | 0.32 | 4.00 | 3.21 | 20 | 3.21 |
 | `inv_frontier_merge_strictly_decreases` | 0.32 | 4.02 | 3.19 | 20 | 3.19 |
 | `inv_fullmesh_heal_bounded_converges` | 0.54 | 4.53 | 5.38 | 19 | 5.11 |
-| `inv_unique_frontier_tip_is_absorbing` | 0.32 | 4.35 | 3.23 | 20 | 3.23 |
+| `inv_component_converged_frontier_absorbing` | 0.32 | 4.35 | 3.23 | 20 | 3.23 |
 | `inv_fullmesh_unique_frontier_round_converges` | 0.38 | 4.41 | 3.79 | 20 | 3.79 |
 | `inv_converged_finalized_state_absorbing` | 0.35 | 4.35 | 3.52 | 20 | 3.52 |
 | `inv_fullmesh_heal_converged_absorbing` | 0.51 | 4.19 | 5.10 | 20 | 5.10 |

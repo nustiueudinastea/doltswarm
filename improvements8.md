@@ -139,7 +139,7 @@ That is not the right safety target for an append-only merge-of-merges design. T
   - `inv_sync_lineage_union_monotone`
   - `inv_heal_frontier_growth_bounded`
   - `inv_frontier_merge_strictly_decreases`
-  - `inv_unique_frontier_tip_is_absorbing`
+  - `inv_component_converged_frontier_absorbing`
   - `inv_converged_finalized_state_absorbing`
   - `inv_fullmesh_frontier_rank_strict_progress`
   - `inv_fullmesh_unique_frontier_round_converges`
@@ -160,7 +160,7 @@ The following checks were run successfully after the protocol/spec change:
   - `inv_sync_lineage_union_monotone`
   - `inv_heal_frontier_growth_bounded`
   - `inv_frontier_merge_strictly_decreases`
-  - `inv_unique_frontier_tip_is_absorbing`
+  - `inv_component_converged_frontier_absorbing`
   - `inv_converged_finalized_state_absorbing`
   - `inv_fullmesh_heal_round_frontier_nonincreasing`
   - `inv_fullmesh_frontier_rank_strict_progress`

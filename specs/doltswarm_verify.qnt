@@ -2650,19 +2650,26 @@ module doltswarm_verify {
     }
   }
 
-  /// Once a connected component already has one unique maximal finalized tip,
-  /// later heal steps inside that component must not create a second
-  /// incomparable frontier tip.
+  /// Once every peer in a connected component already shares the same
+  /// finalized state, one more local heal attempt inside that component must
+  /// keep the component converged and preserve its unique frontier tip.
   /// @default_steps 20
-  val inv_unique_frontier_tip_is_absorbing = PEERS.forall(p => PEERS.forall(q => {
+  val inv_component_converged_frontier_absorbing = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
     val component = connectedComponent(connected, p)
     val before = finalizedFrontierFor(nodes, component)
-    val afterNodes = nodes.set(p, syncPeerIfEnabled(nodes, p, q).get(p))
+    val afterNodes =
+      if (syncEnabled(connected, p, q, st_p, st_q))
+        nodes.set(p, applySyncFinalized(st_p, st_q))
+      else
+        nodes
     val after = finalizedFrontierFor(afterNodes, component)
-    (syncEnabled(connected, p, q, st_p, st_q) and before.size() == 1) implies
-      after.size() == 1
+    (before.size() == 1 and peersShareSameFinalizedState(nodes, component)) implies
+      all {
+        after.size() == 1,
+        peersShareSameFinalizedState(afterNodes, component),
+      }
   }))
 
   /// Rank/progress phase 2 for deterministic full-mesh healing:
