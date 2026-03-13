@@ -218,15 +218,17 @@ module doltswarm_verify {
     appendIntList(acc.append(suffix.length()), suffix)
 
   pure def intListLess(a: List[int], b: List[int]): bool = {
-    val commonLength = if (a.length() < b.length()) a.length() else b.length()
-    val comparison = range(0, commonLength).foldl((false, false), (acc, i) =>
-      if (acc._1) acc
-      else if (a[i] < b[i]) (true, true)
-      else if (a[i] > b[i]) (true, false)
-      else acc
+    // Keep the lexicographic comparison exact while avoiding range(0, Len(...)),
+    // which Apalache cannot encode when the bound is state-dependent.
+    val comparison = a.foldl((0, false, false), (acc, value) =>
+      if (acc._2) acc
+      else if (acc._1 >= b.length()) (acc._1, true, false)
+      else if (value < b[acc._1]) (acc._1, true, true)
+      else if (value > b[acc._1]) (acc._1, true, false)
+      else (acc._1 + 1, false, false)
     )
-    if (comparison._1) comparison._2
-    else a.length() < b.length()
+    if (comparison._2) comparison._3
+    else comparison._1 < b.length()
   }
 
   pure def finalizedCommitLess(a: FinalizedCommitID, b: FinalizedCommitID): bool =

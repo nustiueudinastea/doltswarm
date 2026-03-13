@@ -5,3 +5,4 @@ __pycache__/
 specs/cloud-results/
 specs/quint-runner-key
 specs/quint-runner-key.pub
+*_apalache-out

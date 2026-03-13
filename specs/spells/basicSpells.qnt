@@ -73,10 +73,16 @@ module basicSpells {
   /// Sort a list, given the ordering operator.
   pure def sortList(list: List[a], lt: (a, a) => bool): List[a] = {
     pure def insertInOrder(sortedList: List[a], num: a): List[a] = {
-      match range(0, sortedList.length()).findFirst(i => not(lt(sortedList[i], num))) {
-        | None => sortedList.append(num)
-        | Some(index) => sortedList.slice(0, index).append(num).concat(sortedList.slice(index, sortedList.length()))
-      }
+      val insertion = sortedList.foldl(([], false), (acc, current) => {
+        if (acc._2) {
+          (acc._1.append(current), true)
+        } else if (lt(current, num)) {
+          (acc._1.append(current), false)
+        } else {
+          (acc._1.append(num).append(current), true)
+        }
+      })
+      if (insertion._2) insertion._1 else insertion._1.append(num)
     }
 
     list.foldl([], (sortedList, num) => insertInOrder(sortedList, num))
