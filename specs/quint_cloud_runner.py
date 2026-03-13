@@ -931,6 +931,7 @@ def main() -> None:
     print()
 
     vms: list[VMInstance] = []
+    destroyed_vms: set[str] = set()
     wall_start = time.monotonic()
 
     try:
@@ -992,6 +993,11 @@ def main() -> None:
             }
             for f in as_completed(futures):
                 all_results.extend(f.result())
+                vm = futures[f]
+                if not args.keep_vms:
+                    print(f"  [{vm.name}] All invariants done — destroying VM")
+                    provider.destroy_vm(vm)
+                    destroyed_vms.add(vm.name)
 
         wall_elapsed = time.monotonic() - wall_start
 
@@ -1033,12 +1039,14 @@ def main() -> None:
             sys.exit(1)
 
     finally:
+        remaining_vms = [vm for vm in vms if vm.name not in destroyed_vms]
         if not args.keep_vms:
-            print("\nCleaning up VMs...")
-            destroy_vms(provider, vms)
+            if remaining_vms:
+                print("\nCleaning up remaining VMs...")
+                destroy_vms(provider, remaining_vms)
         else:
             print("\n--keep-vms set. VMs left running:")
-            for vm in vms:
+            for vm in remaining_vms:
                 print(f"  {vm.name}: ssh root@{vm.ip}")
 
 
