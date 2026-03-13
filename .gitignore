@@ -1,6 +1,7 @@
 .aider*
 .envrc
 .cache/
+__pycache__/
 specs/cloud-results/
 specs/quint-runner-key
 specs/quint-runner-key.pub

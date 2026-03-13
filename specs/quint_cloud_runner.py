@@ -62,6 +62,8 @@ class VMInstance:
     ssh: paramiko.SSHClient | None = None
     cpus: int = 0
     name: str = ""
+    created_at: float = field(default_factory=time.monotonic)
+    destroyed_at: float | None = None
 
 
 @dataclass
@@ -252,6 +254,10 @@ class CloudProvider(abc.ABC):
     @abc.abstractmethod
     def name(self) -> str: ...
 
+    @abc.abstractmethod
+    def price_per_hour(self, vm_type: str) -> float | None:
+        """Return EUR/hour for the given VM type, or None if unknown."""
+
 
 # ---------------------------------------------------------------------------
 # Scaleway provider
@@ -421,6 +427,18 @@ class ScalewayProvider(CloudProvider):
         except Exception as e:
             print(f"  WARNING: Failed to destroy {vm.name}: {e}")
 
+    # Scaleway hourly pricing (EUR) — https://www.scaleway.com/en/pricing/
+    _PRICING = {
+        "POP2-HC-2C-4G":   0.07,
+        "POP2-HC-4C-8G":   0.14,
+        "POP2-HC-8C-16G":  0.28,
+        "POP2-HC-16C-32G": 0.55,
+        "POP2-HC-32C-64G": 1.10,
+    }
+
+    def price_per_hour(self, vm_type: str) -> float | None:
+        return self._PRICING.get(vm_type)
+
 
 # ---------------------------------------------------------------------------
 # Hetzner provider
@@ -507,6 +525,24 @@ class HetznerProvider(CloudProvider):
         except Exception as e:
             print(f"  WARNING: Failed to destroy {vm.name}: {e}")
 
+    # Hetzner hourly pricing (EUR) — https://docs.hetzner.cloud/
+    _PRICING = {
+        "ccx13":  0.07,
+        "ccx23":  0.14,
+        "ccx33":  0.27,
+        "ccx43":  0.53,
+        "ccx53":  1.05,
+        "ccx63":  2.10,
+        "cpx11":  0.005,
+        "cpx21":  0.01,
+        "cpx31":  0.02,
+        "cpx41":  0.04,
+        "cpx51":  0.08,
+    }
+
+    def price_per_hour(self, vm_type: str) -> float | None:
+        return self._PRICING.get(vm_type)
+
 
 # ---------------------------------------------------------------------------
 # VM provisioning (provider-agnostic)
@@ -554,6 +590,7 @@ def destroy_vms(provider: CloudProvider, vms: list[VMInstance]) -> None:
         except Exception:
             pass
         provider.destroy_vm(vm)
+        vm.destroyed_at = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -579,9 +616,20 @@ def run_invariant_on_vm(
     )
 
     started = time.monotonic()
-    exit_code, stdout, stderr = ssh_exec(
-        vm.ssh, docker_cmd, timeout=3600, check=False
-    )
+    try:
+        exit_code, stdout, stderr = ssh_exec(
+            vm.ssh, docker_cmd, timeout=7200, check=False
+        )
+    except (TimeoutError, socket.timeout, paramiko.buffered_pipe.PipeTimeout) as e:
+        elapsed = time.monotonic() - started
+        return InvariantResult(
+            invariant=invariant.name,
+            vm_name=vm.name,
+            passed=False,
+            elapsed_seconds=elapsed,
+            output="",
+            error=f"SSH timeout after {elapsed:.0f}s: {e}",
+        )
     elapsed = time.monotonic() - started
 
     passed = exit_code == 0
@@ -660,15 +708,40 @@ def run_vm_batch(
 # Report
 # ---------------------------------------------------------------------------
 
-def print_report(results: list[InvariantResult], wall_seconds: float) -> None:
+def print_report(
+    results: list[InvariantResult],
+    wall_seconds: float,
+    vms: list[VMInstance] | None = None,
+    provider: CloudProvider | None = None,
+    vm_type: str | None = None,
+) -> None:
     passed = [r for r in results if r.passed]
     failed = [r for r in results if not r.passed]
+
+    total_cpu_seconds = sum(r.elapsed_seconds for r in results)
 
     print("\n" + "=" * 70)
     print("RESULTS SUMMARY")
     print("=" * 70)
     print(f"Total: {len(results)}  Passed: {len(passed)}  Failed: {len(failed)}")
     print(f"Wall time: {wall_seconds:.1f}s ({wall_seconds / 60:.1f}m)")
+    print(f"Total CPU time: {total_cpu_seconds:.1f}s ({total_cpu_seconds / 60:.1f}m)")
+
+    if vms and provider and vm_type:
+        price = provider.price_per_hour(vm_type)
+        if price is not None:
+            total_vm_hours = 0.0
+            for vm in vms:
+                end = vm.destroyed_at if vm.destroyed_at else time.monotonic()
+                vm_hours = (end - vm.created_at) / 3600
+                # Cloud providers bill per started hour minimum
+                total_vm_hours += max(vm_hours, 1 / 60)
+            total_cost = total_vm_hours * price
+            print(f"Estimated cost: EUR {total_cost:.3f} "
+                  f"({len(vms)} VMs x {vm_type} @ EUR {price}/h)")
+        else:
+            print(f"Cost: unknown pricing for VM type {vm_type}")
+
     print()
 
     if failed:
@@ -698,6 +771,8 @@ def save_logs(
     output_dir: Path,
     wall_seconds: float,
     args: argparse.Namespace,
+    vms: list[VMInstance] | None = None,
+    provider: CloudProvider | None = None,
 ) -> None:
     """Save per-invariant stdout/stderr to local files for inspection."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -767,6 +842,18 @@ def save_logs(
             f.write(f"Total CPU time: {total_cpu:.1f}s ({total_cpu / 60:.1f}m)\n")
             if wall_seconds > 0:
                 f.write(f"Parallelism:    {total_cpu / wall_seconds:.1f}x\n")
+
+        if vms and provider:
+            price = provider.price_per_hour(args.vm_type)
+            if price is not None:
+                total_vm_hours = 0.0
+                for vm in vms:
+                    end = vm.destroyed_at if vm.destroyed_at else time.monotonic()
+                    total_vm_hours += max((end - vm.created_at) / 3600, 1 / 60)
+                cost = total_vm_hours * price
+                f.write(f"Est. cost:      EUR {cost:.3f} "
+                        f"({len(vms)} VMs x {args.vm_type} @ EUR {price}/h)\n")
+
         f.write("\n")
 
         # Failure breakdown
@@ -997,14 +1084,15 @@ def main() -> None:
                 if not args.keep_vms:
                     print(f"  [{vm.name}] All invariants done — destroying VM")
                     provider.destroy_vm(vm)
+                    vm.destroyed_at = time.monotonic()
                     destroyed_vms.add(vm.name)
 
         wall_elapsed = time.monotonic() - wall_start
 
-        print_report(all_results, wall_elapsed)
+        print_report(all_results, wall_elapsed, vms, provider, args.vm_type)
 
         # Save per-invariant logs
-        save_logs(all_results, run_output_dir, wall_elapsed, args)
+        save_logs(all_results, run_output_dir, wall_elapsed, args, vms, provider)
 
         if args.json_output:
             json_data = {
@@ -1017,6 +1105,8 @@ def main() -> None:
                     "fallback_steps": args.fallback_steps,
                 },
                 "wall_seconds": wall_elapsed,
+                "total_cpu_seconds": round(sum(r.elapsed_seconds for r in all_results), 2),
+                "estimated_cost_eur": None,
                 "total": len(all_results),
                 "passed": sum(1 for r in all_results if r.passed),
                 "failed": sum(1 for r in all_results if not r.passed),
@@ -1031,6 +1121,13 @@ def main() -> None:
                     for r in sorted(all_results, key=lambda x: x.invariant)
                 ],
             }
+            price = provider.price_per_hour(args.vm_type)
+            if price is not None:
+                total_vm_hours = 0.0
+                for vm in vms:
+                    end = vm.destroyed_at if vm.destroyed_at else time.monotonic()
+                    total_vm_hours += max((end - vm.created_at) / 3600, 1 / 60)
+                json_data["estimated_cost_eur"] = round(total_vm_hours * price, 4)
             out_path = Path(args.json_output)
             out_path.write_text(json.dumps(json_data, indent=2) + "\n")
             print(f"\nResults written to {out_path}")
