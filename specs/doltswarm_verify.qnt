@@ -408,10 +408,16 @@ module doltswarm_verify {
     clock.has(event_id) and
       ancestorIdClosure(Set(event_id), clock).subseteq(clock.keys())
 
-  /// Head event IDs eligible for reconciliation (MERGEABLE):
+  /// Retained finalized event bodies can remain in the local clock for
+  /// closure/bookkeeping, but they are already represented by the finalized
+  /// accumulator and must not re-enter tentative reconciliation.
+  pure def tentativeHeadEventIDs(st: NodeState): Set[EventID] =
+    st.head_event_ids.exclude(st.finalized_events.keys())
+
+  /// Tentative head event IDs eligible for reconciliation (MERGEABLE):
   /// parent-closed and chunk-ready.
   pure def mergeableHeadEventIDs(st: NodeState): Set[EventID] =
-    st.head_event_ids.filter(event_id =>
+    tentativeHeadEventIDs(st).filter(event_id =>
       isParentClosed(st.clock, event_id) and st.chunks_ready.contains(event_id)
     )
 
@@ -509,14 +515,19 @@ module doltswarm_verify {
   /// multi-head use the same anchored fold semantics (no single-head bypass).
   pure def computeTentativeProjection(st: NodeState):
       (ProllyRootHash, Set[EventID], Set[EventID]) = {
+    val tentativeHeads = tentativeHeadEventIDs(st)
     val readyHeads = mergeableHeadEventIDs(st)
-    if (st.head_event_ids.empty()) {
+    if (tentativeHeads.empty()) {
       (st.finalized_prolly_root_hash, Set(), Set())
     } else if (readyHeads.empty()) {
-      (st.tentative_prolly_root_hash, st.parked_conflicts.intersect(st.head_event_ids), st.projection_basis)
+      (
+        st.tentative_prolly_root_hash,
+        st.parked_conflicts.intersect(tentativeHeads),
+        st.projection_basis.intersect(tentativeHeads)
+      )
     } else {
       val folded = anchoredFold(readyHeads, st, st.finalized_prolly_root_hash)
-      val unreadyHeads = st.head_event_ids.exclude(readyHeads)
+      val unreadyHeads = tentativeHeads.exclude(readyHeads)
       val retainedUnreadyParked = st.parked_conflicts.intersect(unreadyHeads)
       val parkedSet = folded._2.union(retainedUnreadyParked)
       val projectionBasis = readyHeads.exclude(folded._2)
@@ -1179,6 +1190,16 @@ module doltswarm_verify {
     st_a.resolved_finalized_conflict_ids == st_b.resolved_finalized_conflict_ids,
   }
 
+  /// Inputs that determine the non-provisional tentative projection.
+  /// `finalized_events` participates because finalized retained bodies are
+  /// excluded from tentative heads.
+  pure def sameTentativeProjectionInputs(s1: NodeState, s2: NodeState): bool = all {
+    s1.clock == s2.clock,
+    s1.chunks_ready == s2.chunks_ready,
+    s1.finalized_prolly_root_hash == s2.finalized_prolly_root_hash,
+    s1.finalized_events == s2.finalized_events,
+  }
+
   pure def sameFinalizedStateAcross(peerStatesA: PeerID -> NodeState,
       peerStatesB: PeerID -> NodeState): bool =
     PEERS.forall(p => sameFinalizedState(peerStatesA.get(p), peerStatesB.get(p)))
@@ -1621,8 +1642,9 @@ module doltswarm_verify {
 
   /// A peer reconciles when it has multiple heads.
   /// Merges are deterministic local computations — no event is created,
-  /// nothing is disseminated. Every peer with the same event set independently
-  /// computes the same merged root. The next LOCAL_WRITE will have
+  /// nothing is disseminated. Every peer with the same tentative-projection
+  /// inputs independently computes the same merged root whenever at least one
+  /// tentative head is mergeable. The next LOCAL_WRITE will have
   /// parents = projection_basis, which collapses only the exact basis that
   /// produced the tentative root.
   /// Primarily used to exercise re-anchoring after finalized_prolly_root_hash advances
@@ -2717,15 +2739,14 @@ module doltswarm_verify {
       sameFinalizedStateAcross(healedAgain, healed)
   }
 
-  /// Data convergence: peers with the same retained clock state and the same
-  /// finalized root must derive the same reconcile projection.
+  /// Data convergence: peers with the same tentative-projection inputs
+  /// (retained clock/chunks plus finalized boundary inputs) must derive the
+  /// same reconcile projection whenever at least one tentative head is mergeable.
   /// @default_steps 20
   val inv_data_convergence = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
-    (s1.clock == s2.clock and
-     s1.chunks_ready == s2.chunks_ready and
-     s1.finalized_prolly_root_hash == s2.finalized_prolly_root_hash and
+    (sameTentativeProjectionInputs(s1, s2) and
      not(mergeableHeadEventIDs(s1).empty())) implies
       (s1.tentative_prolly_root_hash == s2.tentative_prolly_root_hash and
        s1.parked_conflicts == s2.parked_conflicts and
@@ -3021,12 +3042,13 @@ module doltswarm_verify {
     st.parked_conflicts.subseteq(st.head_event_ids)
   })
 
-  /// Closure-ready parking safety: once all heads are mergeable, parked events
-  /// are a subset of mergeable heads.
+  /// Closure-ready parking safety: once all tentative heads are mergeable,
+  /// parked events are a subset of mergeable tentative heads.
   /// @default_steps 20
   val inv_parked_mergeable_when_closure_ready = PEERS.forall(p => {
     val st = nodes.get(p)
-    (mergeableHeadEventIDs(st) == st.head_event_ids) implies st.parked_conflicts.subseteq(mergeableHeadEventIDs(st))
+    (mergeableHeadEventIDs(st) == tentativeHeadEventIDs(st)) implies
+      st.parked_conflicts.subseteq(mergeableHeadEventIDs(st))
   })
 
   /// Retained finalized subgraph closure: any finalized event body retained in
@@ -3090,14 +3112,14 @@ module doltswarm_verify {
   }))
 
   /// Re-anchoring conservative retention check: when SYNC_FINALIZED changes the
-  /// anchor and mergeable heads are still missing, unresolved parked heads that
-  /// remain heads must not disappear from parked_conflicts.
+  /// anchor and mergeable tentative heads are still missing, unresolved parked
+  /// tentative heads must not disappear from parked_conflicts.
   /// @default_steps 20
   val inv_reanchor_provisional_parked_retained = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
     val st_q = nodes.get(q)
     val synced = applySyncFinalized(st_p, st_q)
-    val unresolvedHeadIDs = st_p.parked_conflicts.intersect(synced.head_event_ids)
+    val unresolvedHeadIDs = st_p.parked_conflicts.intersect(tentativeHeadEventIDs(synced))
     (syncEnabled(connected, p, q, st_p, st_q) and
       synced.finalized_commit_id != st_p.finalized_commit_id and
       mergeableHeadEventIDs(synced).empty()) implies
@@ -3105,7 +3127,7 @@ module doltswarm_verify {
   }))
 
   /// Re-anchoring under closure lag: after SYNC_FINALIZED changes finalized_prolly_root_hash,
-  /// projection may remain provisional while mergeable heads are missing.
+  /// projection may remain provisional while mergeable tentative heads are missing.
   /// Once required closure and chunks are available and the full anchored fold
   /// over the newly mergeable ready-head set differs from the stale
   /// root/parked/basis projection, recomputation must change that stale
@@ -3126,14 +3148,14 @@ module doltswarm_verify {
     val readyHeads = mergeableHeadEventIDs(caughtState)
     val folded = anchoredFold(readyHeads, caughtState, caughtState.finalized_prolly_root_hash)
     val retainedUnreadyParked = caughtState.parked_conflicts.intersect(
-      caughtState.head_event_ids.exclude(readyHeads)
+      tentativeHeadEventIDs(caughtState).exclude(readyHeads)
     )
     val expectedParked = folded._2.union(retainedUnreadyParked)
     val expectedBasis = readyHeads.exclude(folded._2)
     val recomputed = computeTentativeProjection(caughtState)
     (syncEnabled(connected, p, q, st_p, st_q) and
       synced.finalized_commit_id != st_p.finalized_commit_id and
-      not(synced.head_event_ids.empty()) and
+      not(tentativeHeadEventIDs(synced).empty()) and
       mergeableHeadEventIDs(synced).empty() and
       not(readyHeads.empty()) and
       (
@@ -3288,17 +3310,15 @@ module doltswarm_verify {
   }))
 
   /// Parking agreement (INV7d, closure-ready):
-  /// peers with the same events/chunk-readiness and same finalized_prolly_root_hash
-  /// deterministically agree on parked events once head closure is complete.
+  /// peers with the same tentative-projection inputs deterministically agree on
+  /// parked events once all tentative heads are mergeable.
   /// @default_steps 20
   val inv_parking_agreement = PEERS.forall(p1 => PEERS.forall(p2 => {
     val s1 = nodes.get(p1)
     val s2 = nodes.get(p2)
-    (s1.clock.keys() == s2.clock.keys() and
-     s1.chunks_ready == s2.chunks_ready and
-     mergeableHeadEventIDs(s1) == s1.head_event_ids and
-     mergeableHeadEventIDs(s2) == s2.head_event_ids and
-     s1.finalized_prolly_root_hash == s2.finalized_prolly_root_hash) implies
+    (sameTentativeProjectionInputs(s1, s2) and
+     mergeableHeadEventIDs(s1) == tentativeHeadEventIDs(s1) and
+     mergeableHeadEventIDs(s2) == tentativeHeadEventIDs(s2)) implies
       (s1.parked_conflicts == s2.parked_conflicts and
        s1.projection_basis == s2.projection_basis)
   }))
@@ -3382,6 +3402,14 @@ module doltswarm_verify {
   val inv_finalized_parked_disjoint = PEERS.forall(p => {
     val st = nodes.get(p)
     st.finalized_events.keys().intersect(st.parked_conflicts).empty()
+  })
+
+  /// Finalized retained bodies are below the tentative boundary: they may stay
+  /// in clock for bookkeeping, but never participate in the live projection basis.
+  /// @default_steps 20
+  val inv_finalized_projection_basis_disjoint = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.finalized_events.keys().intersect(st.projection_basis).empty()
   })
 
   /// Three-peer partition-heal regression:

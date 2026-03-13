@@ -296,10 +296,10 @@ All Layer 3 state is in-memory. Persistence comes from Dolt's Layer 1/2. On cras
 | Variable | Type | Description |
 |---|---|---|
 | `clock` | `Map[EventID, Event]` | Locally retained Merkle clock events: all non-finalized events plus any retained finalized events not yet compacted by `GC_CLOCK`. The retained finalized subset `clock.keys() ∩ finalized_events.keys()` MUST stay parent-closed. |
-| `head_event_ids` | `Set[EventID]` | Clock head event IDs (events with no children locally) |
+| `head_event_ids` | `Set[EventID]` | Clock head event IDs (events with no children locally). Retained finalized event bodies may appear here structurally after local compaction; they remain below the tentative boundary and are ignored by `RECONCILE`. |
 | `chunks_ready` | `Set[EventID]` | Announced events whose `prolly_root_hash` and `anchor_prolly_root_hash` chunks are locally available (`CHUNKS_READY`). |
 | `tentative_prolly_root_hash` | `Hash` | Current merged RootValue |
-| `projection_basis` | `Set[EventID]` | The exact event-id basis embodied in `tentative_prolly_root_hash`: the head-event-id set whose anchored fold produced the current tentative content projection. Under closure lag this basis may lag behind raw `head_event_ids`; `LOCAL_WRITE` and `RESOLVE_*` parent from `projection_basis`, not from raw head event IDs. |
+| `projection_basis` | `Set[EventID]` | The exact event-id basis embodied in `tentative_prolly_root_hash`: the unsettled head-event-id set whose anchored fold produced the current tentative content projection. Under closure lag this basis may lag behind raw `head_event_ids`; `LOCAL_WRITE` and `RESOLVE_*` parent from `projection_basis`, not from raw head event IDs. Finalized retained event bodies never appear in `projection_basis`. |
 | `hlc` | `HLC` | Local hybrid logical clock used only for deterministic event ordering and tie-breaking |
 | `peer_seen_frontier` | `Map[PeerID, Set[EventID]]` | Last known seen frontier per peer. A seen frontier is the maximal set of locally parent-closed events that peer has observed. `peer_seen_frontier[self]` MUST equal the locally derived seen frontier. |
 | `finalized_commit_id` | `FinalizedCommitID` | Authoritative finalized-history identity at the stability boundary. Together with `finalized_prolly_root_hash`, this is the authoritative finalized tip. |
@@ -333,7 +333,7 @@ The protocol has two explicit state zones. The finalized zone itself has three r
 - **Authoritative finalized history:** `finalized_commit_id` and `finalized_prolly_root_hash`. This is the finalized Dolt history boundary that peers must converge on.
 - **Finalized sync metadata:** `finalized_commit_parents`, `finalized_checkpoint_events`, `finalized_conflicts`, and `resolved_finalized_conflict_ids`. This is the shared auxiliary finalized-layer metadata reconciled by `ADVANCE_STABILITY` and `SYNC_FINALIZED`.
 - **Local finalized bookkeeping:** `finalized_events`. This is a derived local view reconstructed from the current authoritative finalized tip plus reachable checkpoint descriptors.
-- **Tentative state (revisable local projection):** `clock`, `head_event_ids`, `chunks_ready`, `tentative_prolly_root_hash`, `parked_conflicts`, and `projection_basis`. This is a deterministic projection from the currently-known frontier relative to the current finalized anchor. It is recomputed when new events, ancestors, chunks, or a new finalized anchor arrive.
+- **Tentative state (revisable local projection):** `clock`, `head_event_ids`, `chunks_ready`, `tentative_prolly_root_hash`, `parked_conflicts`, and `projection_basis`. This is a deterministic projection from the currently-known frontier relative to the current finalized boundary inputs: the finalized content anchor (`finalized_prolly_root_hash`) plus the locally derived finalized event catalog (`finalized_events`) that removes already-hardened ids from tentative heads. It is recomputed when new events, ancestors, chunks, or finalized boundary/bookkeeping changes arrive.
 
 Conflict handling is also split:
 - **Tentative-layer conflicts:** represented by `parked_conflicts`; non-blocking and resolved via `RESOLVE_CONFLICT`.
@@ -432,23 +432,24 @@ Steps:
 
 **Merges are deterministic local computations, not new information.** If peers A and B both have events `{e1, e2}` with two head event IDs, they each independently call `MergeRoots` and arrive at the same `tentative_prolly_root_hash`. There is nothing to communicate — the merge result is fully determined by the inputs that all peers already have. No event is created, nothing is disseminated.
 
-**Reconcile has an explicit closure-lag contract.** Reconcile operates on ALL `head_event_ids` (not pre-filtered by existing `parked_conflicts`). When all head event IDs are mergeable, parking is recomputed deterministically from anchored fold semantics. When closure is incomplete (some head event IDs are not yet mergeable), projection is provisional and unresolved parked head IDs are retained conservatively until closure completion.
+**Reconcile has an explicit closure-lag contract.** Reconcile operates on all unsettled head event IDs, not on retained finalized bookkeeping bodies. Define `tentative_head_event_ids = head_event_ids \ finalized_events.keys()`. Reconcile operates on ALL `tentative_head_event_ids` (not pre-filtered by existing `parked_conflicts`). When all tentative head event IDs are mergeable, parking is recomputed deterministically from anchored fold semantics. When closure is incomplete (some tentative head event IDs are not yet mergeable), projection is provisional and unresolved parked head IDs are retained conservatively until closure completion.
 
 `AnchoredFold(head_event_ids, start_prolly_root_hash) -> (root, conflict_set)` is the shared merge primitive used by both `RECONCILE` and `ADVANCE_STABILITY`: sort head event IDs by HLC, start `acc = start_prolly_root_hash`, then fold `MergeRoots(acc, head.prolly_root_hash, head.anchor_prolly_root_hash)` so each event is replayed against the finalized anchor it was originally written on.
 
-1. If `head_event_ids = ∅`: set `tentative_prolly_root_hash ← finalized_prolly_root_hash`, set `parked_conflicts ← ∅`, set `projection_basis ← ∅`, return.
-2. `mergeable_head_event_ids = { h ∈ head_event_ids | h is PARENTS_READY ∧ h is CHUNKS_READY }`.
-3. `unready_head_event_ids = head_event_ids \ mergeable_head_event_ids`.
-4. If `mergeable_head_event_ids = ∅`: no merge is possible yet. Keep `tentative_prolly_root_hash` unchanged, conservatively retain unresolved parked head event IDs (`parked_conflicts ← parked_conflicts ∩ head_event_ids`), and preserve the previous `projection_basis`. Return.
-5. Sort `mergeable_head_event_ids` by HLC total order (deterministic).
-6. Apply `AnchoredFold(mergeable_head_event_ids, finalized_prolly_root_hash)` to compute `(merged_root, parked_ready)`:
+1. `tentative_head_event_ids = head_event_ids \ finalized_events.keys()`.
+2. If `tentative_head_event_ids = ∅`: set `tentative_prolly_root_hash ← finalized_prolly_root_hash`, set `parked_conflicts ← ∅`, set `projection_basis ← ∅`, return.
+3. `mergeable_head_event_ids = { h ∈ tentative_head_event_ids | h is PARENTS_READY ∧ h is CHUNKS_READY }`.
+4. `unready_head_event_ids = tentative_head_event_ids \ mergeable_head_event_ids`.
+5. If `mergeable_head_event_ids = ∅`: no merge is possible yet. Keep `tentative_prolly_root_hash` unchanged, conservatively retain unresolved parked head event IDs (`parked_conflicts ← parked_conflicts ∩ tentative_head_event_ids`), and preserve only the still-unsettled portion of the previous `projection_basis` (`projection_basis ← projection_basis ∩ tentative_head_event_ids`). Return.
+6. Sort `mergeable_head_event_ids` by HLC total order (deterministic).
+7. Apply `AnchoredFold(mergeable_head_event_ids, finalized_prolly_root_hash)` to compute `(merged_root, parked_ready)`:
    - This single fold contract is used for both single-head and multi-head reconciliation (no semantic single-head bypass).
    - On each conflicting fold step, the later head in total order is parked.
-7. `retained_unready_parked = parked_conflicts ∩ unready_head_event_ids`.
-8. `parked_conflicts ← parked_ready ∪ retained_unready_parked`.
-9. `tentative_prolly_root_hash ← merged_root`.
-10. `projection_basis ← mergeable_head_event_ids \ parked_ready`. This is the exact event-id basis embodied in `tentative_prolly_root_hash`.
-11. **`head_event_ids` are unchanged.** Head event IDs are always derived from `computeHeadEventIDs(clock)` — since reconcile does not add events to the clock, the head-event-id set cannot change. Parked head event IDs remain as persistent DAG forks until `RESOLVE_CONFLICT`.
+8. `retained_unready_parked = parked_conflicts ∩ unready_head_event_ids`.
+9. `parked_conflicts ← parked_ready ∪ retained_unready_parked`.
+10. `tentative_prolly_root_hash ← merged_root`.
+11. `projection_basis ← mergeable_head_event_ids \ parked_ready`. This is the exact event-id basis embodied in `tentative_prolly_root_hash`.
+12. **`head_event_ids` are unchanged.** Head event IDs are always derived from `computeHeadEventIDs(clock)` — since reconcile does not add events to the clock, the head-event-id set cannot change. Parked head event IDs remain as persistent DAG forks until `RESOLVE_CONFLICT`. Retained finalized clock bodies may still appear in `head_event_ids` structurally, but they do not re-enter tentative merge/parking once finalized.
 
 > **Why no merge events?** Disseminating merges would be pure redundancy — every peer holding the same events computes the same merged state. Worse, if merge events were disseminated, concurrent merges by different peers would create new DAG forks requiring further reconciliation (an infinite merge loop). Only three things inject new control-plane information: `LOCAL_WRITE` (new data), conflict-resolution actions (`RESOLVE_CONFLICT` and `RESOLVE_FINALIZED_CONFLICT`, both flowing through `LOCAL_WRITE`), and `HEARTBEAT` (which naturally reflects the reduced head set after merge).
 
@@ -555,7 +556,7 @@ Local compaction for finalized history retention. A peer that never runs `GC_CLO
    - Remove `event_id` from `chunks_ready`.
 3. Recompute `head_event_ids = computeHeadEventIDs(clock)`.
 4. Refresh `peer_seen_frontier[self]` to the locally derived seen frontier of the retained `clock`.
-5. Recompute reconcile projection (`tentative_prolly_root_hash`, `parked_conflicts`, `projection_basis`) from current reconcile inputs (`head_event_ids`, `clock`, `chunks_ready`, `finalized_prolly_root_hash`, `parked_conflicts`, `projection_basis`).
+5. Recompute reconcile projection (`tentative_prolly_root_hash`, `parked_conflicts`, `projection_basis`) from current reconcile inputs (`head_event_ids`, `clock`, `chunks_ready`, `finalized_prolly_root_hash`, `parked_conflicts`, `projection_basis`). Any retained finalized body that becomes a structural head after compaction remains below the tentative boundary and must not be re-parked or reintroduced into `projection_basis`.
 
 `GC_CLOCK` must preserve correctness: compacting finalized event bodies cannot remove ancestry needed by any retained event. The retained `clock` subgraph must stay parent-closed.
 
@@ -672,7 +673,7 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 
 **INV1c — Retained Finalized Subgraph Closure:** For any peer `p`, the retained finalized subset `p.clock.keys() ∩ p.finalized_events.keys()` is parent-closed. `GC_CLOCK` can compact finalized event bodies, but any finalized event body that remains in `clock` must retain the finalized ancestry needed by other retained events.
 
-**INV2 — Data Convergence:** For any two peers that have processed the same set of events in the same total order, `p.tentative_prolly_root_hash == q.tentative_prolly_root_hash` and `p.projection_basis == q.projection_basis`.
+**INV2 — Data Convergence:** For any two peers with the same tentative-projection inputs (`clock`, `chunks_ready`, `finalized_prolly_root_hash`, and `finalized_events`), the same deterministic reconcile projection is derived whenever at least one tentative head is mergeable. In that regime, `p.tentative_prolly_root_hash == q.tentative_prolly_root_hash` and `p.projection_basis == q.projection_basis`.
 
 **INV3 — Finalized History Agreement:** For any two peers with the same `finalized_commit_id` and the same derived finalized-commit lineage metadata reachable from that tip, the finalized Dolt commit DAG is byte-identical: same hashes, same parents, same roots. Auxiliary checkpoint-event provenance and finalized-conflict metadata may still require equal-tip sync, but that metadata repair must not change the finalized DAG itself. During a network partition, peers in different connected components finalize independently under their reduced `active_peers`; their finalized tips and lineage metadata therefore diverge whenever those components harden different histories. When the partition heals, `SYNC_FINALIZED` reconciles states (lineage ADOPT/NOOP/MERGE) into a shared fork-and-join DAG that is eventually identical across all peers. For more than two incomparable finalized tips, this convergence is by repeated deterministic merge-of-merges rounds over the remaining finalized frontier, not by one-shot associativity of nested pairwise merges.
 
@@ -687,7 +688,7 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 - **INV7a — No Unhandled Tentative Conflict:** `tentative_prolly_root_hash` is never a conflict sentinel. Every conflict detected by `MergeRoots` during reconciliation is captured in `parked_conflicts` (the later event by total order is parked). No conflict result propagates into the working state.
 - **INV7b — No Unhandled Finalized Conflict:** `finalized_prolly_root_hash` is never a conflict sentinel. `ADVANCE_STABILITY` requires stable non-parked frontier heads to be finalization-safe by construction, and `SYNC_FINALIZED` divergence merges handle conflicts by using the ours-side root (deterministic). No conflict result propagates into the finalized state.
 - **INV7c — Parked Event Integrity:** Every parked event references a known event in the clock. No conflict is silently discarded — parked events persist until explicitly resolved via `RESOLVE_CONFLICT`.
-- **INV7d — Parking Agreement (closure-ready):** For any two peers with the same clock and the same `finalized_prolly_root_hash`, parking decisions and `projection_basis` agree once relevant heads are mergeable. Under closure lag, parked tracking is conservative: unresolved parked head IDs are retained provisionally until closure completes.
+- **INV7d — Parking Agreement (closure-ready):** For any two peers with the same tentative-projection inputs (`clock`, `chunks_ready`, `finalized_prolly_root_hash`, and `finalized_events`), parking decisions and `projection_basis` agree once all tentative heads are mergeable. Under closure lag, parked tracking is conservative: unresolved parked head IDs are retained provisionally until closure completes.
 - **INV7e — Finalized Conflict Tracking:** Every finalized-layer conflict detected by `SYNC_FINALIZED` conflict handling is inserted into `finalized_conflicts` and remains present until its id enters durable `resolved_finalized_conflict_ids`.
 - **INV7f — Finalized Conflict Authenticity:** Every tracked `finalized_conflicts` entry corresponds to an actual merge conflict for its tuple `(ours_finalized_commit_id, theirs_finalized_commit_id, common_finalized_commit_id)` under `MergeRoots`.
 - **INV7g — Finalized Conflict ID Symmetry:** For the same finalized-merge conflict inputs, all peers derive the same deterministic `conflict_id`, regardless of which side initiates `SYNC_FINALIZED`.
@@ -703,6 +704,8 @@ Graceful: publish leave, removed from `active_peers` immediately. Ungraceful: st
 **INV9b — Subsumed Event Parent Link:** For every event `r` in `p.clock` with `r.resolved_parked_event_id = x` (non-null), `x ∈ r.parent_event_ids`. The resolution event causally parents from the event it subsumes.
 
 **INV9c — Subsumed Finalization Is Bookkeeping-Only:** For every peer `p`, subsumed events that are finalized do not change `finalized_prolly_root_hash`. Formally: if `ADVANCE_STABILITY` finalizes a subsumed event, `finalized_prolly_root_hash` and `finalized_commit_id` are unchanged.
+
+**INV9d — Finalized/Projection-Basis Disjointness:** For every peer `p`, `p.finalized_events.keys() ∩ p.projection_basis == ∅`. Retained finalized event bodies may stay in `clock` for bookkeeping, but they never participate in the live tentative projection basis.
 
 **INV10 — Reconcile Fixed-Point Consistency:** For every peer `p`, `p.tentative_prolly_root_hash`, `p.parked_conflicts`, and `p.projection_basis` must equal the deterministic reconcile projection of current state (including provisional closure-lag behavior). No action leaves stale reconcile outputs after changing `heads`, `clock`, `chunks_ready`, or finalized commit/content state.
 
@@ -913,7 +916,7 @@ Events are processed individually via `MergeRoots`. There is no batching into wa
 
 ### 7.3.1 Merges are silent local state
 
-Merges (RECONCILE) are deterministic local computations derived entirely from the Merkle clock and `finalized_prolly_root_hash`. They produce no events, no network traffic, and no DAG entries. Every peer holding the same event set independently computes the same `tentative_prolly_root_hash` and `projection_basis`.
+Merges (`RECONCILE`) are deterministic local computations derived from the current tentative-projection inputs: retained `clock`, `chunks_ready`, `finalized_prolly_root_hash`, and the locally derived `finalized_events` catalog. Retained finalized event bodies may still exist structurally in `clock`, but they remain below the tentative boundary and are excluded from tentative heads. Peers with the same tentative-projection inputs therefore compute the same `tentative_prolly_root_hash` and `projection_basis` whenever at least one tentative head is mergeable; under closure lag they conservatively retain unresolved parked tentative heads until closure completes. They produce no events, no network traffic, and no DAG entries.
 
 Only three protocol actions inject new control-plane information:
 - **LOCAL_WRITE** — new data (the event's `parent_event_ids = projection_basis` naturally reflects the tentative projection it was written on).
