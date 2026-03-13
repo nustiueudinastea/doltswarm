@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parallel Quint invariant test runner on cloud VMs (Scaleway or Hetzner).
+Parallel Quint invariant test runner on cloud VMs (Scaleway, Hetzner, or UpCloud).
 
 Provisions N VMs, installs Docker, pulls the pre-built quint image,
 uploads specs, and distributes invariant checks across VMs using all
@@ -9,12 +9,14 @@ available CPUs.
 Usage:
     python3 quint_cloud_runner.py --vms 3 --samples 10000
     python3 quint_cloud_runner.py --vms 2 --provider hetzner --samples 10000
+    python3 quint_cloud_runner.py --vms 2 --provider upcloud --samples 10000
     python3 quint_cloud_runner.py --vms 2 --vm-type POP2-HC-16C-32G --samples 50000
 
 Requirements:
     pip install paramiko
     pip install scaleway          # for Scaleway (default)
     pip install hcloud            # for Hetzner
+    pip install upcloud-api       # for UpCloud
 """
 
 from __future__ import annotations
@@ -64,6 +66,7 @@ class VMInstance:
     name: str = ""
     created_at: float = field(default_factory=time.monotonic)
     destroyed_at: float | None = None
+    hw_info: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -545,6 +548,121 @@ class HetznerProvider(CloudProvider):
 
 
 # ---------------------------------------------------------------------------
+# UpCloud provider
+# ---------------------------------------------------------------------------
+
+class UpCloudProvider(CloudProvider):
+    LOCATIONS = ["nl-ams1", "pl-waw1", "de-fra1"]
+    # Ubuntu 24.04 template UUID
+    UBUNTU_TEMPLATE = "01000000-0000-4000-8000-000030240200"
+
+    def __init__(self) -> None:
+        self._manager = None
+
+    @property
+    def name(self) -> str:
+        return "upcloud"
+
+    @property
+    def default_vm_type(self) -> str:
+        return "HICPU-8xCPU-12GB"
+
+    @property
+    def default_location(self) -> str:
+        return "nl-ams1"
+
+    def init(self) -> None:
+        try:
+            import upcloud_api  # noqa: F401
+        except ImportError:
+            sys.exit("ERROR: upcloud-api is required. Install with: pip install upcloud-api")
+
+        from upcloud_api import CloudManager
+
+        token = os.environ.get("UPCLOUD_TOKEN")
+        username = os.environ.get("UPCLOUD_USERNAME")
+        password = os.environ.get("UPCLOUD_PASSWORD")
+
+        if token:
+            self._manager = CloudManager(token=token)
+            self._manager.authenticate()
+            print("  Authenticated with UpCloud using API token")
+        elif username and password:
+            self._manager = CloudManager(username, password)
+            self._manager.authenticate()
+            print(f"  Authenticated with UpCloud as {username}")
+        else:
+            sys.exit("ERROR: Set UPCLOUD_TOKEN, or both UPCLOUD_USERNAME and UPCLOUD_PASSWORD")
+
+    def create_vm(self, name: str, vm_type: str, location: str) -> VMInstance:
+        from upcloud_api import Server, Storage, login_user_block
+
+        pub_key = get_ssh_public_key()
+        login_user = login_user_block(
+            username="root",
+            ssh_keys=[pub_key],
+            create_password=False,
+        )
+
+        locations = [location] + [l for l in self.LOCATIONS if l != location]
+        last_error = None
+
+        for loc in locations:
+            try:
+                server = Server(
+                    plan=vm_type,
+                    hostname=f"{name}.quint-runner",
+                    title=name,
+                    zone=loc,
+                    storage_devices=[
+                        Storage(
+                            os=self.UBUNTU_TEMPLATE,
+                            size=25,
+                        ),
+                    ],
+                    login_user=login_user,
+                )
+                server = self._manager.create_server(server)
+                server.ensure_started()
+                ip = server.get_public_ip()
+                if not ip:
+                    raise RuntimeError(f"VM {name} did not get a public IP in {loc}")
+                print(f"  Created VM {name} ({vm_type}) at {ip} [{loc}]")
+                return VMInstance(
+                    provider_handle=server,
+                    ip=ip,
+                    name=name,
+                )
+            except Exception as e:
+                last_error = e
+                if "unavailable" in str(e).lower() or "capacity" in str(e).lower():
+                    print(f"  [{name}] Zone {loc} unavailable, trying next...")
+                    continue
+                raise
+
+        raise RuntimeError(f"Failed to create VM {name} in any zone: {last_error}")
+
+    def destroy_vm(self, vm: VMInstance) -> None:
+        try:
+            vm.provider_handle.stop_and_destroy()
+            print(f"  Destroyed VM {vm.name}")
+        except Exception as e:
+            print(f"  WARNING: Failed to destroy {vm.name}: {e}")
+
+    # UpCloud hourly pricing (EUR) — https://upcloud.com/pricing
+    _PRICING = {
+        "HICPU-2xCPU-4GB":   0.06,
+        "HICPU-4xCPU-8GB":   0.11,
+        "HICPU-8xCPU-12GB":  0.22,
+        "HICPU-12xCPU-16GB": 0.33,
+        "HICPU-16xCPU-32GB": 0.44,
+    }
+
+    def price_per_hour(self, vm_type: str) -> float | None:
+        return self._PRICING.get(vm_type)
+
+
+# ---------------------------------------------------------------------------
 # VM provisioning (provider-agnostic)
 # ---------------------------------------------------------------------------
 
@@ -558,16 +676,47 @@ def provision_vm(vm: VMInstance, specs_dir: Path) -> None:
     install_script = textwrap.dedent(f"""\
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y -qq docker.io > /dev/null 2>&1
+        for attempt in 1 2 3; do
+            apt-get update -qq && break
+            echo "apt-get update failed (attempt $attempt), retrying in 10s..."
+            sleep 10
+        done
+        if apt-cache show docker.io > /dev/null 2>&1; then
+            apt-get install -y -qq docker.io > /dev/null 2>&1
+        else
+            apt-get install -y -qq ca-certificates curl > /dev/null 2>&1
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+> /etc/apt/sources.list.d/docker.list
+            apt-get update -qq
+            apt-get install -y -qq docker-ce docker-ce-cli > /dev/null 2>&1
+        fi
         systemctl enable --now docker
         docker pull {DOCKER_IMAGE}
     """)
-    ssh_exec(vm.ssh, install_script, timeout=300, prefix=vm.name)
+    ssh_exec(vm.ssh, install_script, timeout=600, prefix=vm.name)
 
-    # Detect CPU count
+    # Detect CPU count and collect hardware info
     _, cpu_out, _ = ssh_exec(vm.ssh, "nproc")
     vm.cpus = int(cpu_out.strip())
+
+    hw_script = textwrap.dedent("""\
+        echo "CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+        echo "CPU_CORES=$(nproc)"
+        echo "CPU_SOCKETS=$(grep -c 'physical id' /proc/cpuinfo 2>/dev/null | sort -u | wc -l || echo 1)"
+        echo "CPU_MHZ=$(grep -m1 'cpu MHz' /proc/cpuinfo | cut -d: -f2 | xargs)"
+        echo "MEM_TOTAL=$(awk '/MemTotal/{printf "%.1f GB", $2/1024/1024}' /proc/meminfo)"
+        echo "ARCH=$(uname -m)"
+        echo "KERNEL=$(uname -r)"
+    """)
+    _, hw_out, _ = ssh_exec(vm.ssh, hw_script)
+    vm.hw_info = {}
+    for line in hw_out.strip().splitlines():
+        if "=" in line:
+            key, val = line.split("=", 1)
+            vm.hw_info[key] = val
     print(f"  [{vm.name}] Docker ready — {vm.cpus} CPUs")
 
     # Upload spec files
@@ -909,6 +1058,7 @@ def save_logs(
 PROVIDERS = {
     "scaleway": ScalewayProvider,
     "hetzner": HetznerProvider,
+    "upcloud": UpCloudProvider,
 }
 
 
@@ -1051,6 +1201,22 @@ def main() -> None:
         print("Phase 2: Provisioning VMs...")
         with ThreadPoolExecutor(max_workers=len(vms)) as pool:
             list(pool.map(lambda vm: provision_vm(vm, specs_dir), vms))
+        print()
+
+        # Print VM hardware summary
+        print("VM Hardware:")
+        for vm in vms:
+            hw = vm.hw_info
+            cpu_model = hw.get("CPU_MODEL", "unknown")
+            cpu_mhz = hw.get("CPU_MHZ", "")
+            mem = hw.get("MEM_TOTAL", "unknown")
+            arch = hw.get("ARCH", "unknown")
+            kernel = hw.get("KERNEL", "unknown")
+            freq = f" @ {float(cpu_mhz):.0f} MHz" if cpu_mhz else ""
+            print(f"  {vm.name} ({vm.ip}):")
+            print(f"    CPU:    {vm.cpus}x {cpu_model}{freq}")
+            print(f"    Memory: {mem}")
+            print(f"    Arch:   {arch}, kernel {kernel}")
         print()
 
         # Phase 3: Distribute and run invariants
