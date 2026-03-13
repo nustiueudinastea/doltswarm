@@ -28,9 +28,12 @@
  * The spec abstracts that contract as `validEvent(e)` and models only
  * executions where every peer applies the same predicate.
  *
- * Events carry anchor_prolly_root_hash in addition to prolly_root_hash. Reconciliation and
- * finalization start from the current finalized content-root accumulator, but
- * each event is merged against its own recorded anchor_prolly_root_hash.
+ * Events carry anchor_prolly_root_hash in addition to prolly_root_hash.
+ * Reconciliation folds tentative heads directly against their recorded anchors.
+ * Finalization still starts from the current finalized content-root accumulator,
+ * but replays each chosen event against its reconstructed parent-basis replay
+ * base (recorded anchor for root events, deterministic parent-basis fold
+ * otherwise).
  *
  * Conceptual split mirrored from the protocol:
  * - Authoritative finalized history:
@@ -378,15 +381,24 @@ module doltswarm_verify {
     clock.keys().exclude(allParents)
   }
 
-  /// Derived set of event IDs whose tentative conflict has been explicitly
-  /// resolved. These events are finalized as bookkeeping-only entries.
-  pure def subsumedEvents(clock: EventID -> Event): Set[EventID] =
-    clock.keys().fold(Set(), (acc, event_id) =>
+  /// Derived set of event IDs whose conflicted tentative branch has been
+  /// explicitly carried forward by a resolution event. This includes the
+  /// resolved parked head and its retained tentative ancestors, all of which
+  /// finalize as bookkeeping-only entries rather than by replay.
+  pure def subsumedEvents(clock: EventID -> Event): Set[EventID] = {
+    val resolvedParkedRoots = clock.keys().fold(Set(), (acc, event_id) =>
       match clock.get(event_id).resolved_parked_event_id {
         | Some(pid) => acc.union(Set(pid))
         | None => acc
       }
     )
+    ancestorIdClosure(resolvedParkedRoots, clock)
+  }
+
+  /// Ancestors of unresolved parked heads remain blocked from finalization
+  /// until that parked branch is either resolved or compacted away.
+  pure def parkedBranchEvents(st: NodeState): Set[EventID] =
+    ancestorIdClosure(st.parked_conflicts, st.clock)
 
   /// Ancestor-ID closure from a seed set by repeatedly following parent links.
   ///
@@ -486,10 +498,12 @@ module doltswarm_verify {
     eventIDList.sortList((a, b) => less(clock.get(a).hlc, clock.get(b).hlc))
   }
 
-  /// Shared anchored ordered merge fold used by RECONCILE and ADVANCE_STABILITY.
-  /// Starts from start_prolly_root_hash and merges each head against its own recorded
-  /// anchor_prolly_root_hash. Returns (merged_root, conflicts) where conflicts
-  /// contains head event IDs whose merge against the running accumulator conflicted.
+  /// Shared anchored ordered merge fold used by RECONCILE and by
+  /// ADVANCE_STABILITY's replay-base reconstruction.
+  /// Starts from start_prolly_root_hash and merges each head against its own
+  /// recorded anchor_prolly_root_hash. Returns (merged_root, conflicts) where
+  /// conflicts contains head event IDs whose merge against the running
+  /// accumulator conflicted.
   pure def anchoredFold(head_event_ids: Set[EventID], st: NodeState,
       start_prolly_root_hash: ProllyRootHash): (ProllyRootHash, Set[EventID]) = {
     val sorted = sortEventIDsByHLC(head_event_ids, st.clock)
@@ -506,10 +520,63 @@ module doltswarm_verify {
     })
   }
 
+  /// Parents that define the actual replay basis for finalization. Conflict
+  /// resolution events carry the resolved parked head as a causal/bookkeeping
+  /// parent, but replay against the current non-parked basis rather than
+  /// treating the parked head as the write ancestor.
+  pure def finalizationReplayParents(event: Event): Set[EventID] =
+    match event.resolved_parked_event_id {
+      | Some(parkedEventID) => event.parent_event_ids.exclude(Set(parkedEventID))
+      | None => event.parent_event_ids
+    }
+
+  /// Deterministic replay base for finalization. Root events replay against
+  /// their recorded finalized anchor; descendant events replay against the
+  /// reconstructed parent-basis root they were written on.
+  pure def finalizationReplayBase(st: NodeState, event_id: EventID): ProllyRootHash = {
+    val event = st.clock.get(event_id)
+    val replayParents = finalizationReplayParents(event)
+    if (replayParents.empty()) event.anchor_prolly_root_hash
+    else if (not(replayParents.subseteq(st.clock.keys()))) CONFLICT_HASH
+    else {
+      val parentFold = anchoredFold(replayParents, st, event.anchor_prolly_root_hash)
+      if (parentFold._2.empty()) parentFold._1
+      else CONFLICT_HASH
+    }
+  }
+
+  /// Replay safety for non-subsumed finalization. Causal stability and
+  /// parent-finalization are necessary but not sufficient: a replay candidate is
+  /// only admissible if its reconstructed replay base is defined and replaying
+  /// it into the current finalized accumulator is conflict-free.
+  pure def replayFinalizationSafe(st: NodeState, event_id: EventID): bool = {
+    val event = st.clock.get(event_id)
+    val replayBase = finalizationReplayBase(st, event_id)
+    replayBase != CONFLICT_HASH and
+      mergeRoots(
+        st.finalized_prolly_root_hash,
+        event.prolly_root_hash,
+        replayBase
+      ) != CONFLICT_HASH
+  }
+
+  /// Eligible ready heads that are already unsafe to replay against the
+  /// current finalized accumulator must remain parked, even if they become the
+  /// only tentative head after a competing branch hardens.
+  pure def replayUnsafeEligibleHeads(st: NodeState, readyHeads: Set[EventID]): Set[EventID] =
+    readyHeads.filter(event_id => {
+      val event = st.clock.get(event_id)
+      not(subsumedEvents(st.clock).contains(event_id)) and
+        event.parent_event_ids.subseteq(st.finalized_events.keys()) and
+        not(replayFinalizationSafe(st, event_id))
+    })
+
   /// Deterministic tentative projection for head_event_ids:
   /// - full closure path: mergeable heads are folded with per-event anchors
   /// - closure-lag path: projection is provisional and retains unresolved
   ///   parked head IDs conservatively until closure completes
+  /// - immediately eligible heads that are replay-unsafe against the current
+  ///   finalized accumulator stay parked instead of re-entering projection
   ///
   /// Returns (merged_root, parked_set, projection_basis). Single-head and
   /// multi-head use the same anchored fold semantics (no single-head bypass).
@@ -526,11 +593,13 @@ module doltswarm_verify {
         st.projection_basis.intersect(tentativeHeads)
       )
     } else {
-      val folded = anchoredFold(readyHeads, st, st.finalized_prolly_root_hash)
+      val replayUnsafeHeads = replayUnsafeEligibleHeads(st, readyHeads)
+      val projectionReadyHeads = readyHeads.exclude(replayUnsafeHeads)
+      val folded = anchoredFold(projectionReadyHeads, st, st.finalized_prolly_root_hash)
       val unreadyHeads = tentativeHeads.exclude(readyHeads)
       val retainedUnreadyParked = st.parked_conflicts.intersect(unreadyHeads)
-      val parkedSet = folded._2.union(retainedUnreadyParked)
-      val projectionBasis = readyHeads.exclude(folded._2)
+      val parkedSet = folded._2.union(retainedUnreadyParked).union(replayUnsafeHeads)
+      val projectionBasis = projectionReadyHeads.exclude(folded._2)
       (folded._1, parkedSet, projectionBasis)
     }
   }
@@ -544,17 +613,22 @@ module doltswarm_verify {
   pure def finalizationCandidates(st: NodeState): Set[EventID] =
     st.clock.keys().filter(event_id =>
       not(st.finalized_events.has(event_id)) and
-      not(st.parked_conflicts.contains(event_id)) and
+      not(parkedBranchEvents(st).contains(event_id)) and
       isParentClosed(st.clock, event_id) and
       st.chunks_ready.contains(event_id) and
       coveredByActivePeers(st, event_id)
     )
 
   /// Canonical stable frontier for finalized compilation: stable events whose
-  /// parents are already in finalized history.
+  /// parents are already in finalized history, and whose non-subsumed replay is
+  /// already known to be safe against the current finalized accumulator.
   pure def finalizationEligible(st: NodeState): Set[EventID] =
     finalizationCandidates(st).filter(event_id =>
-      st.clock.get(event_id).parent_event_ids.subseteq(st.finalized_events.keys())
+      st.clock.get(event_id).parent_event_ids.subseteq(st.finalized_events.keys()) and
+        (
+          subsumedEvents(st.clock).contains(event_id) or
+            replayFinalizationSafe(st, event_id)
+        )
     )
 
   pure def nextFinalizationEventID(st: NodeState): EventID =
@@ -568,7 +642,9 @@ module doltswarm_verify {
     if (event_id == EMPTY_EVENT_ID) st.finalized_prolly_root_hash
     else {
       val event = st.clock.get(event_id)
-      mergeRoots(st.finalized_prolly_root_hash, event.prolly_root_hash, event.anchor_prolly_root_hash)
+      val replayBase = finalizationReplayBase(st, event_id)
+      if (replayBase == CONFLICT_HASH) CONFLICT_HASH
+      else mergeRoots(st.finalized_prolly_root_hash, event.prolly_root_hash, replayBase)
     }
   }
 
@@ -858,6 +934,81 @@ module doltswarm_verify {
     }
   }
 
+  /// Deterministic helper for synthetic seeded bootstrap scenarios.
+  pure def seedEvent(peer: PeerID, wall: int, logical: int,
+      prollyRootHash: ProllyRootHash, anchorRootHash: ProllyRootHash,
+      parentEventIDs: Set[EventID]): Event = {
+    val eventID = makeEventID(peer, wall, logical)
+    {
+      event_id: eventID,
+      prolly_root_hash: prollyRootHash,
+      anchor_prolly_root_hash: anchorRootHash,
+      parent_event_ids: parentEventIDs,
+      resolved_parked_event_id: None,
+      resolved_finalized_conflict_id: None,
+      hlc: { wall: wall, logical: logical, peer: peer },
+      peer: peer,
+    }
+  }
+
+  /// Seeded bootstrapped checkpoint state used only by scenario invariants.
+  /// retainFinalizedBody toggles whether the current checkpoint event body is
+  /// still materialized locally. includeExtraCheckpoint toggles extra known but
+  /// unreachable checkpoint metadata so equal-tip metadata repair can be
+  /// checked without introducing bootstrap as a core action.
+  pure def seedBootstrappedCheckpointState(self: PeerID,
+      retainFinalizedBody: bool, includeExtraCheckpoint: bool): NodeState = {
+    val event1 = seedEvent(1, 1, 0, 11, EMPTY_ROOT, Set())
+    val event2 = seedEvent(2, 1, 0, 12, EMPTY_ROOT, Set())
+    val tip1 = makeFinalizedCheckpointCommitID(11, Set())
+    val tip2 = makeFinalizedCheckpointCommitID(12, Set())
+    val parentsBase = Map()
+      .put(EMPTY_FINALIZED_COMMIT_ID, Set())
+      .put(tip1, Set())
+    val parents =
+      if (includeExtraCheckpoint)
+        lineageAddFinalizedCommit(parentsBase, tip2, Set())
+      else
+        parentsBase
+    val checkpointsBase = Map().put(tip1, Map().put(event1.event_id, event1.prolly_root_hash))
+    val checkpoints =
+      if (includeExtraCheckpoint)
+        checkpointsBase.put(tip2, Map().put(event2.event_id, event2.prolly_root_hash))
+      else
+        checkpointsBase
+    val clock =
+      if (retainFinalizedBody)
+        Map().put(event1.event_id, event1)
+      else
+        Map()
+    val chunksReady =
+      if (retainFinalizedBody)
+        Set(event1.event_id)
+      else
+        Set()
+    {
+      clock: clock,
+      head_event_ids: computeHeadEventIDs(clock),
+      chunks_ready: chunksReady,
+      tentative_prolly_root_hash: 11,
+      projection_basis: Set(),
+      hlc_clock: { wall: 2, logical: 0, peer: self },
+      peer_seen_frontier: PEERS.mapBy(peer =>
+        if (peer == self) observedFrontier(clock) else Set()
+      ),
+      finalized_commit_id: tip1,
+      finalized_prolly_root_hash: 11,
+      finalized_events: derivedFinalizedEventMap(tip1, parents, checkpoints),
+      finalized_commit_parents: parents,
+      finalized_checkpoint_events: checkpoints,
+      parked_conflicts: Set(),
+      finalized_conflicts: Map(),
+      resolved_finalized_conflict_ids: Set(),
+      active_peers: Set(self),
+      localWall: 2,
+    }
+  }
+
   pure def resolveFinalizedConflictEnabled(st: NodeState, p: PeerID,
       conflictID: FinalizedConflictID): bool = all {
     st.finalized_conflicts.has(conflictID),
@@ -960,6 +1111,56 @@ module doltswarm_verify {
     {
       ...st,
       peer_seen_frontier: st.peer_seen_frontier.set(q, remote.peer_seen_frontier.get(q)),
+      active_peers: newActivePeers,
+    }
+  }
+
+  /// RECEIVE_EVENT pure local result for one admissible event.
+  pure def receiveResult(st: NodeState, p: PeerID, e: Event): NodeState = {
+    val newClock = st.clock.put(e.event_id, e)
+    val newHLC = observe(st.hlc_clock, e.hlc, st.localWall, p)
+    val tempState: NodeState = {
+      ...st,
+      clock: newClock,
+      head_event_ids: computeHeadEventIDs(newClock),
+      hlc_clock: newHLC,
+      peer_seen_frontier: st.peer_seen_frontier.set(p, observedFrontier(newClock)),
+    }
+    val reconcile = computeTentativeProjection(tempState)
+    {
+      ...tempState,
+      tentative_prolly_root_hash: reconcile._1,
+      parked_conflicts: reconcile._2,
+      projection_basis: reconcile._3,
+    }
+  }
+
+  /// GC_CLOCK pure local result for pruning one retained finalized event body.
+  pure def gcResult(st: NodeState, p: PeerID, event_id: EventID): NodeState = {
+    val newClock = dropEvent(st.clock, event_id)
+    val newHeads = computeHeadEventIDs(newClock)
+    val newChunksReady = st.chunks_ready.intersect(newClock.keys())
+    val gcState: NodeState = {
+      ...st,
+      clock: newClock,
+      head_event_ids: newHeads,
+      chunks_ready: newChunksReady,
+      peer_seen_frontier: st.peer_seen_frontier.set(p, observedFrontier(newClock)),
+    }
+    val reconcile = computeTentativeProjection(gcState)
+    {
+      ...gcState,
+      tentative_prolly_root_hash: reconcile._1,
+      parked_conflicts: reconcile._2,
+      projection_basis: reconcile._3,
+    }
+  }
+
+  /// EVICT_PEER pure local result.
+  pure def evictResult(st: NodeState, q: PeerID): NodeState = {
+    val newActivePeers = st.active_peers.exclude(Set(q))
+    {
+      ...st,
       active_peers: newActivePeers,
     }
   }
@@ -1278,11 +1479,28 @@ module doltswarm_verify {
     syncPeerIfEnabled(after23, 3, 2)
   }
 
+  pure val FAIR_HEAL_SCHEDULE_REVERSE: List[(PeerID, PeerID)] =
+    [(3, 2), (2, 3), (3, 1), (1, 3), (2, 1), (1, 2)]
+
+  pure val FAIR_HEAL_SCHEDULE_ROTATED: List[(PeerID, PeerID)] =
+    [(2, 3), (3, 2), (1, 3), (3, 1), (1, 2), (2, 1)]
+
+  /// Alternate fair schedules used by bounded convergence regressions.
+  def healRoundScheduled(peerStates: PeerID -> NodeState,
+      schedule: List[(PeerID, PeerID)]): PeerID -> NodeState =
+    schedule.foldl(peerStates, (acc, pair) =>
+      syncPeerIfEnabled(acc, pair._1, pair._2)
+    )
+
   pure val FULL_MESH_HEAL_ROUNDS: int = 3
 
   def healRoundsFullMesh(peerStates: PeerID -> NodeState, rounds: int):
       PeerID -> NodeState =
     range(0, rounds).foldl(peerStates, (acc, _) => healRoundFullMesh(acc))
+
+  def healRoundsScheduled(peerStates: PeerID -> NodeState,
+      schedule: List[(PeerID, PeerID)], rounds: int): PeerID -> NodeState =
+    range(0, rounds).foldl(peerStates, (acc, _) => healRoundScheduled(acc, schedule))
 
   /// Finalized-state update for SYNC_FINALIZED (without tentative_prolly_root_hash re-anchoring).
   pure def syncFinalizedCoreResult(st_local: NodeState, st_remote: NodeState): NodeState = {
@@ -1734,8 +1952,10 @@ module doltswarm_verify {
   /// not parked, not already finalized, and have all parents already finalized.
   /// The chosen event is the minimum eligible one by deterministic HLC/EventID
   /// order. The checkpoint merge starts from finalized_prolly_root_hash and
-  /// merges only that event against its recorded anchor, preserving a canonical
-  /// finalized checkpoint sequence independent of scheduler timing.
+  /// merges only that event against its reconstructed replay base (recorded
+  /// anchor for root events, deterministic parent-basis fold otherwise),
+  /// preserving a canonical finalized checkpoint sequence independent of
+  /// scheduler timing.
   ///
   /// In the executable model this standalone action is a scheduling abstraction
   /// for all candidate-enabling transitions (receive, chunk-ready, heartbeat,
@@ -2022,6 +2242,40 @@ module doltswarm_verify {
     (s1.finalized_commit_id == s2.finalized_commit_id) implies
       (s1.finalized_prolly_root_hash == s2.finalized_prolly_root_hash)
   }))
+
+  /// Identity-separation regression: finalized-history identity depends on the
+  /// exact parent set, not only on the prolly-root hash.
+  /// @default_steps 12
+  val inv_same_root_different_parents_distinct_finalized_commit_ids = all {
+    val parentA = makeFinalizedCheckpointCommitID(11, Set())
+    val parentB = makeFinalizedCheckpointCommitID(12, Set())
+    val childOnA = makeFinalizedCheckpointCommitID(13, Set(parentA))
+    val childOnB = makeFinalizedCheckpointCommitID(13, Set(parentB))
+    val mergeChild = makeFinalizedMergeCommitID(13, Set(parentA, parentB))
+    all {
+      childOnA != childOnB,
+      childOnA != mergeChild,
+      childOnB != mergeChild,
+    }
+  }
+
+  /// Identity-separation regression: two distinct events may legitimately
+  /// carry the same prolly-root hash without collapsing event history.
+  /// @default_steps 12
+  val inv_same_prolly_root_does_not_collapse_event_history = all {
+    val event1 = seedEvent(1, 1, 0, 11, EMPTY_ROOT, Set())
+    val event2 = seedEvent(2, 1, 0, 11, EMPTY_ROOT, Set(event1.event_id))
+    val seedClock = Map()
+      .put(event1.event_id, event1)
+      .put(event2.event_id, event2)
+    all {
+      event1.event_id != event2.event_id,
+      event1.prolly_root_hash == event2.prolly_root_hash,
+      seedClock.keys().size() == 2,
+      computeHeadEventIDs(seedClock) == Set(event2.event_id),
+      ancestorIdClosure(Set(event2.event_id), seedClock) == Set(event1.event_id, event2.event_id),
+    }
+  }
 
   /// Finalized lineage well-formedness:
   /// - EMPTY_FINALIZED_COMMIT_ID is present
@@ -2551,6 +2805,33 @@ module doltswarm_verify {
     })
   })
 
+  /// Finalized-conflict lifecycle regression: once a resolving claim hardens
+  /// into finalized state, the durable resolved-id set carries the truth and
+  /// later finalized sync must preserve that outcome.
+  /// @default_steps 20
+  val inv_resolved_finalized_conflict_hardens_and_syncs = PEERS.forall(p => PEERS.forall(q => {
+    val st = nodes.get(p)
+    val st_q = nodes.get(q)
+    val nextEventID = nextFinalizationEventID(st)
+    val post = finalizeResult(st)
+    (finalizeEnabled(st) and nextEventID != EMPTY_EVENT_ID) implies
+      match st.clock.get(nextEventID).resolved_finalized_conflict_id {
+        | Some(conflictID) => all {
+          post.resolved_finalized_conflict_ids.contains(conflictID),
+          not(post.finalized_conflicts.has(conflictID)),
+          (syncEnabled(allPairs(PEERS), p, q, post, st_q)) implies all {
+            applySyncFinalized(post, st_q).resolved_finalized_conflict_ids.contains(conflictID),
+            not(applySyncFinalized(post, st_q).finalized_conflicts.has(conflictID)),
+          },
+          (syncEnabled(allPairs(PEERS), q, p, st_q, post)) implies all {
+            applySyncFinalized(st_q, post).resolved_finalized_conflict_ids.contains(conflictID),
+            not(applySyncFinalized(st_q, post).finalized_conflicts.has(conflictID)),
+          },
+        }
+        | None => true
+      }
+  }))
+
   /// Liveness-oriented bounded scenario checks (fairness approximations):
   /// - heartbeats/sync actions eventually fire on connected peers
   /// - closure/chunk readiness actions eventually complete for reachable events
@@ -2686,6 +2967,47 @@ module doltswarm_verify {
     }
   }
 
+  /// Alternate fair schedules should also avoid frontier growth in one round.
+  /// This does not prove arbitrary-schedule liveness, but it checks that the
+  /// bounded healing story is not an artifact of one hard-coded pair order.
+  /// @default_steps 20
+  val inv_alt_scheduled_heal_round_frontier_nonincreasing = {
+    val healedReverse = healRoundScheduled(nodes, FAIR_HEAL_SCHEDULE_REVERSE)
+    val healedRotated = healRoundScheduled(nodes, FAIR_HEAL_SCHEDULE_ROTATED)
+    allPairs(PEERS).subseteq(connected) implies all {
+      globalFinalizedFrontier(healedReverse).size() <= globalFinalizedFrontier(nodes).size(),
+      globalFinalizedFrontier(healedRotated).size() <= globalFinalizedFrontier(nodes).size(),
+    }
+  }
+
+  /// Bounded convergence regression for two alternate fair schedules.
+  /// This strengthens the partition-heal checks beyond the default full-mesh
+  /// ordered-pair sequence without claiming a full temporal fairness proof.
+  /// @default_steps 20
+  val inv_alt_scheduled_heal_bounded_converges = {
+    val initialTips = finalizedTipSetAcross(nodes)
+    val healedReverse = healRoundsScheduled(nodes, FAIR_HEAL_SCHEDULE_REVERSE, FULL_MESH_HEAL_ROUNDS)
+    val healedRotated = healRoundsScheduled(nodes, FAIR_HEAL_SCHEDULE_ROTATED, FULL_MESH_HEAL_ROUNDS)
+    val reverseParents = mergedFinalizedParentsAcross(healedReverse)
+    val rotatedParents = mergedFinalizedParentsAcross(healedRotated)
+    allPairs(PEERS).subseteq(connected) implies all {
+      allPeersSameFinalizedState(healedReverse),
+      globalFinalizedFrontier(healedReverse) == Set(healedReverse.get(1).finalized_commit_id),
+      finalizedDescendsFromAll(
+        healedReverse.get(1).finalized_commit_id,
+        initialTips,
+        reverseParents
+      ),
+      allPeersSameFinalizedState(healedRotated),
+      globalFinalizedFrontier(healedRotated) == Set(healedRotated.get(1).finalized_commit_id),
+      finalizedDescendsFromAll(
+        healedRotated.get(1).finalized_commit_id,
+        initialTips,
+        rotatedParents
+      ),
+    }
+  }
+
   /// Once every peer in a connected component already shares the same
   /// finalized state, one more local heal attempt inside that component must
   /// keep the component converged and preserve its unique frontier tip.
@@ -2795,6 +3117,20 @@ module doltswarm_verify {
     )
   })
 
+  /// Checkpoint-descriptor bookkeeping must agree with any retained event
+  /// body that remains locally materialized in clock.
+  /// @default_steps 20
+  val inv_checkpoint_descriptor_root_consistency = PEERS.forall(p => {
+    val st = nodes.get(p)
+    st.finalized_checkpoint_events.keys().forall(finalized_commit =>
+      st.finalized_checkpoint_events.get(finalized_commit).keys().forall(event_id =>
+        not(st.clock.has(event_id)) or
+          st.clock.get(event_id).prolly_root_hash
+            == st.finalized_checkpoint_events.get(finalized_commit).get(event_id)
+      )
+    )
+  })
+
   /// LOCAL_WRITE must not directly mutate finalized state. Concurrent writes
   /// remain below the finalized-history boundary.
   /// @default_steps 3
@@ -2802,6 +3138,30 @@ module doltswarm_verify {
     val st = nodes.get(p)
     writeEnabled(st) implies CONTENTS.forall(content => {
       val post = writeResult(st, p, content)
+      all {
+        post.finalized_commit_id == st.finalized_commit_id,
+        post.finalized_prolly_root_hash == st.finalized_prolly_root_hash,
+        post.finalized_events == st.finalized_events,
+        post.finalized_commit_parents == st.finalized_commit_parents,
+        post.finalized_checkpoint_events == st.finalized_checkpoint_events,
+        post.finalized_conflicts == st.finalized_conflicts,
+        post.resolved_finalized_conflict_ids == st.resolved_finalized_conflict_ids,
+      }
+    })
+  })
+
+  /// RECEIVE_EVENT is a tentative-layer ingestion step only; it must not
+  /// directly mutate finalized state.
+  /// @default_steps 20
+  val inv_receive_preserves_finalized_state = PEERS.forall(p => {
+    val st = nodes.get(p)
+    val processable = inbox.get(p).filter(e =>
+      validEvent(e) and
+      not(st.clock.keys().contains(e.event_id)) and
+      not(st.finalized_events.has(e.event_id))
+    )
+    processable.forall(e => {
+      val post = receiveResult(st, p, e)
       all {
         post.finalized_commit_id == st.finalized_commit_id,
         post.finalized_prolly_root_hash == st.finalized_prolly_root_hash,
@@ -2829,6 +3189,46 @@ module doltswarm_verify {
       post.finalized_conflicts == st.finalized_conflicts,
       post.resolved_finalized_conflict_ids == st.resolved_finalized_conflict_ids,
     }
+  })
+
+  /// GC_CLOCK is local resource management only; it must not directly mutate
+  /// finalized history or finalized-layer conflict metadata.
+  /// @default_steps 20
+  val inv_gc_preserves_finalized_state = PEERS.forall(p => {
+    val st = nodes.get(p)
+    gcPruneable(st).forall(event_id => {
+      val post = gcResult(st, p, event_id)
+      all {
+        post.finalized_commit_id == st.finalized_commit_id,
+        post.finalized_prolly_root_hash == st.finalized_prolly_root_hash,
+        post.finalized_events == st.finalized_events,
+        post.finalized_commit_parents == st.finalized_commit_parents,
+        post.finalized_checkpoint_events == st.finalized_checkpoint_events,
+        post.finalized_conflicts == st.finalized_conflicts,
+        post.resolved_finalized_conflict_ids == st.resolved_finalized_conflict_ids,
+      }
+    })
+  })
+
+  /// EVICT_PEER changes only witness membership; it must not directly mutate
+  /// finalized history or finalized-layer conflict metadata.
+  /// @default_steps 20
+  val inv_evict_preserves_finalized_state = PEERS.forall(p => {
+    val st = nodes.get(p)
+    PEERS.filter(q =>
+      q != p and st.active_peers.contains(q) and not(isConnected(connected, p, q))
+    ).forall(q => {
+      val post = evictResult(st, q)
+      all {
+        post.finalized_commit_id == st.finalized_commit_id,
+        post.finalized_prolly_root_hash == st.finalized_prolly_root_hash,
+        post.finalized_events == st.finalized_events,
+        post.finalized_commit_parents == st.finalized_commit_parents,
+        post.finalized_checkpoint_events == st.finalized_checkpoint_events,
+        post.finalized_conflicts == st.finalized_conflicts,
+        post.resolved_finalized_conflict_ids == st.resolved_finalized_conflict_ids,
+      }
+    })
   })
 
   /// Normal finalization extends finalized lineage with at most one new edge:
@@ -2870,6 +3270,63 @@ module doltswarm_verify {
     }
   })
 
+  /// Replay-base reconstruction must stay defined for non-subsumed eligible
+  /// events: their finalized parents must determine one deterministic parent
+  /// basis root.
+  /// @default_steps 20
+  val inv_finalization_replay_base_is_defined = PEERS.forall(p => {
+    val st = nodes.get(p)
+    finalizationEligible(st).exclude(subsumedEvents(st.clock)).forall(event_id =>
+      finalizationReplayBase(st, event_id) != CONFLICT_HASH
+    )
+  })
+
+  /// An immediately eligible head that is replay-unsafe against the current
+  /// finalized accumulator must remain parked and out of projection until a
+  /// human resolution event carries it forward.
+  /// @default_steps 20
+  val inv_replay_unsafe_eligible_heads_are_parked = PEERS.forall(p => {
+    val st = nodes.get(p)
+    val replayUnsafe = replayUnsafeEligibleHeads(st, mergeableHeadEventIDs(st))
+    all {
+      replayUnsafe.subseteq(st.parked_conflicts),
+      replayUnsafe.intersect(st.projection_basis).empty(),
+    }
+  })
+
+  /// Direct finalization-safety check: every non-subsumed eligible event must
+  /// merge conflict-free against the current finalized accumulator once replayed
+  /// against its reconstructed parent-basis base.
+  /// @default_steps 20
+  val inv_finalization_eligible_events_are_conflict_free = PEERS.forall(p => {
+    val st = nodes.get(p)
+    finalizationEligible(st).exclude(subsumedEvents(st.clock)).forall(event_id => {
+      val event = st.clock.get(event_id)
+      val replayBase = finalizationReplayBase(st, event_id)
+      replayBase != CONFLICT_HASH and
+        mergeRoots(
+          st.finalized_prolly_root_hash,
+          event.prolly_root_hash,
+          replayBase
+        ) != CONFLICT_HASH
+    })
+  })
+
+  /// ADVANCE_STABILITY may harden finalized-conflict resolution claims and thus
+  /// shrink finalized_conflicts, but it must never create a fresh conflict id.
+  /// @default_steps 20
+  val inv_finalize_does_not_create_finalized_conflicts = PEERS.forall(p => {
+    val st = nodes.get(p)
+    val post = finalizeResult(st)
+    finalizeEnabled(st) implies all {
+      post.finalized_conflicts.keys().subseteq(st.finalized_conflicts.keys()),
+      post.finalized_conflicts.keys().forall(conflictID =>
+        st.finalized_conflicts.has(conflictID) and
+          post.finalized_conflicts.get(conflictID) == st.finalized_conflicts.get(conflictID)
+      ),
+    }
+  })
+
   /// Tentative conflict resolution emits a normal anchored write that
   /// references the resolved parked head and leaves finalized state untouched.
   /// @default_steps 20
@@ -2903,6 +3360,27 @@ module doltswarm_verify {
         }
       })
     })
+  })
+
+  /// Resolving one parked head may legitimately release another parked head if
+  /// full deterministic recomputation makes that other head part of the live
+  /// projection. But an unrelated parked head must not disappear while staying
+  /// tentative, non-subsumed, and outside the new projection basis.
+  /// @default_steps 20
+  val inv_resolve_conflict_preserves_other_parked_heads = PEERS.forall(p => {
+    val st = nodes.get(p)
+    (st.parked_conflicts.size() >= 2) implies
+      st.parked_conflicts.forall(parkedEventID => {
+        resolveConflictEnabled(st, parkedEventID) implies CONTENTS.forall(resolvedContent => {
+          val post = resolveConflictResult(st, p, parkedEventID, resolvedContent)
+          st.parked_conflicts.exclude(Set(parkedEventID)).forall(otherParked =>
+            (tentativeHeadEventIDs(post).contains(otherParked) and
+              not(subsumedEvents(post.clock).contains(otherParked)) and
+              not(post.parked_conflicts.contains(otherParked))) implies
+                post.projection_basis.contains(otherParked)
+          )
+        })
+      })
   })
 
   /// All retained events in clocks satisfy the abstract swarm-wide admission
@@ -3126,12 +3604,12 @@ module doltswarm_verify {
       unresolvedHeadIDs.subseteq(synced.parked_conflicts)
   }))
 
-  /// Re-anchoring under closure lag: after SYNC_FINALIZED changes finalized_prolly_root_hash,
-  /// projection may remain provisional while mergeable tentative heads are missing.
-  /// Once required closure and chunks are available and the full anchored fold
-  /// over the newly mergeable ready-head set differs from the stale
-  /// root/parked/basis projection, recomputation must change that stale
-  /// projection accordingly.
+  /// Re-anchoring under closure lag: after SYNC_FINALIZED changes
+  /// finalized_prolly_root_hash, projection may remain provisional while
+  /// mergeable tentative heads are missing. Once required closure and chunks are
+  /// available, recomputation must use the current reconcile rule: exclude
+  /// replay-unsafe eligible heads from projection, anchored-fold the remaining
+  /// ready heads, and retain only unresolved unready parked heads.
   /// @default_steps 20
   val inv_reanchor_after_closure_lag = PEERS.forall(p => PEERS.forall(q => {
     val st_p = nodes.get(p)
@@ -3146,12 +3624,18 @@ module doltswarm_verify {
       chunks_ready: caughtChunksReady,
     }
     val readyHeads = mergeableHeadEventIDs(caughtState)
-    val folded = anchoredFold(readyHeads, caughtState, caughtState.finalized_prolly_root_hash)
+    val replayUnsafeHeads = replayUnsafeEligibleHeads(caughtState, readyHeads)
+    val projectionReadyHeads = readyHeads.exclude(replayUnsafeHeads)
+    val folded = anchoredFold(
+      projectionReadyHeads,
+      caughtState,
+      caughtState.finalized_prolly_root_hash
+    )
     val retainedUnreadyParked = caughtState.parked_conflicts.intersect(
       tentativeHeadEventIDs(caughtState).exclude(readyHeads)
     )
-    val expectedParked = folded._2.union(retainedUnreadyParked)
-    val expectedBasis = readyHeads.exclude(folded._2)
+    val expectedParked = folded._2.union(retainedUnreadyParked).union(replayUnsafeHeads)
+    val expectedBasis = projectionReadyHeads.exclude(folded._2)
     val recomputed = computeTentativeProjection(caughtState)
     (syncEnabled(connected, p, q, st_p, st_q) and
       synced.finalized_commit_id != st_p.finalized_commit_id and
@@ -3254,10 +3738,48 @@ module doltswarm_verify {
     bootstrapBoundaryReady(p, st)
   })
 
+  /// Seeded bootstrap scenario: a compacted checkpoint state is a valid
+  /// bootstrap boundary even with conservative membership and no remote
+  /// frontier knowledge.
+  /// @default_steps 12
+  val inv_bootstrap_seed_compacted_ready = PEERS.forall(p => {
+    val seeded = seedBootstrappedCheckpointState(p, false, false)
+    bootstrapBoundaryReady(p, seeded)
+  })
+
+  /// Seeded bootstrap scenario: retaining the current finalized event body in
+  /// clock is also a valid bootstrap boundary.
+  /// @default_steps 12
+  val inv_bootstrap_seed_retained_ready = PEERS.forall(p => {
+    val seeded = seedBootstrappedCheckpointState(p, true, false)
+    bootstrapBoundaryReady(p, seeded)
+  })
+
+  /// Seeded bootstrap scenario: equal-tip metadata divergence can be repaired
+  /// via SYNC_NOOP without changing the finalized tip or violating the
+  /// bootstrap boundary contract.
+  /// @default_steps 12
+  val inv_bootstrap_seed_equal_tip_metadata_repair = PEERS.forall(p => PEERS.forall(q => {
+    val st_p = seedBootstrappedCheckpointState(p, false, false)
+    val st_q = seedBootstrappedCheckpointState(q, true, true)
+    val synced = applySyncFinalized(st_p, st_q)
+    (p != q) implies all {
+      syncEnabled(allPairs(PEERS), p, q, st_p, st_q),
+      syncMode(st_p, st_q) == SYNC_NOOP,
+      synced.finalized_commit_id == st_p.finalized_commit_id,
+      synced.finalized_prolly_root_hash == st_p.finalized_prolly_root_hash,
+      synced.finalized_checkpoint_events == mergeFinalizedCheckpointMap(
+        st_p.finalized_checkpoint_events,
+        st_q.finalized_checkpoint_events
+      ),
+      bootstrapBoundaryReady(p, synced),
+    }
+  }))
+
   pure def localReadyUnfinalized(st: NodeState): Set[EventID] =
     st.clock.keys().filter(event_id =>
       not(st.finalized_events.has(event_id)) and
-      not(st.parked_conflicts.contains(event_id)) and
+      not(parkedBranchEvents(st).contains(event_id)) and
       isParentClosed(st.clock, event_id) and
       st.chunks_ready.contains(event_id)
     )
