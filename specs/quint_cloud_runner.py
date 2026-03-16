@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import socket
 import sys
 import textwrap
@@ -42,6 +43,59 @@ except ImportError:
 
 
 DOCKER_IMAGE = "nustiueudinastea/quint-runner:latest"
+
+MONITOR_SCRIPT = r"""#!/bin/bash
+# Resource monitor: writes CSV to /root/monitor.csv every second
+CSV=/root/monitor.csv
+echo "ts,cpu_pct,mem_used_mb,mem_total_mb,load_1m,nprocs" > "$CSV"
+prev_idle=0; prev_total=0
+while true; do
+    read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+    total=$((user+nice+system+idle+iowait+irq+softirq+steal))
+    if [ "$prev_total" -ne 0 ]; then
+        dt=$((total-prev_total)); di=$((idle-prev_idle))
+        [ "$dt" -gt 0 ] && cpu=$((100*(dt-di)/dt)) || cpu=0
+        mt=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+        ma=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+        mu=$((mt-ma))
+        la=$(awk '{print $1}' /proc/loadavg)
+        np=$(awk '{print $4}' /proc/loadavg | cut -d/ -f2)
+        echo "$(date +%s),$cpu,$mu,$mt,$la,$np" >> "$CSV"
+    fi
+    prev_idle=$idle; prev_total=$total
+    sleep 1
+done
+"""
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown support
+# ---------------------------------------------------------------------------
+
+_shutdown_requested = threading.Event()
+
+
+_all_vms: list = []  # populated in main() for shutdown handler access
+_provider_ref: list = []  # [provider] for shutdown handler
+
+
+def _shutdown_handler(signum, frame):
+    """Handle SIGINT/SIGTERM by setting the shutdown flag and unblocking SSH."""
+    sig_name = signal.Signals(signum).name
+    if _shutdown_requested.is_set():
+        # Second signal — force-destroy VMs and exit immediately
+        print(f"\n{sig_name} received again — force-destroying VMs and exiting", flush=True)
+        if _provider_ref and _all_vms:
+            for vm in _all_vms:
+                try:
+                    _provider_ref[0].destroy_vm(vm)
+                except Exception:
+                    pass
+        os._exit(1)
+    print(f"\n{sig_name} received — shutting down, destroying VMs...", flush=True)
+    _shutdown_requested.set()
+    # Close all SSH transports to unblock any blocking reads in ssh_exec
+    for vm in _all_vms:
+        _close_ssh_safe(vm)
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -63,10 +117,24 @@ class VMInstance:
     ip: str
     ssh: paramiko.SSHClient | None = None
     cpus: int = 0
+    memory_mb: int = 0
     name: str = ""
     created_at: float = field(default_factory=time.monotonic)
     destroyed_at: float | None = None
     hw_info: dict = field(default_factory=dict)
+
+
+@dataclass
+class ResourceStats:
+    """Resource usage stats for a time window or full VM lifetime."""
+    avg_cpu_pct: float | None = None
+    max_cpu_pct: float | None = None
+    avg_mem_used_mb: float | None = None
+    max_mem_used_mb: float | None = None
+    mem_total_mb: float | None = None
+    avg_load_1m: float | None = None
+    max_load_1m: float | None = None
+    samples: int = 0
 
 
 @dataclass
@@ -77,6 +145,9 @@ class InvariantResult:
     elapsed_seconds: float
     output: str
     error: str = ""
+    exit_code: int | None = None
+    failure_category: str = ""  # violation, oom, timeout, infra, runtime_error, unknown
+    resource_stats: ResourceStats | None = None
 
 
 @dataclass
@@ -181,8 +252,17 @@ def ssh_exec(
     check: bool = True,
     stream: bool = False,
     prefix: str = "",
+    log_fh=None,
+    line_callback=None,
 ) -> tuple[int, str, str]:
-    """Execute command over SSH. Returns (exit_code, stdout, stderr)."""
+    """Execute command over SSH. Returns (exit_code, stdout, stderr).
+
+    If log_fh is set, output is streamed line-by-line and written to the file
+    handle (regardless of the stream flag). The stream flag controls whether
+    lines are also printed to the console.
+
+    If line_callback is set, it is called with each stdout line (str).
+    """
     chan = ssh.get_transport().open_session()
     chan.set_combine_stderr(False)
     chan.settimeout(timeout)
@@ -194,16 +274,26 @@ def ssh_exec(
     stdout_stream = chan.makefile("rb", -1)
     stderr_stream = chan.makefile_stderr("rb", -1)
 
-    if stream:
+    if stream or log_fh or line_callback:
         for raw_line in stdout_stream:
             line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
             stdout_chunks.append(line)
-            if prefix:
-                print(f"  [{prefix}] {line}", flush=True)
-            else:
-                print(f"  {line}", flush=True)
+            if log_fh:
+                log_fh.write(line + "\n")
+                log_fh.flush()
+            if line_callback:
+                line_callback(line)
+            if stream:
+                if prefix:
+                    print(f"  [{prefix}] {line}", flush=True)
+                else:
+                    print(f"  {line}", flush=True)
         for raw_line in stderr_stream:
-            stderr_chunks.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            stderr_chunks.append(line)
+            if log_fh:
+                log_fh.write(f"[stderr] {line}\n")
+                log_fh.flush()
     else:
         stdout_chunks = [stdout_stream.read().decode("utf-8", errors="replace")]
         stderr_chunks = [stderr_stream.read().decode("utf-8", errors="replace")]
@@ -666,11 +756,19 @@ class UpCloudProvider(CloudProvider):
 # VM provisioning (provider-agnostic)
 # ---------------------------------------------------------------------------
 
-def provision_vm(vm: VMInstance, specs_dir: Path) -> None:
-    """Install Docker, pull image, upload specs."""
+def provision_vm(vm: VMInstance, specs_dir: Path, mode: str = "run") -> None:
+    """Install Docker, pull image, upload specs. In verify mode, also install Java and quint."""
     print(f"  [{vm.name}] Waiting for SSH...")
     wait_for_ssh(vm.ip)
     vm.ssh = connect_ssh(vm.ip)
+
+    # Tighten TCP keepalive — helps keep long-running gRPC connections alive
+    ssh_exec(vm.ssh, (
+        "sysctl -w net.ipv4.tcp_keepalive_time=60 "
+        "net.ipv4.tcp_keepalive_intvl=10 "
+        "net.ipv4.tcp_keepalive_probes=6 "
+        "> /dev/null 2>&1"
+    ), timeout=10, check=False)
 
     print(f"  [{vm.name}] Installing Docker and pulling image...")
     install_script = textwrap.dedent(f"""\
@@ -708,6 +806,7 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_C
         echo "CPU_SOCKETS=$(grep -c 'physical id' /proc/cpuinfo 2>/dev/null | sort -u | wc -l || echo 1)"
         echo "CPU_MHZ=$(grep -m1 'cpu MHz' /proc/cpuinfo | cut -d: -f2 | xargs)"
         echo "MEM_TOTAL=$(awk '/MemTotal/{printf "%.1f GB", $2/1024/1024}' /proc/meminfo)"
+        echo "MEM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)"
         echo "ARCH=$(uname -m)"
         echo "KERNEL=$(uname -r)"
     """)
@@ -717,6 +816,8 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_C
         if "=" in line:
             key, val = line.split("=", 1)
             vm.hw_info[key] = val
+    if "MEM_MB" in vm.hw_info:
+        vm.memory_mb = int(vm.hw_info["MEM_MB"])
     print(f"  [{vm.name}] Docker ready — {vm.cpus} CPUs")
 
     # Upload spec files
@@ -728,23 +829,297 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_C
     if spells_dir.exists():
         for spell_file in spells_dir.glob("*.qnt"):
             scp_upload(vm.ssh, spell_file, f"/root/specs/spells/{spell_file.name}")
+    # Start resource monitor
+    try:
+        ssh_exec(vm.ssh,
+                 f"cat > /root/monitor.sh << 'MONEOF'\n{MONITOR_SCRIPT}\nMONEOF\n"
+                 f"chmod +x /root/monitor.sh",
+                 timeout=10, check=True)
+        ssh_exec(vm.ssh, "nohup /root/monitor.sh > /dev/null 2>&1 &",
+                 timeout=10, check=False)
+        print(f"  [{vm.name}] Resource monitor started")
+    except Exception as e:
+        print(f"  [{vm.name}] WARNING: could not start resource monitor: {e}")
+
     print(f"  [{vm.name}] Ready")
+
+
+def _close_ssh_safe(vm: VMInstance) -> None:
+    """Close SSH connection with a timeout to avoid hanging."""
+    if not vm.ssh:
+        return
+    try:
+        transport = vm.ssh.get_transport()
+        if transport and transport.is_active():
+            transport.close()
+        vm.ssh.close()
+    except Exception:
+        pass
+    vm.ssh = None
+
+
+# ---------------------------------------------------------------------------
+# Resource stats helpers
+# ---------------------------------------------------------------------------
+
+_AWK_BODY = "n++;ct+=$2;if($2>mc)mc=$2;mt+=$3;if($3>mm)mm=$3;tt=$4;lt+=$5;if($5>ml)ml=$5"
+_AWK_END = (
+    'END{if(n>0)printf "%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\\n",'
+    'n,ct/n,mc,mt/n,mm,tt,lt/n,ml;else print "0"}'
+)
+
+
+def _parse_resource_stats(raw: str) -> ResourceStats | None:
+    raw = raw.strip()
+    if not raw or raw == "0":
+        return None
+    parts = raw.split(",")
+    if len(parts) < 8:
+        return None
+    return ResourceStats(
+        samples=int(float(parts[0])),
+        avg_cpu_pct=float(parts[1]),
+        max_cpu_pct=float(parts[2]),
+        avg_mem_used_mb=float(parts[3]),
+        max_mem_used_mb=float(parts[4]),
+        mem_total_mb=float(parts[5]),
+        avg_load_1m=float(parts[6]),
+        max_load_1m=float(parts[7]),
+    )
+
+
+def fetch_resource_stats_window(
+    vm: VMInstance, start_ts: int, end_ts: int,
+) -> ResourceStats | None:
+    """Fetch resource stats from monitor.csv for a Unix timestamp window."""
+    try:
+        cmd = (
+            f"awk -F, 'NR>1 && $1>={start_ts} && $1<={end_ts}"
+            f"{{{_AWK_BODY}}}{_AWK_END}' /root/monitor.csv"
+        )
+        _, out, _ = ssh_exec(vm.ssh, cmd, timeout=10, check=False)
+        return _parse_resource_stats(out)
+    except Exception:
+        return None
+
+
+def fetch_resource_stats_full(vm: VMInstance) -> ResourceStats | None:
+    """Fetch resource stats from the entire monitor.csv (full VM lifetime)."""
+    try:
+        cmd = f"awk -F, 'NR>1{{{_AWK_BODY}}}{_AWK_END}' /root/monitor.csv"
+        _, out, _ = ssh_exec(vm.ssh, cmd, timeout=10, check=False)
+        return _parse_resource_stats(out)
+    except Exception:
+        return None
+
+
+def download_monitor_csv(vm: VMInstance, output_dir: Path) -> Path | None:
+    """Download /root/monitor.csv from the VM."""
+    try:
+        local_path = output_dir / f"{vm.name}_monitor.csv"
+        sftp = vm.ssh.open_sftp()
+        try:
+            sftp.get("/root/monitor.csv", str(local_path))
+        finally:
+            sftp.close()
+        return local_path
+    except Exception:
+        return None
+
+
+def format_resource_stats(stats: ResourceStats | None, prefix: str = "#") -> str:
+    """Format resource stats as comment lines for log files."""
+    if stats is None:
+        return f"{prefix} resource_stats: unavailable\n"
+    mem_pct = (100.0 * stats.max_mem_used_mb / stats.mem_total_mb
+               if stats.mem_total_mb else 0)
+    return (
+        f"{prefix} cpu_avg_pct: {stats.avg_cpu_pct:.1f}\n"
+        f"{prefix} cpu_max_pct: {stats.max_cpu_pct:.1f}\n"
+        f"{prefix} mem_avg_mb: {stats.avg_mem_used_mb:.0f}\n"
+        f"{prefix} mem_max_mb: {stats.max_mem_used_mb:.0f}\n"
+        f"{prefix} mem_total_mb: {stats.mem_total_mb:.0f}\n"
+        f"{prefix} mem_max_pct: {mem_pct:.1f}\n"
+        f"{prefix} load_avg_1m: {stats.avg_load_1m:.2f}\n"
+        f"{prefix} load_max_1m: {stats.max_load_1m:.2f}\n"
+        f"{prefix} monitor_samples: {stats.samples}\n"
+    )
 
 
 def destroy_vms(provider: CloudProvider, vms: list[VMInstance]) -> None:
     for vm in vms:
+        _close_ssh_safe(vm)
         try:
-            if vm.ssh:
-                vm.ssh.close()
-        except Exception:
-            pass
-        provider.destroy_vm(vm)
+            provider.destroy_vm(vm)
+        except Exception as e:
+            print(f"  WARNING: Failed to destroy {vm.name}: {e}", flush=True)
         vm.destroyed_at = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Failure classification
+# ---------------------------------------------------------------------------
+
+def extract_apalache_phase(stdout: str) -> str | None:
+    """Extract the last Apalache phase reached from stdout."""
+    last_pass = None
+    last_state = None
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        # Match "PASS #13: BoundedChecker" or "State 1: Checking 1 state invariants"
+        if stripped.startswith("PASS #"):
+            # e.g. "PASS #13: BoundedChecker  I@10:36:02.762"
+            part = stripped.split("I@")[0].strip() if "I@" in stripped else stripped
+            last_pass = part
+        elif "state " in stripped.lower() and ("checking" in stripped.lower() or "picking" in stripped.lower()):
+            last_state = stripped.split("I@")[0].strip() if "I@" in stripped else stripped
+    if last_state:
+        return last_state
+    return last_pass
+
+
+def classify_failure(exit_code: int | None, stdout: str, stderr: str) -> str:
+    """Classify a failed invariant check into a category."""
+    combined = (stdout + stderr).lower()
+
+    if "invariant violated" in combined or "[ok] no violation found" in combined:
+        return "violation"
+
+    if "ssh timeout" in combined:
+        return "timeout"
+
+    if "ran out of heap memory" in combined or "java heap space" in combined:
+        return "oom"
+
+    if "address already in use" in combined:
+        return "infra_port_conflict"
+
+    if "rst_stream" in combined or "grpc" in combined:
+        return "infra_grpc"
+
+    if "runtime error" in combined or "error [qnt" in combined:
+        return "runtime_error"
+
+    # Truncated output — likely OOM-killed by the kernel
+    if exit_code is not None and exit_code != 0:
+        if "state 0: checking" in combined or "state 2: checking" in combined:
+            last_line = stdout.strip().splitlines()[-1] if stdout.strip() else ""
+            if "checking" in last_line.lower() or "picking" in last_line.lower():
+                return "oom_killed"
+
+    if exit_code == 137:
+        return "oom_killed"
+
+    return "unknown"
+
+
+FAILURE_LABELS = {
+    "violation": "Invariant violations",
+    "timeout": "SSH timeouts",
+    "oom": "JVM out-of-memory",
+    "oom_killed": "Likely OOM-killed (truncated output)",
+    "infra_port_conflict": "Apalache port conflicts",
+    "infra_grpc": "gRPC transport errors",
+    "infra_ssh": "SSH connection errors",
+    "runtime_error": "Quint runtime errors",
+    "shutdown": "Cancelled (shutdown requested)",
+    "unknown": "Unknown failures",
+}
+
+# Categories that are worth retrying
+RETRYABLE_CATEGORIES = {"infra_port_conflict", "infra_grpc"}
 
 
 # ---------------------------------------------------------------------------
 # Invariant execution
 # ---------------------------------------------------------------------------
+
+def _docker_resource_flags(vm: VMInstance) -> str:
+    """Docker flags to reserve ~5% of CPU and memory for OS/sshd."""
+    flags = []
+    if vm.cpus > 1:
+        # Reserve 0.5 CPU for OS (at least 1 core for the container)
+        limit = max(1.0, vm.cpus - 0.5)
+        flags.append(f"--cpus={limit:.1f}")
+    if vm.memory_mb > 0:
+        # Reserve 5% of RAM (at least 512MB) for OS/sshd
+        reserved = max(512, int(vm.memory_mb * 0.05))
+        container_mb = vm.memory_mb - reserved
+        flags.append(f"--memory={container_mb}m")
+    return " ".join(flags)
+
+
+def _build_verify_cmd(
+    invariant_name: str,
+    effective_steps: int,
+    heap_arg: str,
+    vm: VMInstance | None = None,
+) -> str:
+    """Build a quint verify command that runs inside Docker.
+
+    JVM flags (passed via -e JVM_ARGS):
+      -Xmx{heap}               — max heap sized to 80% of VM RAM
+      -XX:+UseG1GC             — low-pause garbage collector
+      -XX:MaxGCPauseMillis=2000 — keep GC pauses short to avoid gRPC timeouts
+      -XX:+CrashOnOutOfMemoryError — crash immediately on OOM instead of
+                                     thrashing for minutes then dropping gRPC
+
+    Apalache tuning:
+      --verbosity=5            — max Apalache logging (shows all passes + step progress)
+    """
+    import random
+    port = random.randint(10000, 60000)
+    jvm_flags = (
+        f"-Xmx{heap_arg} "
+        f"-XX:+UseG1GC "
+        f"-XX:MaxGCPauseMillis=2000 "
+        f"-XX:+CrashOnOutOfMemoryError"
+    )
+    res_flags = _docker_resource_flags(vm) if vm else ""
+    return (
+        f"docker run --rm "
+        f"{res_flags} "
+        f"-v /root/specs:/specs "
+        f"-e JVM_ARGS='{jvm_flags}' "
+        f"{DOCKER_IMAGE} "
+        f"quint verify /specs/doltswarm_verify.qnt "
+        f"--invariant={invariant_name} "
+        f"--max-steps={effective_steps} "
+        f"--server-endpoint=localhost:{port} "
+        f"--verbosity=5"
+    )
+
+
+def _collect_failure_diagnostics(vm: VMInstance, invariant_name: str) -> str:
+    """After a gRPC/crash failure, collect diagnostics from the VM."""
+    diag_lines: list[str] = []
+    try:
+        # Check if java/apalache is still running
+        _, ps_out, _ = ssh_exec(vm.ssh, "pgrep -af 'java|apalache' || echo 'no java process'",
+                                timeout=5, check=False)
+        diag_lines.append(f"[diag] java processes: {ps_out.strip()}")
+
+        # Check dmesg for OOM killer
+        _, dmesg_out, _ = ssh_exec(vm.ssh, "dmesg | grep -i -E 'oom|killed|out of memory' | tail -5",
+                                   timeout=5, check=False)
+        if dmesg_out.strip():
+            diag_lines.append(f"[diag] dmesg OOM: {dmesg_out.strip()}")
+
+        # Check Apalache output directory for crash logs
+        _, apa_out, _ = ssh_exec(vm.ssh,
+                                 "ls -t /root/_apalache-out/server/*/detailed.log 2>/dev/null | head -1 "
+                                 "| xargs tail -20 2>/dev/null || echo 'no apalache log'",
+                                 timeout=10, check=False)
+        if apa_out.strip() and apa_out.strip() != "no apalache log":
+            diag_lines.append(f"[diag] apalache log tail:\n{apa_out.strip()}")
+
+        # Check available memory at time of failure
+        _, mem_out, _ = ssh_exec(vm.ssh, "free -m | head -2", timeout=5, check=False)
+        diag_lines.append(f"[diag] memory: {mem_out.strip()}")
+    except Exception:
+        diag_lines.append("[diag] could not collect diagnostics (SSH failed)")
+    return "\n".join(diag_lines)
+
 
 def run_invariant_on_vm(
     vm: VMInstance,
@@ -752,44 +1127,209 @@ def run_invariant_on_vm(
     samples: int,
     steps: int | None,
     fallback_steps: int,
+    mode: str = "run",
+    jvm_memory: str = "8g",
+    max_retries: int = 2,
+    output_dir: Path | None = None,
 ) -> InvariantResult:
     effective_steps = steps if steps is not None else (invariant.default_steps or fallback_steps)
 
-    docker_cmd = (
-        f"docker run --rm -v /root/specs:/specs {DOCKER_IMAGE} "
-        f"quint run /specs/doltswarm_verify.qnt "
-        f"--backend=rust "
-        f"--invariant={invariant.name} "
-        f"--max-samples={samples} "
-        f"--max-steps={effective_steps}"
-    )
+    # Compute JVM heap for verify mode.
+    # Docker container gets 95% of VM RAM.  JVM heap must fit within that,
+    # leaving room for Z3 native memory (~20% of heap) + JVM metaspace/stacks.
+    # Formula: container_mb * 0.65 ≈ 62% of total VM RAM.
+    if mode == "verify":
+        if vm.memory_mb > 0:
+            reserved_os = max(512, int(vm.memory_mb * 0.05))
+            container_mb = vm.memory_mb - reserved_os
+            heap_mb = int(container_mb * 0.65)
+            heap_arg = f"{heap_mb}m"
+        else:
+            heap_arg = jvm_memory
 
-    started = time.monotonic()
-    try:
-        exit_code, stdout, stderr = ssh_exec(
-            vm.ssh, docker_cmd, timeout=7200, check=False
-        )
-    except (TimeoutError, socket.timeout, paramiko.buffered_pipe.PipeTimeout) as e:
+    # Timeout: 4 hours for verify (SMT solving can be very slow), 2 hours for run
+    ssh_timeout = 14400 if mode == "verify" else 7200
+
+    attempts = 0
+    while True:
+        if _shutdown_requested.is_set():
+            return InvariantResult(
+                invariant=invariant.name,
+                vm_name=vm.name,
+                passed=False,
+                elapsed_seconds=0,
+                output="",
+                error="Shutdown requested",
+                failure_category="shutdown",
+            )
+
+        attempts += 1
+
+        res_flags = _docker_resource_flags(vm)
+        if mode == "verify":
+            cmd = _build_verify_cmd(invariant.name, effective_steps, heap_arg, vm=vm)
+        else:
+            cmd = (
+                f"docker run --rm {res_flags} "
+                f"-v /root/specs:/specs {DOCKER_IMAGE} "
+                f"quint run /specs/doltswarm_verify.qnt "
+                f"--backend=rust "
+                f"--invariant={invariant.name} "
+                f"--max-samples={samples} "
+                f"--max-steps={effective_steps}"
+            )
+
+        # Record VM timestamp before the run for resource stats
+        vm_start_ts = None
+        try:
+            _, ts_out, _ = ssh_exec(vm.ssh, "date +%s", timeout=5, check=False)
+            vm_start_ts = int(ts_out.strip())
+        except Exception:
+            pass
+
+        # Progressive log: write a .running.log with streaming output
+        running_log_path = None
+        log_fh = None
+        if output_dir:
+            running_log_path = output_dir / f"{invariant.name}.running.log"
+            try:
+                running_log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = open(running_log_path, "w")
+                log_fh.write(f"# invariant: {invariant.name}\n")
+                log_fh.write(f"# status: RUNNING (attempt {attempts})\n")
+                log_fh.write(f"# vm: {vm.name}\n")
+                log_fh.write(f"# started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_fh.write(f"# mode: {mode}\n\n")
+                log_fh.flush()
+            except Exception:
+                log_fh = None
+
+        # Progress callback: print condensed Apalache milestones only
+        progress_cb = None
+        if mode == "verify":
+            _run_start = time.monotonic()
+            def _apalache_progress(line: str) -> None:
+                stripped = line.strip()
+                elapsed_m = (time.monotonic() - _run_start) / 60
+                info = stripped.split("I@")[0].strip() if "I@" in stripped else stripped
+                # BoundedChecker start (the main solving phase)
+                if "PASS #13: BoundedChecker" in stripped or "PASS #12:" in stripped:
+                    print(f"  [{vm.name}] {invariant.name}: {info} ({elapsed_m:.1f}m)", flush=True)
+                # Step transitions (the key progress indicator during solving)
+                elif stripped.lower().startswith("step ") and "picking" in stripped.lower():
+                    print(f"  [{vm.name}] {invariant.name}: {info} ({elapsed_m:.1f}m)", flush=True)
+                # State checking result (only the final state per step matters)
+                elif stripped.lower().startswith("state ") and "checking" in stripped.lower():
+                    print(f"  [{vm.name}] {invariant.name}: {info} ({elapsed_m:.1f}m)", flush=True)
+                # Final verdict
+                elif "no violation found" in stripped.lower() or "invariant violated" in stripped.lower():
+                    print(f"  [{vm.name}] {invariant.name}: {stripped} ({elapsed_m:.1f}m)", flush=True)
+            progress_cb = _apalache_progress
+
+        started = time.monotonic()
+        try:
+            exit_code, stdout, stderr = ssh_exec(
+                vm.ssh, cmd, timeout=ssh_timeout, check=False,
+                log_fh=log_fh, line_callback=progress_cb,
+            )
+        except (TimeoutError, socket.timeout, paramiko.buffered_pipe.PipeTimeout) as e:
+            elapsed = time.monotonic() - started
+            if log_fh:
+                log_fh.write(f"\n[TIMEOUT after {elapsed:.0f}s: {e}]\n")
+                log_fh.close()
+            return InvariantResult(
+                invariant=invariant.name,
+                vm_name=vm.name,
+                passed=False,
+                elapsed_seconds=elapsed,
+                output="",
+                error=f"SSH timeout after {elapsed:.0f}s: {e}",
+                exit_code=None,
+                failure_category="timeout",
+            )
+        except (OSError, paramiko.SSHException, EOFError) as e:
+            elapsed = time.monotonic() - started
+            category = "shutdown" if _shutdown_requested.is_set() else "infra_ssh"
+            if log_fh:
+                log_fh.write(f"\n[SSH ERROR: {e}]\n")
+                log_fh.close()
+            return InvariantResult(
+                invariant=invariant.name,
+                vm_name=vm.name,
+                passed=False,
+                elapsed_seconds=elapsed,
+                output="",
+                error=f"SSH error: {e}",
+                exit_code=None,
+                failure_category=category,
+            )
+        finally:
+            if log_fh and not log_fh.closed:
+                log_fh.close()
+
         elapsed = time.monotonic() - started
+
+        # Clean up .running.log (final log written by on_result callback)
+        if running_log_path and running_log_path.exists():
+            try:
+                running_log_path.unlink()
+            except Exception:
+                pass
+
+        # Fetch resource stats for this invariant's time window
+        resource_stats = None
+        if vm_start_ts is not None:
+            try:
+                _, ts_out, _ = ssh_exec(vm.ssh, "date +%s", timeout=5, check=False)
+                vm_end_ts = int(ts_out.strip())
+                resource_stats = fetch_resource_stats_window(vm, vm_start_ts, vm_end_ts)
+            except Exception:
+                pass
+
+        if exit_code == 0:
+            return InvariantResult(
+                invariant=invariant.name,
+                vm_name=vm.name,
+                passed=True,
+                elapsed_seconds=elapsed,
+                output=stdout,
+                exit_code=exit_code,
+                resource_stats=resource_stats,
+            )
+
+        category = classify_failure(exit_code, stdout, stderr)
+
+        # Collect diagnostics for gRPC/OOM failures (skip during shutdown)
+        oom_detected = False
+        if category in ("infra_grpc", "oom", "oom_killed") and not _shutdown_requested.is_set():
+            diag = _collect_failure_diagnostics(vm, invariant.name)
+            if diag:
+                oom_detected = "oom" in diag.lower() or "killed process" in diag.lower()
+                stderr = stderr + "\n\n" + diag if stderr else diag
+
+        if category in RETRYABLE_CATEGORIES and attempts <= max_retries and not _shutdown_requested.is_set():
+            reason = "OOM killed by Docker cgroup" if oom_detected else FAILURE_LABELS.get(category, category)
+            last_phase = extract_apalache_phase(stdout) or "unknown phase"
+            print(
+                f"  [{vm.name}] {invariant.name}: CRASHED ({reason}) "
+                f"at '{last_phase}' after {elapsed:.0f}s — "
+                f"restarting (attempt {attempts + 1}/{max_retries + 1})",
+                flush=True,
+            )
+            time.sleep(2)
+            continue
+
         return InvariantResult(
             invariant=invariant.name,
             vm_name=vm.name,
             passed=False,
             elapsed_seconds=elapsed,
-            output="",
-            error=f"SSH timeout after {elapsed:.0f}s: {e}",
+            output=stdout,
+            error=stderr,
+            exit_code=exit_code,
+            failure_category=category,
+            resource_stats=resource_stats,
         )
-    elapsed = time.monotonic() - started
-
-    passed = exit_code == 0
-    return InvariantResult(
-        invariant=invariant.name,
-        vm_name=vm.name,
-        passed=passed,
-        elapsed_seconds=elapsed,
-        output=stdout,
-        error=stderr if not passed else "",
-    )
 
 
 def distribute_invariants(
@@ -829,13 +1369,31 @@ def run_vm_batch(
     steps: int | None,
     fallback_steps: int,
     progress: RunProgress,
+    mode: str = "run",
+    jvm_memory: str = "8g",
+    on_result: callable = None,
+    output_dir: Path | None = None,
 ) -> list[InvariantResult]:
     """Run a batch of invariants on a VM, parallelising up to vm.cpus containers."""
     results: list[InvariantResult] = []
-    concurrency = max(1, vm.cpus)
+    # verify is memory-heavy — run only 1 at a time per VM
+    concurrency = 1 if mode == "verify" else max(1, vm.cpus)
 
     def run_one(inv: Invariant) -> InvariantResult:
-        result = run_invariant_on_vm(vm, inv, samples, steps, fallback_steps)
+        try:
+            result = run_invariant_on_vm(vm, inv, samples, steps, fallback_steps,
+                                         mode=mode, jvm_memory=jvm_memory,
+                                         output_dir=output_dir)
+        except Exception as e:
+            result = InvariantResult(
+                invariant=inv.name,
+                vm_name=vm.name,
+                passed=False,
+                elapsed_seconds=0,
+                output="",
+                error=f"Uncaught exception: {type(e).__name__}: {e}",
+                failure_category="infra_ssh",
+            )
         done, total = progress.record(result.passed)
         status = "PASS" if result.passed else "FAIL"
         print(
@@ -843,12 +1401,27 @@ def run_vm_batch(
             f"on {vm.name} ({result.elapsed_seconds:.1f}s)",
             flush=True,
         )
+        if on_result:
+            on_result(result)
         return result
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {pool.submit(run_one, inv): inv for inv in invariants}
         for future in as_completed(futures):
-            results.append(future.result())
+            try:
+                results.append(future.result())
+            except Exception as e:
+                inv = futures[future]
+                result = InvariantResult(
+                    invariant=inv.name,
+                    vm_name=vm.name,
+                    passed=False,
+                    elapsed_seconds=0,
+                    output="",
+                    error=f"Future exception: {type(e).__name__}: {e}",
+                    failure_category="infra_ssh",
+                )
+                results.append(result)
 
     return results
 
@@ -894,26 +1467,69 @@ def print_report(
     print()
 
     if failed:
-        print("FAILURES:")
-        for r in sorted(failed, key=lambda x: x.invariant):
-            print(f"  FAIL  {r.invariant}  (on {r.vm_name}, {r.elapsed_seconds:.1f}s)")
-            if r.error:
-                for line in r.error.strip().splitlines()[:10]:
-                    print(f"        {line}")
-            if r.output:
-                for line in r.output.strip().splitlines()[-10:]:
-                    print(f"        {line}")
+        # Group by category
+        by_cat: dict[str, list[InvariantResult]] = {}
+        for r in failed:
+            by_cat.setdefault(r.failure_category or "unknown", []).append(r)
+
+        print("FAILURE BREAKDOWN:")
+        for cat, label in FAILURE_LABELS.items():
+            if cat in by_cat:
+                print(f"  {label}: {len(by_cat[cat])}")
         print()
+
+        # Show details for violations (most important)
+        if "violation" in by_cat:
+            print("INVARIANT VIOLATIONS:")
+            for r in sorted(by_cat["violation"], key=lambda x: x.invariant):
+                print(f"  FAIL  {r.invariant}  (on {r.vm_name}, {r.elapsed_seconds:.1f}s)")
+                if r.output:
+                    for line in r.output.strip().splitlines()[-10:]:
+                        print(f"        {line}")
+            print()
 
     print("ALL RESULTS:")
     for r in sorted(results, key=lambda x: x.invariant):
         status = "PASS" if r.passed else "FAIL"
-        print(f"  {status}  {r.invariant:<60s} {r.elapsed_seconds:7.1f}s  {r.vm_name}")
+        cat_suffix = f"  [{r.failure_category}]" if not r.passed and r.failure_category else ""
+        print(f"  {status}  {r.invariant:<60s} {r.elapsed_seconds:7.1f}s  {r.vm_name}{cat_suffix}")
 
 
 # ---------------------------------------------------------------------------
 # Log saving
 # ---------------------------------------------------------------------------
+
+def save_invariant_log(
+    result: InvariantResult,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Write a single invariant result log file. Safe to call as each result arrives."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    status = "pass" if result.passed else "fail"
+    log_path = output_dir / f"{result.invariant}.{status}.log"
+    with open(log_path, "w") as f:
+        f.write(f"# invariant: {result.invariant}\n")
+        f.write(f"# status: {'PASS' if result.passed else 'FAIL'}\n")
+        f.write(f"# vm: {result.vm_name}\n")
+        f.write(f"# exit_code: {result.exit_code}\n")
+        f.write(f"# elapsed: {result.elapsed_seconds:.2f}s\n")
+        f.write(f"# samples: {args.samples}\n")
+        f.write(f"# steps: {args.steps or 'per-annotation'}\n")
+        f.write(f"# mode: {args.mode}\n")
+        if not result.passed and result.failure_category:
+            f.write(f"# failure_category: {result.failure_category}\n")
+        apalache_phase = extract_apalache_phase(result.output)
+        if apalache_phase:
+            f.write(f"# last_apalache_phase: {apalache_phase}\n")
+        f.write(format_resource_stats(result.resource_stats))
+        f.write("\n--- stdout ---\n")
+        f.write(result.output)
+        if result.error:
+            f.write("\n\n--- stderr ---\n")
+            f.write(result.error)
+        f.write("\n")
+
 
 def save_logs(
     results: list[InvariantResult],
@@ -923,7 +1539,7 @@ def save_logs(
     vms: list[VMInstance] | None = None,
     provider: CloudProvider | None = None,
 ) -> None:
-    """Save per-invariant stdout/stderr to local files for inspection."""
+    """Save summary file. Individual logs are already written progressively."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     sorted_results = sorted(results, key=lambda r: r.invariant)
@@ -931,36 +1547,11 @@ def save_logs(
     failed = [r for r in results if not r.passed]
     times = [r.elapsed_seconds for r in results]
 
-    # Write individual log files per invariant
-    for r in sorted_results:
-        status = "pass" if r.passed else "fail"
-        log_path = output_dir / f"{r.invariant}.{status}.log"
-        with open(log_path, "w") as f:
-            f.write(f"# invariant: {r.invariant}\n")
-            f.write(f"# status: {'PASS' if r.passed else 'FAIL'}\n")
-            f.write(f"# vm: {r.vm_name}\n")
-            f.write(f"# elapsed: {r.elapsed_seconds:.2f}s\n")
-            f.write(f"# samples: {args.samples}\n")
-            f.write(f"# steps: {args.steps or 'per-annotation'}\n")
-            f.write("\n--- stdout ---\n")
-            f.write(r.output)
-            if r.error:
-                f.write("\n\n--- stderr ---\n")
-                f.write(r.error)
-            f.write("\n")
-
-    # Categorise failures by error type
-    violation_fails: list[InvariantResult] = []
-    runtime_error_fails: list[InvariantResult] = []
-    other_fails: list[InvariantResult] = []
+    # Categorise failures by category
+    failures_by_category: dict[str, list[InvariantResult]] = {}
     for r in failed:
-        combined = (r.output + r.error).lower()
-        if "invariant violated" in combined:
-            violation_fails.append(r)
-        elif "runtime error" in combined or "error [qnt" in combined:
-            runtime_error_fails.append(r)
-        else:
-            other_fails.append(r)
+        cat = r.failure_category or "unknown"
+        failures_by_category.setdefault(cat, []).append(r)
 
     # Write summary
     summary_path = output_dir / "summary.txt"
@@ -1005,37 +1596,60 @@ def save_logs(
 
         f.write("\n")
 
-        # Failure breakdown
+        # Failure breakdown by category
         if failed:
             f.write(f"{'=' * 70}\n")
             f.write(f"FAILURE BREAKDOWN\n")
             f.write(f"{'=' * 70}\n\n")
 
-            if violation_fails:
-                f.write(f"Invariant violations ({len(violation_fails)}):\n")
-                for r in sorted(violation_fails, key=lambda x: x.invariant):
-                    f.write(f"  FAIL  {r.invariant}  ({r.elapsed_seconds:.1f}s, {r.vm_name})\n")
+            # Show category summary first
+            for cat, label in FAILURE_LABELS.items():
+                if cat in failures_by_category:
+                    f.write(f"  {label}: {len(failures_by_category[cat])}\n")
+            f.write("\n")
+
+            # Then detailed list per category
+            # Show violations first (most important), then infra, then rest
+            category_order = [
+                "violation", "oom", "oom_killed", "timeout",
+                "infra_port_conflict", "infra_grpc", "infra_ssh",
+                "runtime_error", "shutdown", "unknown",
+            ]
+            for cat in category_order:
+                if cat not in failures_by_category:
+                    continue
+                results_in_cat = failures_by_category[cat]
+                label = FAILURE_LABELS.get(cat, cat)
+                f.write(f"{label} ({len(results_in_cat)}):\n")
+                for r in sorted(results_in_cat, key=lambda x: x.invariant):
+                    exit_str = f"exit={r.exit_code}" if r.exit_code is not None else "no exit"
+                    phase = extract_apalache_phase(r.output)
+                    phase_str = f", last phase: {phase}" if phase else ""
+                    res_str = ""
+                    if r.resource_stats:
+                        s = r.resource_stats
+                        res_str = f", CPU avg={s.avg_cpu_pct:.0f}% MEM max={s.max_mem_used_mb:.0f}MB"
+                    f.write(f"  FAIL  {r.invariant}  ({r.elapsed_seconds:.1f}s, {r.vm_name}, {exit_str}{phase_str}{res_str})\n")
                 f.write("\n")
 
-            if runtime_error_fails:
-                f.write(f"Runtime errors ({len(runtime_error_fails)}):\n")
-                for r in sorted(runtime_error_fails, key=lambda x: x.invariant):
-                    # Extract first error line for a quick hint
-                    hint = ""
-                    for line in (r.output + r.error).splitlines():
-                        if "error" in line.lower() and "qnt" in line.lower():
-                            hint = line.strip()[:80]
-                            break
-                    f.write(f"  FAIL  {r.invariant}  ({r.elapsed_seconds:.1f}s, {r.vm_name})\n")
-                    if hint:
-                        f.write(f"        {hint}\n")
-                f.write("\n")
-
-            if other_fails:
-                f.write(f"Other failures ({len(other_fails)}):\n")
-                for r in sorted(other_fails, key=lambda x: x.invariant):
-                    f.write(f"  FAIL  {r.invariant}  ({r.elapsed_seconds:.1f}s, {r.vm_name})\n")
-                f.write("\n")
+        # Resource usage summary
+        results_with_stats = [r for r in results if r.resource_stats is not None]
+        if results_with_stats:
+            f.write(f"{'=' * 70}\n")
+            f.write(f"RESOURCE USAGE\n")
+            f.write(f"{'=' * 70}\n\n")
+            for r in sorted(results_with_stats, key=lambda x: x.invariant):
+                s = r.resource_stats
+                status = "PASS" if r.passed else "FAIL"
+                mem_pct = (100.0 * s.max_mem_used_mb / s.mem_total_mb
+                           if s.mem_total_mb else 0)
+                f.write(
+                    f"  {status}  {r.invariant:<50s}  "
+                    f"CPU avg={s.avg_cpu_pct:5.1f}% max={s.max_cpu_pct:5.1f}%  "
+                    f"MEM max={s.max_mem_used_mb:6.0f}MB/{s.mem_total_mb:.0f}MB ({mem_pct:.0f}%)  "
+                    f"load={s.avg_load_1m:.1f}\n"
+                )
+            f.write("\n")
 
         # Full results table
         f.write(f"{'=' * 70}\n")
@@ -1043,12 +1657,22 @@ def save_logs(
         f.write(f"{'=' * 70}\n\n")
         for r in sorted_results:
             status = "PASS" if r.passed else "FAIL"
-            f.write(f"  {status}  {r.invariant:<60s} {r.elapsed_seconds:7.1f}s  {r.vm_name}\n")
+            extra = ""
+            if not r.passed:
+                parts = []
+                if r.exit_code is not None:
+                    parts.append(f"exit={r.exit_code}")
+                if r.failure_category:
+                    parts.append(r.failure_category)
+                if parts:
+                    extra = f"  [{', '.join(parts)}]"
+            f.write(f"  {status}  {r.invariant:<60s} {r.elapsed_seconds:7.1f}s  {r.vm_name}{extra}\n")
 
     print(f"\nLogs saved to {output_dir}/")
     print(f"  summary.txt            — stats, failure breakdown, full results")
     print(f"  <invariant>.pass.log   — full stdout for passing checks")
     print(f"  <invariant>.fail.log   — full stdout+stderr for failures")
+    print(f"  <vm>_monitor.csv       — raw per-second resource data")
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1720,7 @@ def main() -> None:
         help="Datacenter zone/location (default: provider-specific)",
     )
     parser.add_argument(
-        "--samples", type=int, required=True,
+        "--samples", type=int, default=10000,
         help="Number of random traces per invariant (--max-samples)",
     )
     parser.add_argument(
@@ -1112,8 +1736,16 @@ def main() -> None:
         help="Quint spec file (default: doltswarm_verify.qnt)",
     )
     parser.add_argument(
-        "--invariant",
-        help="Run only this specific invariant",
+        "--invariant", action="append", dest="invariants",
+        help="Run only these invariants (can be repeated: --invariant inv_a --invariant inv_b)",
+    )
+    parser.add_argument(
+        "--mode", choices=["run", "verify"], default="run",
+        help="Quint mode: 'run' for random simulation (default), 'verify' for Apalache model checking",
+    )
+    parser.add_argument(
+        "--jvm-memory", default="8g",
+        help="Max JVM heap for Apalache in verify mode (default: 8g)",
     )
     parser.add_argument(
         "--keep-vms", action="store_true",
@@ -1142,16 +1774,23 @@ def main() -> None:
         sys.exit(f"ERROR: Spec file not found: {spec_path}")
 
     invariants = parse_invariants(spec_path)
-    if args.invariant:
-        matched = [inv for inv in invariants if inv.name == args.invariant]
-        if not matched:
-            sys.exit(f"ERROR: Unknown invariant: {args.invariant}")
+    if args.invariants:
+        wanted = set(args.invariants)
+        matched = [inv for inv in invariants if inv.name in wanted]
+        missing = wanted - {inv.name for inv in matched}
+        if missing:
+            sys.exit(f"ERROR: Unknown invariant(s): {', '.join(sorted(missing))}")
         invariants = matched
 
     print(f"Found {len(invariants)} invariant(s) to check")
     print(f"Provider: {provider.name}")
-    print(f"Config: {args.vms} VM(s) x {args.vm_type}, "
-          f"samples={args.samples}, steps={args.steps or 'per-annotation'}")
+    print(f"Mode: {args.mode}")
+    if args.mode == "verify":
+        print(f"Config: {args.vms} VM(s) x {args.vm_type}, "
+              f"steps={args.steps or 'per-annotation'}, JVM memory=80% of VM RAM")
+    else:
+        print(f"Config: {args.vms} VM(s) x {args.vm_type}, "
+              f"samples={args.samples}, steps={args.steps or 'per-annotation'}")
     print(f"Docker image: {DOCKER_IMAGE}")
     print()
 
@@ -1162,14 +1801,22 @@ def main() -> None:
 
     # Create timestamped output directory
     run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-    run_output_dir = specs_dir / args.output_dir / run_timestamp
+    run_output_dir = specs_dir / args.output_dir / f"{args.mode}-{run_timestamp}"
     run_output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {run_output_dir}")
     print()
 
     vms: list[VMInstance] = []
+    _all_vms.clear()       # share with signal handler
+    _provider_ref.clear()
+    _provider_ref.append(provider)
     destroyed_vms: set[str] = set()
+    summary_written = False
     wall_start = time.monotonic()
+
+    # Install signal handlers for graceful shutdown
+    original_sigint = signal.signal(signal.SIGINT, _shutdown_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, _shutdown_handler)
 
     try:
         # Phase 1: Create VMs
@@ -1187,7 +1834,9 @@ def main() -> None:
             errors = []
             for f in as_completed(futures):
                 try:
-                    vms.append(f.result())
+                    vm = f.result()
+                    vms.append(vm)
+                    _all_vms.append(vm)
                 except Exception as e:
                     errors.append(e)
         if errors:
@@ -1200,7 +1849,7 @@ def main() -> None:
         # Phase 2: Provision VMs (Docker + pull image + upload specs)
         print("Phase 2: Provisioning VMs...")
         with ThreadPoolExecutor(max_workers=len(vms)) as pool:
-            list(pool.map(lambda vm: provision_vm(vm, specs_dir), vms))
+            list(pool.map(lambda vm: provision_vm(vm, specs_dir, mode=args.mode), vms))
         print()
 
         # Print VM hardware summary
@@ -1229,6 +1878,16 @@ def main() -> None:
 
         progress = RunProgress(total=len(invariants))
         all_results: list[InvariantResult] = []
+        _results_lock = threading.Lock()
+
+        def _on_result(result: InvariantResult) -> None:
+            """Called from worker threads as each invariant finishes."""
+            with _results_lock:
+                all_results.append(result)
+            try:
+                save_invariant_log(result, run_output_dir, args)
+            except Exception as e:
+                print(f"  WARNING: failed to write log for {result.invariant}: {e}", flush=True)
 
         with ThreadPoolExecutor(max_workers=len(vms)) as pool:
             futures = {
@@ -1240,14 +1899,37 @@ def main() -> None:
                     args.steps,
                     args.fallback_steps,
                     progress,
+                    mode=args.mode,
+                    jvm_memory=args.jvm_memory,
+                    on_result=_on_result,
+                    output_dir=run_output_dir,
                 ): vm
                 for vm in vms
                 if assignment[vm.name]
             }
             for f in as_completed(futures):
-                all_results.extend(f.result())
+                try:
+                    f.result()  # results already collected via _on_result
+                except Exception as e:
+                    print(f"  WARNING: VM batch raised: {type(e).__name__}: {e}", flush=True)
                 vm = futures[f]
                 if not args.keep_vms:
+                    if not _shutdown_requested.is_set():
+                        # Normal completion: fetch stats and download CSV
+                        vm_stats = fetch_resource_stats_full(vm)
+                        if vm_stats:
+                            mem_pct = (100.0 * vm_stats.max_mem_used_mb / vm_stats.mem_total_mb
+                                       if vm_stats.mem_total_mb else 0)
+                            print(
+                                f"  [{vm.name}] Resources: "
+                                f"CPU avg={vm_stats.avg_cpu_pct:.0f}% max={vm_stats.max_cpu_pct:.0f}%, "
+                                f"MEM max={vm_stats.max_mem_used_mb:.0f}/{vm_stats.mem_total_mb:.0f}MB ({mem_pct:.0f}%), "
+                                f"load avg={vm_stats.avg_load_1m:.1f}",
+                                flush=True,
+                            )
+                        csv_path = download_monitor_csv(vm, run_output_dir)
+                        if csv_path:
+                            print(f"  [{vm.name}] Monitor CSV saved: {csv_path.name}", flush=True)
                     print(f"  [{vm.name}] All invariants done — destroying VM")
                     provider.destroy_vm(vm)
                     vm.destroyed_at = time.monotonic()
@@ -1257,8 +1939,9 @@ def main() -> None:
 
         print_report(all_results, wall_elapsed, vms, provider, args.vm_type)
 
-        # Save per-invariant logs
+        # Save summary (individual logs already written progressively)
         save_logs(all_results, run_output_dir, wall_elapsed, args, vms, provider)
+        summary_written = True
 
         if args.json_output:
             json_data = {
@@ -1282,6 +1965,8 @@ def main() -> None:
                         "vm": r.vm_name,
                         "passed": r.passed,
                         "elapsed_seconds": round(r.elapsed_seconds, 2),
+                        "exit_code": r.exit_code,
+                        "failure_category": r.failure_category or None,
                         "error": r.error[:500] if r.error else "",
                     }
                     for r in sorted(all_results, key=lambda x: x.invariant)
@@ -1301,16 +1986,46 @@ def main() -> None:
         if any(not r.passed for r in all_results):
             sys.exit(1)
 
+    except KeyboardInterrupt:
+        # In case KeyboardInterrupt sneaks through before signal handler is set
+        _shutdown_requested.set()
+        print("\nInterrupted — cleaning up VMs...", flush=True)
+
     finally:
+        # Restore original signal handlers during cleanup
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+
+        # Write summary if not already written (e.g. crash or Ctrl-C)
+        if all_results and not summary_written:
+            try:
+                wall_elapsed = time.monotonic() - wall_start
+                save_logs(all_results, run_output_dir, wall_elapsed, args, vms, provider)
+                print(f"\nSummary written to {run_output_dir}/summary.txt "
+                      f"({len(all_results)} result(s))", flush=True)
+            except Exception as e:
+                print(f"\nWARNING: failed to write summary: {e}", flush=True)
+
         remaining_vms = [vm for vm in vms if vm.name not in destroyed_vms]
         if not args.keep_vms:
             if remaining_vms:
-                print("\nCleaning up remaining VMs...")
+                print(f"\nCleaning up {len(remaining_vms)} remaining VM(s)...", flush=True)
+                if not _shutdown_requested.is_set():
+                    # Normal exit: download monitor CSVs before destroying
+                    for vm in remaining_vms:
+                        if vm.ssh:
+                            try:
+                                download_monitor_csv(vm, run_output_dir)
+                            except Exception:
+                                pass
+                # Destroy VMs via provider API (no SSH needed)
                 destroy_vms(provider, remaining_vms)
+                print("All VMs cleaned up.", flush=True)
         else:
-            print("\n--keep-vms set. VMs left running:")
-            for vm in remaining_vms:
-                print(f"  {vm.name}: ssh root@{vm.ip}")
+            if remaining_vms:
+                print("\n--keep-vms set. VMs left running:")
+                for vm in remaining_vms:
+                    print(f"  {vm.name}: ssh root@{vm.ip}")
 
 
 if __name__ == "__main__":
