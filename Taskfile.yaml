@@ -204,37 +204,82 @@ tasks:
         --default-samples={{.DEFAULT_SAMPLES}} --target-seconds={{.TARGET_SECONDS}} \
         --output-markdown=invariant-benchmarks.md --write-annotations
 
+  quint:verify:
+    desc: Formally verify Quint invariants via Apalache (bounded model checking)
+    summary: |
+      Run quint verify (Apalache model checker) on invariants. This proves
+      correctness up to the given step bound, unlike quint:run which only
+      does random sampling.
+
+      Requires Java (Apalache is downloaded automatically by quint).
+
+      Options:
+        STEPS       Max steps for bounded model checking (default: 2)
+        INVARIANT   Specific invariant to check (default: all inv_* checks)
+        JVM_MEMORY  Max JVM heap size (default: 16g)
+
+      Examples:
+        task quint:verify INVARIANT=inv_self_in_active_peers
+        task quint:verify INVARIANT=inv_self_in_active_peers STEPS=3 JVM_MEMORY=40g
+    dir: specs
+    vars:
+      STEPS: '{{.STEPS | default "2"}}'
+      JVM_MEMORY: '{{.JVM_MEMORY | default "16g"}}'
+      INVARIANT_ARG: "{{if .INVARIANT}} --invariant={{.INVARIANT}}{{end}}"
+    cmds:
+      - JVM_ARGS="-Xmx{{.JVM_MEMORY}}" quint verify doltswarm_verify.qnt --max-steps={{.STEPS}}{{.INVARIANT_ARG}}
+
+  quint:docker:build:
+    desc: Build the quint-runner Docker image locally (current platform only)
+    dir: specs
+    cmds:
+      - docker buildx build -f Dockerfile.quint -t nustiueudinastea/quint-runner:latest --load .
+
+  quint:docker:build-and-push:
+    desc: Build and push the quint-runner Docker image (amd64 + arm64)
+    dir: specs
+    cmds:
+      - docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.quint -t nustiueudinastea/quint-runner:latest --push .
+
   quint:cloud:
-    desc: Run Quint invariants in parallel on cloud VMs (Scaleway or Hetzner)
+    desc: Run Quint invariants in parallel on cloud VMs (Scaleway, Hetzner, or UpCloud)
     summary: |
       Provision cloud VMs, pull the quint Docker image, and distribute
       invariant checks across VMs using all available CPUs.
 
       Scaleway (default): uses ~/.config/scw/config.yaml, deploys to "testing" project
       Hetzner:            requires HCLOUD_TOKEN env var
+      UpCloud:            requires UPCLOUD_TOKEN (or UPCLOUD_USERNAME + UPCLOUD_PASSWORD)
 
-      pip install paramiko scaleway   # or: pip install paramiko hcloud
+      pip install paramiko scaleway   # or: pip install paramiko hcloud / upcloud-api
 
       Options:
         VMS         Number of VMs to run in parallel (required)
-        PROVIDER    Cloud provider: scaleway (default) or hetzner
-        SAMPLES     Number of random traces per invariant (default: 10000)
+        PROVIDER    Cloud provider: scaleway (default), hetzner, or upcloud
+        MODE        Quint mode: run (default) or verify (Apalache model checking)
+        SAMPLES     Number of random traces per invariant (default: 10000, run mode only)
         STEPS       Override max steps for all invariants
-        VM_TYPE     VM type (default: POP2-HC-8C-16G for Scaleway, ccx33 for Hetzner)
+        VM_TYPE     VM type (default per provider)
         INVARIANT   Run only this specific invariant
         KEEP_VMS    Set to 1 to keep VMs alive after run
+        JVM_MEMORY  Max JVM heap for verify mode (default: 8g)
 
       Examples:
         task quint:cloud VMS=3
         task quint:cloud VMS=2 PROVIDER=hetzner SAMPLES=50000
         task quint:cloud VMS=4 VM_TYPE=POP2-HC-16C-32G SAMPLES=10000
         task quint:cloud VMS=1 KEEP_VMS=1 SAMPLES=1000
+        task quint:cloud VMS=3 MODE=verify STEPS=2 JVM_MEMORY=10g
     dir: specs
     vars:
       VMS: '{{.VMS | default ""}}'
       SAMPLES: '{{.SAMPLES | default "10000"}}'
       PROVIDER: '{{.PROVIDER | default "scaleway"}}'
+      MODE: '{{.MODE | default "run"}}'
+      JVM_MEMORY: '{{.JVM_MEMORY | default "8g"}}'
       PROVIDER_ARG: "--provider={{.PROVIDER}}"
+      MODE_ARG: "--mode={{.MODE}}"
+      JVM_MEMORY_ARG: "--jvm-memory={{.JVM_MEMORY}}"
       VM_TYPE_ARG: "{{if .VM_TYPE}} --vm-type={{.VM_TYPE}}{{end}}"
       STEPS_ARG: "{{if .STEPS}} --steps={{.STEPS}}{{end}}"
       INVARIANT_ARG: "{{if .INVARIANT}} --invariant={{.INVARIANT}}{{end}}"
@@ -243,7 +288,7 @@ tasks:
       - sh: '[ -n "{{.VMS}}" ]'
         msg: "VMS parameter is required. Example: task quint:cloud VMS=3"
     cmds:
-      - python3 quint_cloud_runner.py --vms={{.VMS}} {{.PROVIDER_ARG}}{{.VM_TYPE_ARG}} --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.INVARIANT_ARG}}{{.KEEP_ARG}}
+      - python3 quint_cloud_runner.py --vms={{.VMS}} {{.PROVIDER_ARG}} {{.MODE_ARG}} {{.JVM_MEMORY_ARG}}{{.VM_TYPE_ARG}} --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.INVARIANT_ARG}}{{.KEEP_ARG}}
 
   default:
     desc: Show available tasks
