@@ -1054,18 +1054,19 @@ def _build_verify_cmd(
     effective_steps: int,
     heap_arg: str,
     vm: VMInstance | None = None,
+    spec: str = "doltswarm_verify.qnt",
+    init_action: str | None = None,
+    step_action: str | None = None,
+    inductive: bool = False,
 ) -> str:
     """Build a quint verify command that runs inside Docker.
 
     JVM flags (passed via -e JVM_ARGS):
-      -Xmx{heap}               — max heap sized to 80% of VM RAM
+      -Xmx{heap}               — max heap sized to 65% of container RAM
       -XX:+UseG1GC             — low-pause garbage collector
       -XX:MaxGCPauseMillis=2000 — keep GC pauses short to avoid gRPC timeouts
       -XX:+CrashOnOutOfMemoryError — crash immediately on OOM instead of
                                      thrashing for minutes then dropping gRPC
-
-    Apalache tuning:
-      --verbosity=5            — max Apalache logging (shows all passes + step progress)
     """
     import random
     port = random.randint(10000, 60000)
@@ -1076,18 +1077,23 @@ def _build_verify_cmd(
         f"-XX:+CrashOnOutOfMemoryError"
     )
     res_flags = _docker_resource_flags(vm) if vm else ""
-    return (
-        f"docker run --rm "
-        f"{res_flags} "
-        f"-v /root/specs:/specs "
-        f"-e JVM_ARGS='{jvm_flags}' "
-        f"{DOCKER_IMAGE} "
-        f"quint verify /specs/doltswarm_verify.qnt "
-        f"--invariant={invariant_name} "
-        f"--max-steps={effective_steps} "
-        f"--server-endpoint=localhost:{port} "
-        f"--verbosity=5"
-    )
+    inv_flag = "--inductive-invariant" if inductive else "--invariant"
+    parts = [
+        f"docker run --rm {res_flags}",
+        f"-v /root/specs:/specs",
+        f"-e JVM_ARGS='{jvm_flags}'",
+        DOCKER_IMAGE,
+        f"quint verify /specs/{spec}",
+        f"{inv_flag}={invariant_name}",
+        f"--max-steps={effective_steps}",
+        f"--server-endpoint=localhost:{port}",
+        f"--verbosity=5",
+    ]
+    if init_action:
+        parts.append(f"--init={init_action}")
+    if step_action:
+        parts.append(f"--step={step_action}")
+    return " ".join(parts)
 
 
 def _collect_failure_diagnostics(vm: VMInstance, invariant_name: str) -> str:
@@ -1131,6 +1137,10 @@ def run_invariant_on_vm(
     jvm_memory: str = "8g",
     max_retries: int = 2,
     output_dir: Path | None = None,
+    spec: str = "doltswarm_verify.qnt",
+    init_action: str | None = None,
+    step_action: str | None = None,
+    inductive: bool = False,
 ) -> InvariantResult:
     effective_steps = steps if steps is not None else (invariant.default_steps or fallback_steps)
 
@@ -1167,7 +1177,9 @@ def run_invariant_on_vm(
 
         res_flags = _docker_resource_flags(vm)
         if mode == "verify":
-            cmd = _build_verify_cmd(invariant.name, effective_steps, heap_arg, vm=vm)
+            cmd = _build_verify_cmd(invariant.name, effective_steps, heap_arg,
+                                    vm=vm, spec=spec, init_action=init_action,
+                                    step_action=step_action, inductive=inductive)
         else:
             cmd = (
                 f"docker run --rm {res_flags} "
@@ -1373,6 +1385,10 @@ def run_vm_batch(
     jvm_memory: str = "8g",
     on_result: callable = None,
     output_dir: Path | None = None,
+    spec: str = "doltswarm_verify.qnt",
+    init_action: str | None = None,
+    step_action: str | None = None,
+    inductive: bool = False,
 ) -> list[InvariantResult]:
     """Run a batch of invariants on a VM, parallelising up to vm.cpus containers."""
     results: list[InvariantResult] = []
@@ -1383,7 +1399,10 @@ def run_vm_batch(
         try:
             result = run_invariant_on_vm(vm, inv, samples, steps, fallback_steps,
                                          mode=mode, jvm_memory=jvm_memory,
-                                         output_dir=output_dir)
+                                         output_dir=output_dir, spec=spec,
+                                         init_action=init_action,
+                                         step_action=step_action,
+                                         inductive=inductive)
         except Exception as e:
             result = InvariantResult(
                 invariant=inv.name,
@@ -1744,6 +1763,18 @@ def main() -> None:
         help="Quint mode: 'run' for random simulation (default), 'verify' for Apalache model checking",
     )
     parser.add_argument(
+        "--init", default=None,
+        help="Override the init action for verify mode (default: spec's init)",
+    )
+    parser.add_argument(
+        "--step", default=None,
+        help="Override the step action for verify mode (default: spec's step)",
+    )
+    parser.add_argument(
+        "--inductive", action="store_true",
+        help="Use --inductive-invariant instead of --invariant for verify mode",
+    )
+    parser.add_argument(
         "--jvm-memory", default="8g",
         help="Max JVM heap for Apalache in verify mode (default: 8g)",
     )
@@ -1903,6 +1934,10 @@ def main() -> None:
                     jvm_memory=args.jvm_memory,
                     on_result=_on_result,
                     output_dir=run_output_dir,
+                    spec=args.spec,
+                    init_action=args.init,
+                    step_action=args.step,
+                    inductive=args.inductive,
                 ): vm
                 for vm in vms
                 if assignment[vm.name]
