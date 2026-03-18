@@ -174,7 +174,7 @@ tasks:
       VERBOSITY_ARG: "{{if .VERBOSITY}} --verbosity={{.VERBOSITY}}{{end}}"
       INVARIANT_ARG: "{{if .INVARIANT}} --invariant={{.INVARIANT}}{{end}}"
     cmds:
-      - python3 quint_invariants.py run --spec doltswarm_verify.qnt --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.VERBOSITY_ARG}}{{.INVARIANT_ARG}}
+      - python3 tooling/quint_invariants.py run --spec doltswarm_verify.qnt --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.VERBOSITY_ARG}}{{.INVARIANT_ARG}}
 
   quint:benchmark:
     desc: Benchmark Quint invariants and regenerate annotated step budgets
@@ -199,7 +199,7 @@ tasks:
       TARGET_SECONDS: '{{.TARGET_SECONDS | default "5"}}'
     cmds:
       - |
-        python3 quint_invariants.py benchmark --spec doltswarm_verify.qnt \
+        python3 tooling/quint_invariants.py benchmark --spec doltswarm_verify.qnt \
         --benchmark-samples={{.BENCH_SAMPLES}} --benchmark-steps={{.BENCH_STEPS}} \
         --default-samples={{.DEFAULT_SAMPLES}} --target-seconds={{.TARGET_SECONDS}} \
         --output-markdown=invariant-benchmarks.md --write-annotations
@@ -233,13 +233,13 @@ tasks:
     desc: Build the quint-runner Docker image locally (current platform only)
     dir: specs
     cmds:
-      - docker buildx build -f Dockerfile.quint -t nustiueudinastea/quint-runner:latest --load .
+      - docker buildx build -f tooling/Dockerfile.quint -t nustiueudinastea/quint-runner:latest --load .
 
   quint:docker:build-and-push:
     desc: Build and push the quint-runner Docker image (amd64 + arm64)
     dir: specs
     cmds:
-      - docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.quint -t nustiueudinastea/quint-runner:latest --push .
+      - docker buildx build --platform linux/amd64,linux/arm64 -f tooling/Dockerfile.quint -t nustiueudinastea/quint-runner:latest --push .
 
   quint:cloud:
     desc: Run Quint invariants in parallel on cloud VMs (Scaleway, Hetzner, or UpCloud)
@@ -288,7 +288,7 @@ tasks:
       - sh: '[ -n "{{.VMS}}" ]'
         msg: "VMS parameter is required. Example: task quint:cloud VMS=3"
     cmds:
-      - python3 quint_cloud_runner.py --vms={{.VMS}} {{.PROVIDER_ARG}} {{.MODE_ARG}} {{.JVM_MEMORY_ARG}}{{.VM_TYPE_ARG}} --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.INVARIANT_ARG}}{{.KEEP_ARG}}
+      - python3 tooling/quint_cloud_runner.py --vms={{.VMS}} {{.PROVIDER_ARG}} {{.MODE_ARG}} {{.JVM_MEMORY_ARG}}{{.VM_TYPE_ARG}} --samples={{.SAMPLES}}{{.STEPS_ARG}}{{.INVARIANT_ARG}}{{.KEEP_ARG}}
 
   default:
     desc: Show available tasks

@@ -7,10 +7,10 @@ uploads specs, and distributes invariant checks across VMs using all
 available CPUs.
 
 Usage:
-    python3 quint_cloud_runner.py --vms 3 --samples 10000
-    python3 quint_cloud_runner.py --vms 2 --provider hetzner --samples 10000
-    python3 quint_cloud_runner.py --vms 2 --provider upcloud --samples 10000
-    python3 quint_cloud_runner.py --vms 2 --vm-type POP2-HC-16C-32G --samples 50000
+    python3 specs/tooling/quint_cloud_runner.py --vms 3 --samples 10000
+    python3 specs/tooling/quint_cloud_runner.py --vms 2 --provider hetzner --samples 10000
+    python3 specs/tooling/quint_cloud_runner.py --vms 2 --provider upcloud --samples 10000
+    python3 specs/tooling/quint_cloud_runner.py --vms 2 --vm-type POP2-HC-16C-32G --samples 50000
 
 Requirements:
     pip install paramiko
@@ -83,19 +83,29 @@ def _shutdown_handler(signum, frame):
     sig_name = signal.Signals(signum).name
     if _shutdown_requested.is_set():
         # Second signal — force-destroy VMs and exit immediately
-        print(f"\n{sig_name} received again — force-destroying VMs and exiting", flush=True)
+        vm_names = [vm.name for vm in _all_vms] if _all_vms else []
+        print(f"\n[shutdown] {sig_name} received again — force-destroying {len(vm_names)} VM(s) and exiting",
+              flush=True)
         if _provider_ref and _all_vms:
             for vm in _all_vms:
                 try:
+                    print(f"[shutdown] Force-destroying {vm.name} ({vm.ip})...", flush=True)
                     _provider_ref[0].destroy_vm(vm)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[shutdown] Failed to destroy {vm.name}: {e}", flush=True)
+        print("[shutdown] Done. Exiting.", flush=True)
         os._exit(1)
-    print(f"\n{sig_name} received — shutting down, destroying VMs...", flush=True)
+    vm_names = [vm.name for vm in _all_vms] if _all_vms else []
+    print(f"\n[shutdown] {sig_name} received — stopping all work and destroying {len(vm_names)} VM(s): "
+          f"{', '.join(vm_names) or 'none yet'}", flush=True)
+    print("[shutdown] Closing SSH connections to unblock running commands...", flush=True)
     _shutdown_requested.set()
     # Close all SSH transports to unblock any blocking reads in ssh_exec
     for vm in _all_vms:
+        print(f"[shutdown] Closing SSH to {vm.name} ({vm.ip})", flush=True)
         _close_ssh_safe(vm)
+    print("[shutdown] SSH closed. Waiting for threads to exit, then destroying VMs...", flush=True)
+    print("[shutdown] Press Ctrl-C again to force-destroy immediately.", flush=True)
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -195,8 +205,9 @@ def parse_invariants(spec_path: Path) -> list[Invariant]:
 # SSH helpers
 # ---------------------------------------------------------------------------
 
-SPECS_DIR = Path(__file__).parent.resolve()
-RUNNER_KEY = SPECS_DIR / "quint-runner-key"
+TOOLING_DIR = Path(__file__).parent.resolve()
+SPECS_DIR = TOOLING_DIR.parent.resolve()
+RUNNER_KEY = TOOLING_DIR / "quint-runner-key"
 
 
 def get_ssh_key_path() -> Path:
@@ -207,7 +218,7 @@ def get_ssh_key_path() -> Path:
         if p.exists():
             return p
     sys.exit("ERROR: No SSH key found. Generate one with:\n"
-             "  ssh-keygen -t ed25519 -f specs/quint-runner-key -N '' -C quint-cloud-runner")
+             "  ssh-keygen -t ed25519 -f specs/tooling/quint-runner-key -N '' -C quint-cloud-runner")
 
 
 def get_ssh_public_key() -> str:
@@ -822,13 +833,16 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_C
 
     # Upload spec files
     print(f"  [{vm.name}] Uploading spec files...")
-    ssh_exec(vm.ssh, "mkdir -p /root/specs /root/specs/spells")
-    for qnt_file in specs_dir.glob("*.qnt"):
-        scp_upload(vm.ssh, qnt_file, f"/root/specs/{qnt_file.name}")
-    spells_dir = specs_dir / "spells"
-    if spells_dir.exists():
-        for spell_file in spells_dir.glob("*.qnt"):
-            scp_upload(vm.ssh, spell_file, f"/root/specs/spells/{spell_file.name}")
+    qnt_files = sorted(specs_dir.rglob("*.qnt"))
+    remote_dirs = {Path("/root/specs")}
+    for qnt_file in qnt_files:
+        rel = qnt_file.relative_to(specs_dir)
+        remote_dirs.add(Path("/root/specs") / rel.parent)
+    mkdir_cmd = "mkdir -p " + " ".join(sorted(str(p) for p in remote_dirs))
+    ssh_exec(vm.ssh, mkdir_cmd)
+    for qnt_file in qnt_files:
+        rel = qnt_file.relative_to(specs_dir)
+        scp_upload(vm.ssh, qnt_file, f"/root/specs/{rel.as_posix()}")
     # Start resource monitor
     try:
         ssh_exec(vm.ssh,
@@ -1135,6 +1149,7 @@ def run_invariant_on_vm(
     fallback_steps: int,
     mode: str = "run",
     jvm_memory: str = "8g",
+    verify_heap_ratio: float = 0.65,
     max_retries: int = 2,
     output_dir: Path | None = None,
     spec: str = "doltswarm_verify.qnt",
@@ -1147,12 +1162,12 @@ def run_invariant_on_vm(
     # Compute JVM heap for verify mode.
     # Docker container gets 95% of VM RAM.  JVM heap must fit within that,
     # leaving room for Z3 native memory (~20% of heap) + JVM metaspace/stacks.
-    # Formula: container_mb * 0.65 ≈ 62% of total VM RAM.
+    # Formula: container_mb * verify_heap_ratio.
     if mode == "verify":
         if vm.memory_mb > 0:
             reserved_os = max(512, int(vm.memory_mb * 0.05))
             container_mb = vm.memory_mb - reserved_os
-            heap_mb = int(container_mb * 0.65)
+            heap_mb = int(container_mb * verify_heap_ratio)
             heap_arg = f"{heap_mb}m"
         else:
             heap_arg = jvm_memory
@@ -1383,6 +1398,7 @@ def run_vm_batch(
     progress: RunProgress,
     mode: str = "run",
     jvm_memory: str = "8g",
+    verify_heap_ratio: float = 0.65,
     on_result: callable = None,
     output_dir: Path | None = None,
     spec: str = "doltswarm_verify.qnt",
@@ -1399,6 +1415,7 @@ def run_vm_batch(
         try:
             result = run_invariant_on_vm(vm, inv, samples, steps, fallback_steps,
                                          mode=mode, jvm_memory=jvm_memory,
+                                         verify_heap_ratio=verify_heap_ratio,
                                          output_dir=output_dir, spec=spec,
                                          init_action=init_action,
                                          step_action=step_action,
@@ -1779,6 +1796,10 @@ def main() -> None:
         help="Max JVM heap for Apalache in verify mode (default: 8g)",
     )
     parser.add_argument(
+        "--verify-heap-ratio", type=float, default=0.65,
+        help="Fraction of Docker RAM to give the JVM heap in verify mode when VM RAM is known (default: 0.65)",
+    )
+    parser.add_argument(
         "--keep-vms", action="store_true",
         help="Do not destroy VMs after run (for debugging)",
     )
@@ -1816,9 +1837,12 @@ def main() -> None:
     print(f"Found {len(invariants)} invariant(s) to check")
     print(f"Provider: {provider.name}")
     print(f"Mode: {args.mode}")
+    if not (0.0 < args.verify_heap_ratio < 1.0):
+        sys.exit("ERROR: --verify-heap-ratio must be between 0 and 1")
     if args.mode == "verify":
         print(f"Config: {args.vms} VM(s) x {args.vm_type}, "
-              f"steps={args.steps or 'per-annotation'}, JVM memory=80% of VM RAM")
+              f"steps={args.steps or 'per-annotation'}, "
+              f"JVM heap={args.verify_heap_ratio * 100:.0f}% of container RAM")
     else:
         print(f"Config: {args.vms} VM(s) x {args.vm_type}, "
               f"samples={args.samples}, steps={args.steps or 'per-annotation'}")
@@ -1932,6 +1956,7 @@ def main() -> None:
                     progress,
                     mode=args.mode,
                     jvm_memory=args.jvm_memory,
+                    verify_heap_ratio=args.verify_heap_ratio,
                     on_result=_on_result,
                     output_dir=run_output_dir,
                     spec=args.spec,
@@ -2024,7 +2049,7 @@ def main() -> None:
     except KeyboardInterrupt:
         # In case KeyboardInterrupt sneaks through before signal handler is set
         _shutdown_requested.set()
-        print("\nInterrupted — cleaning up VMs...", flush=True)
+        print("\n[shutdown] KeyboardInterrupt — will destroy VMs in cleanup phase", flush=True)
 
     finally:
         # Restore original signal handlers during cleanup
@@ -2044,7 +2069,9 @@ def main() -> None:
         remaining_vms = [vm for vm in vms if vm.name not in destroyed_vms]
         if not args.keep_vms:
             if remaining_vms:
-                print(f"\nCleaning up {len(remaining_vms)} remaining VM(s)...", flush=True)
+                names = [f"{vm.name} ({vm.ip})" for vm in remaining_vms]
+                print(f"\n[cleanup] Destroying {len(remaining_vms)} remaining VM(s): "
+                      f"{', '.join(names)}", flush=True)
                 if not _shutdown_requested.is_set():
                     # Normal exit: download monitor CSVs before destroying
                     for vm in remaining_vms:
@@ -2054,8 +2081,15 @@ def main() -> None:
                             except Exception:
                                 pass
                 # Destroy VMs via provider API (no SSH needed)
-                destroy_vms(provider, remaining_vms)
-                print("All VMs cleaned up.", flush=True)
+                for vm in remaining_vms:
+                    print(f"[cleanup] Destroying {vm.name} ({vm.ip})...", flush=True)
+                    _close_ssh_safe(vm)
+                    try:
+                        provider.destroy_vm(vm)
+                    except Exception as e:
+                        print(f"[cleanup] WARNING: Failed to destroy {vm.name}: {e}", flush=True)
+                    vm.destroyed_at = time.monotonic()
+                print("[cleanup] All VMs destroyed.", flush=True)
         else:
             if remaining_vms:
                 print("\n--keep-vms set. VMs left running:")
